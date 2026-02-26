@@ -1,0 +1,7 @@
+node_modules/
+out/
+Apps/
+vault.json
+vault.meta.json
+.DS_Store
+.env

@@ -1,0 +1,45 @@
+{
+    "name": "omnilaunch",
+    "version": "1.0.0",
+    "description": "OmniLaunch — Portable Identity & Workspace Automation Engine",
+    "main": "./out/main/index.js",
+    "scripts": {
+        "dev": "node scripts/dev.cjs",
+        "build": "electron-vite build",
+        "start": "node scripts/dev.cjs",
+        "package": "electron-vite build && node -e \"delete process.env.ELECTRON_RUN_AS_NODE; require('child_process').execSync('npx electron-builder --win portable', {stdio:'inherit', env:process.env})\""
+    },
+    "dependencies": {
+        "otplib": "^12.0.1",
+        "playwright": "^1.58.2"
+    },
+    "devDependencies": {
+        "@vitejs/plugin-react": "^4.3.4",
+        "autoprefixer": "^10.4.20",
+        "electron": "^33.2.1",
+        "electron-builder": "^25.1.8",
+        "electron-vite": "^2.3.0",
+        "postcss": "^8.4.49",
+        "react": "^18.3.1",
+        "react-dom": "^18.3.1",
+        "tailwindcss": "^3.4.17",
+        "vite": "^5.4.11"
+    },
+    "build": {
+        "appId": "com.omnilaunch.app",
+        "productName": "OmniLaunch",
+        "win": {
+            "target": "portable"
+        },
+        "portable": {
+            "artifactName": "OmniLaunch.exe"
+        },
+        "files": [
+            "out/**/*"
+        ],
+        "extraResources": [],
+        "directories": {
+            "output": "dist"
+        }
+    }
+}
