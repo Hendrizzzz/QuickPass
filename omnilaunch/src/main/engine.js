@@ -1,371 +1,204 @@
 /**
- * OmniLaunch Automation Engine
+ * OmniLaunch Automation Engine — Phase 7: Multi-Context & App Management
  * 
- * Premium UX: Browser logs in OFF-SCREEN, then appears already logged in.
- * Uses Promise.all() for concurrent execution of all workspace items.
+ * Capabilities:
+ * - launchSessionSetup(onStatus, savedState?, urls?)  — Open browser for setup/editing
+ * - captureSession()                                   — Extract URLs + cookies from ALL contexts, close browser
+ * - captureCurrentSession()                            — Extract URLs + cookies from ALL contexts, keep browser open
+ * - closeBrowser()                                     — Force close the browser
+ * - closeDesktopApps()                                 — Kill tracked desktop app processes
+ * - launchWorkspace(workspace, onStatus, savedState)   — Daily authenticated launch
+ * - onBrowserAllClosed(cb)                             — Register disconnect callback
  */
-import { chromium } from 'playwright'
-import { spawn } from 'child_process'
-import crypto from 'crypto'
+import { chromium } from 'playwright-core'
+import { spawn, execSync } from 'child_process'
 
-// Store active browser instances (not returned via IPC)
-const activeBrowsers = []
+// Active browser/context references
+let activeBrowser = null
+let activeContext = null
+let onDisconnectCallback = null
 
-// ─── TOTP Generator (Offline Google Authenticator) ──────────────────────────────
+// Track launched desktop app PIDs so we can close them
+let launchedAppPids = []
 
-function generateTOTP(secret) {
-    const base32Chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
-    const cleanSecret = secret.replace(/[\s=-]/g, '').toUpperCase()
-    let bits = ''
-    for (const char of cleanSecret) {
-        const val = base32Chars.indexOf(char)
-        if (val === -1) continue
-        bits += val.toString(2).padStart(5, '0')
-    }
-    const keyBytes = []
-    for (let i = 0; i + 8 <= bits.length; i += 8) {
-        keyBytes.push(parseInt(bits.substring(i, i + 8), 2))
-    }
-    const key = Buffer.from(keyBytes)
+// ─── Disconnect Detection ───────────────────────────────────────────────────────
 
-    const epoch = Math.floor(Date.now() / 1000)
-    const timeStep = Math.floor(epoch / 30)
-    const timeBuffer = Buffer.alloc(8)
-    timeBuffer.writeUInt32BE(0, 0)
-    timeBuffer.writeUInt32BE(timeStep, 4)
-
-    const hmac = crypto.createHmac('sha1', key)
-    hmac.update(timeBuffer)
-    const hash = hmac.digest()
-
-    const offset = hash[hash.length - 1] & 0x0f
-    const code = (
-        ((hash[offset] & 0x7f) << 24) |
-        ((hash[offset + 1] & 0xff) << 16) |
-        ((hash[offset + 2] & 0xff) << 8) |
-        (hash[offset + 3] & 0xff)
-    ) % 1000000
-
-    return code.toString().padStart(6, '0')
+export function onBrowserAllClosed(cb) {
+    onDisconnectCallback = cb
 }
 
-// ─── Google Service Detection ───────────────────────────────────────────────────
-
-const GOOGLE_DOMAINS = [
-    'classroom.google.com', 'drive.google.com', 'docs.google.com',
-    'sheets.google.com', 'slides.google.com', 'mail.google.com',
-    'calendar.google.com', 'meet.google.com', 'chat.google.com',
-    'sites.google.com', 'groups.google.com', 'keep.google.com',
-    'youtube.com', 'photos.google.com', 'myaccount.google.com'
-]
-
-function isGoogleService(url) {
-    return GOOGLE_DOMAINS.some(domain => url.includes(domain))
+function attachPageTracking(context) {
+    const checkAllClosed = () => {
+        try {
+            const remaining = context?.pages() || []
+            if (remaining.length === 0) {
+                if (onDisconnectCallback) onDisconnectCallback()
+                activeBrowser?.close().catch(() => { })
+                activeBrowser = null
+                activeContext = null
+            }
+        } catch (_) {
+            if (onDisconnectCallback) onDisconnectCallback()
+            activeBrowser = null
+            activeContext = null
+        }
+    }
+    const trackPage = (page) => page.on('close', checkAllClosed)
+    for (const p of context.pages()) trackPage(p)
+    context.on('page', (p) => trackPage(p))
 }
 
-// ─── Browser Automation Engine ──────────────────────────────────────────────────
+// ─── Browser Launch Helper ──────────────────────────────────────────────────────
 
-async function launchWebTab(tab, onStatus) {
-    const url = tab.url.startsWith('http') ? tab.url : `https://${tab.url}`
-    const needsLogin = tab.email && tab.password
-    const isGoogle = isGoogleService(url)
-
-    // Launch browser MINIMIZED during login (stays in taskbar, can be alt-tabbed)
-    const browser = await chromium.launch({
+async function launchChrome() {
+    return chromium.launch({
         headless: false,
-        channel: 'chrome', // Use system Google Chrome instead of bundled Chromium
+        channel: 'chrome',
+        ignoreDefaultArgs: ['--enable-automation'],
         args: [
             '--no-first-run',
             '--no-default-browser-check',
             '--disable-infobars',
-            '--window-position=-32000,-32000',
-            '--window-size=1280,800'
+            '--disable-blink-features=AutomationControlled',
+            '--start-maximized'
         ]
     })
-
-    const context = await browser.newContext({
-        viewport: null, // Allow native scaling with window bounds
-        ignoreHTTPSErrors: true
-    })
-
-    // Block Images, Fonts, and Media exclusively on Google Login pages for ultra-fast text-only rendering
-    await context.route('**/*', (route) => {
-        const req = route.request()
-        const url = req.url()
-        const type = req.resourceType()
-
-        if (url.includes('accounts.google.com') || url.includes('gstatic.com') || url.includes('play.google.com')) {
-            // ONLY block media/images. DO NOT block stylesheets or fonts because Google's SPA relies on CSS for 2FA dropdown menus!
-            if (['image', 'media'].includes(type)) {
-                return route.abort()
-            }
-        }
-        route.continue()
-    })
-
-    const page = await context.newPage()
-
-    try {
-        if (isGoogle && needsLogin) {
-            // ─── Google Service: Route through ServiceLogin ───────────────
-            const continueUrl = encodeURIComponent(url)
-            const loginUrl = `https://accounts.google.com/ServiceLogin?continue=${continueUrl}`
-            onStatus(`Authenticating for ${tab.url}...`)
-            await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 })
-            await page.waitForLoadState('domcontentloaded')
-
-            await googleLogin(page, tab, onStatus)
-
-            // Wait for redirect to the actual service
-            onStatus(`Waiting for ${tab.url} to load...`)
-            try {
-                const targetDomain = new URL(tab.url).hostname.replace('www.', '')
-                await page.waitForURL('**/*' + targetDomain + '*/**', { timeout: 60000 })
-            } catch (_) {
-                await page.waitForTimeout(5000)
-            }
-        } else {
-            // ─── Non-Google URL ──────────────────────────────────────────
-            onStatus(`Loading ${tab.url}...`)
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
-            await page.waitForLoadState('domcontentloaded')
-
-            const currentUrl = page.url()
-
-            if (currentUrl.includes('accounts.google.com') && needsLogin) {
-                onStatus('Google login redirect detected...')
-                await googleLogin(page, tab, onStatus)
-                try {
-                    const targetDomain = new URL(tab.url).hostname.replace('www.', '')
-                    await page.waitForURL('**/*' + targetDomain + '*/**', { timeout: 60000 })
-                } catch (_) {
-                    await page.waitForTimeout(5000)
-                }
-            } else if (needsLogin) {
-                await genericLogin(page, tab, onStatus)
-            }
-        }
-
-        // ─── REVEAL BROWSER (Post-Login Finalization) ────────────────────
-        try {
-            const context = page.context()
-            const pages = context.pages()
-            if (pages.length > 0) {
-                const cdp = await context.newCDPSession(pages[0])
-                const { windowId } = await cdp.send('Browser.getWindowForTarget')
-                // First teleport it back to the primary screen
-                await cdp.send('Browser.setWindowBounds', {
-                    windowId,
-                    bounds: { windowState: 'normal', left: 0, top: 0, width: 1280, height: 800 }
-                })
-                // Then maximize
-                await cdp.send('Browser.setWindowBounds', {
-                    windowId,
-                    bounds: { windowState: 'maximized' }
-                })
-            }
-        } catch (_) {
-            await page.bringToFront().catch(() => { })
-        }
-
-        onStatus(`[OK] ${tab.url} — ready`)
-    } catch (err) {
-        onStatus(`[WARN] ${tab.url} — ${err.message}`)
-        // Browser remains hidden on failure to prevent jarring popups
-    }
-
-    activeBrowsers.push(browser)
-    return { url: tab.url, success: true }
 }
 
-// ─── Google Login Flow ──────────────────────────────────────────────────────────
+// ─── Multi-Context URL + Cookie Extraction ──────────────────────────────────────
 
-async function googleLogin(page, tab, onStatus) {
+/**
+ * Collects URLs from ALL browser contexts (catches Ctrl+N windows).
+ * Merges cookies from all contexts.
+ */
+async function extractAllPages() {
+    if (!activeBrowser) return { urls: [], state: null }
+
+    const allUrls = []
+    let mergedState = { cookies: [], origins: [] }
+
+    for (const ctx of activeBrowser.contexts()) {
+        // Collect URLs from this context
+        const pages = ctx.pages()
+        for (const p of pages) {
+            try {
+                const url = p.url()
+                if (url && url !== 'about:blank' && !url.startsWith('chrome://')) {
+                    allUrls.push(url)
+                }
+            } catch (_) { }
+        }
+
+        // Collect cookies/storage from this context
+        try {
+            const ctxState = await ctx.storageState()
+            mergedState.cookies.push(...(ctxState.cookies || []))
+            mergedState.origins.push(...(ctxState.origins || []))
+        } catch (_) { }
+    }
+
+    return { urls: allUrls, state: mergedState }
+}
+
+// ─── Session Setup / Edit ───────────────────────────────────────────────────────
+
+export async function launchSessionSetup(onStatus, savedState = null, urls = []) {
+    onStatus('Opening browser...')
+
+    activeBrowser = await launchChrome()
+
+    const contextOptions = { viewport: null, ignoreHTTPSErrors: true }
+    if (savedState && savedState.cookies && savedState.cookies.length > 0) {
+        contextOptions.storageState = savedState
+        onStatus('Restoring your session...')
+    }
+
+    activeContext = await activeBrowser.newContext(contextOptions)
+    attachPageTracking(activeContext)
+
+    if (urls.length > 0) {
+        for (let i = 0; i < urls.length; i++) {
+            const url = urls[i].startsWith('http') ? urls[i] : `https://${urls[i]}`
+            const page = await activeContext.newPage()
+            onStatus(`Loading tab ${i + 1}/${urls.length}...`)
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => { })
+        }
+        onStatus('All tabs loaded. Edit your workspace, then save.')
+    } else {
+        const page = await activeContext.newPage()
+        await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => { })
+        onStatus('Browser is ready. Navigate to your sites and log in.')
+    }
+
+    return { success: true }
+}
+
+// ─── Session Capture ────────────────────────────────────────────────────────────
+
+/**
+ * Captures URLs + cookies from ALL browser contexts and CLOSES the browser.
+ */
+export async function captureSession() {
+    const result = await captureCurrentSession()
+
+    // Always close browser during a full capture, regardless of result
+    await closeBrowser()
+
+    // Provide friendly error message if they tried to save zero tabs
+    if (!result.success && result.error === 'No tabs are open') {
+        return { success: false, error: 'No tabs are open. Please open at least one website.' }
+    }
+
+    return result
+}
+
+/**
+ * Captures URLs + cookies from ALL browser contexts WITHOUT closing.
+ */
+export async function captureCurrentSession() {
+    if (!activeBrowser) {
+        return { success: false, error: 'No active browser session' }
+    }
+
     try {
-        // Step 1: Email ──────────────────────────────────────────────────
-        onStatus('Entering email...')
-        const emailInput = await page.waitForSelector('input[type="email"]', { timeout: 10000 })
-        await emailInput.fill(tab.email)
+        const { urls, state } = await extractAllPages()
 
-        // Click Next — use keyboard Enter (most reliable on Google's SPA)
-        await page.keyboard.press('Enter')
-        onStatus('Email submitted...')
+        if (urls.length === 0) {
+            return { success: false, error: 'No tabs are open' }
+        }
 
-        // Step 2: Password ───────────────────────────────────────────────
-        // Wait for the password page to transition
-        const pwdInput = await page.waitForSelector('input[type="password"]:visible', { timeout: 15000 })
-        onStatus('Entering password...')
-        await pwdInput.fill(tab.password)
+        return { success: true, urls, state, tabCount: urls.length }
+    } catch (err) {
+        return { success: false, error: err.message }
+    }
+}
 
-        // Click Next
-        await page.keyboard.press('Enter')
-        onStatus('Password submitted...')
+// ─── Browser & App Control ──────────────────────────────────────────────────────
 
-        // Step 3: Handle 2FA ─────────────────────────────────────────────
-        // Wait for SPA transition to 2FA screen or success
-        await page.waitForURL(/challenge|signin\/v2|myaccount/, { timeout: 10000 }).catch(() => { })
-        await page.waitForTimeout(2000)
-        const currentUrl = page.url()
+export async function closeBrowser() {
+    onDisconnectCallback = null
+    if (activeBrowser) {
+        await activeBrowser.close().catch(() => { })
+        activeBrowser = null
+        activeContext = null
+    }
+}
 
-        if (currentUrl.includes('challenge') || currentUrl.includes('signin/v2')) {
-            if (tab.totpSecret) {
-                onStatus('2FA challenge detected, generating code...')
-                const totpCode = generateTOTP(tab.totpSecret)
 
-                // ─── Navigate the 2FA method selection page ──────────────
-                // Google's 2FA page shows multiple options. The TOTP/Authenticator
-                // option is often hidden behind "Try another way". Strategy:
-                // 1. Check if TOTP input already exists (direct path)
-                // 2. If not, click "Try another way" to see all methods
-                // 3. Then click the Google Authenticator / TOTP option specifically
-
-                // Fast path: check if TOTP input is already on the page
-                let totpInputVisible = false
-                try {
-                    const quickCheck = page.locator('input[type="tel"], input#totpPin, input[name="totpPin"]').first()
-                    totpInputVisible = await quickCheck.isVisible({ timeout: 2000 })
-                } catch (_) { }
-
-                if (!totpInputVisible) {
-                    // Google sometimes shows the full list immediately. We should try to click Authenticator FIRST.
-                    let clickedAuth = false
-
-                    const tryClickAuthenticator = async (timeoutMs) => {
-                        try {
-                            // Try exact match by text first
-                            const authMatch = page.getByText(/authenticator/i, { exact: false }).first()
-                            await authMatch.click({ timeout: timeoutMs })
-                            return true
-                        } catch (_) { }
-
-                        try {
-                            // Fallback to data attribute if text fails
-                            const fallbackMatch = page.locator('[data-challengetype="6"]').first()
-                            await fallbackMatch.click({ timeout: timeoutMs })
-                            return true
-                        } catch (_) { }
-
-                        return false
-                    }
-
-                    // Attempt 1: Is it already on the screen?
-                    onStatus('Looking for authenticator option...')
-                    clickedAuth = await tryClickAuthenticator(3000)
-
-                    if (!clickedAuth) {
-                        // Attempt 2: It's hidden behind "Try another way"
-                        try {
-                            const tryAnother = page.getByText(/Try another way/i).first()
-                            await tryAnother.click({ timeout: 2000 })
-                            onStatus('Expanding 2FA options...')
-                            await page.waitForTimeout(1000) // Deep buffer for React CSS slide animation
-
-                            clickedAuth = await tryClickAuthenticator(5000)
-                        } catch (_) { }
-                    }
-                }
-
-                // ─── Now find and fill the TOTP input ────────────────────
-                // Look for any text/tel input on the current page
-                const inputSelectors = [
-                    'input[type="tel"]',
-                    'input[name="totpPin"]',
-                    'input#totpPin',
-                    'input[name="pin"]',
-                    'input[type="text"][autocomplete="one-time-code"]',
-                    'input[aria-label*="code"]',
-                    'input[aria-label*="Enter"]'
-                ]
-
-                let totpFilled = false
-                for (const sel of inputSelectors) {
-                    try {
-                        const input = page.locator(sel).first()
-                        await input.waitFor({ state: 'visible', timeout: 2000 })
-                        await input.fill(totpCode)
-                        await page.keyboard.press('Enter')
-                        totpFilled = true
-                        onStatus('2FA code submitted...')
-                        break
-                    } catch (_) { continue }
-                }
-
-                if (!totpFilled) {
-                    onStatus('[WARN] Could not find TOTP input field')
-                }
-
-                await page.waitForURL(/myaccount|classroom|mail/, { timeout: 10000 }).catch(() => { })
-                await page.waitForTimeout(2000)
+/**
+ * Kill all tracked desktop app processes.
+ */
+export function closeDesktopApps() {
+    for (const pid of launchedAppPids) {
+        try {
+            if (process.platform === 'win32') {
+                execSync(`taskkill /pid ${pid} /T /F`, { stdio: 'ignore' })
             } else {
-                onStatus('[WARN] 2FA required — no secret key configured')
-            }
-        }
-
-        onStatus('Login complete')
-    } catch (err) {
-        onStatus(`[WARN] Login step failed: ${err.message}`)
-    }
-}
-
-// ─── Generic Login ──────────────────────────────────────────────────────────────
-
-async function genericLogin(page, tab, onStatus) {
-    try {
-        onStatus('Attempting auto-login...')
-        const emailSelectors = [
-            'input[type="email"]', 'input[name="email"]', 'input[name="username"]',
-            'input[name="login"]', 'input[id="email"]', 'input[id="username"]',
-            'input[autocomplete="email"]', 'input[autocomplete="username"]'
-        ]
-
-        let filled = false
-        for (const sel of emailSelectors) {
-            try {
-                const el = page.locator(sel).first()
-                if (await el.isVisible({ timeout: 2000 })) {
-                    await el.fill(tab.email)
-                    filled = true
-                    break
-                }
-            } catch (_) { continue }
-        }
-
-        if (!filled) {
-            onStatus('[WARN] Could not find login form')
-            return
-        }
-
-        // Password
-        try {
-            const passInput = page.locator('input[type="password"]').first()
-            if (await passInput.isVisible({ timeout: 2000 })) {
-                await passInput.fill(tab.password)
+                process.kill(-pid) // Kill process group on Unix
             }
         } catch (_) { }
-
-        // Submit
-        try {
-            const submitBtn = page.locator('button[type="submit"], input[type="submit"]').first()
-            if (await submitBtn.isVisible({ timeout: 2000 })) {
-                await submitBtn.click()
-            } else {
-                await page.keyboard.press('Enter')
-            }
-        } catch (_) {
-            await page.keyboard.press('Enter')
-        }
-
-        // Wait for redirect to the actual service
-        try {
-            const targetDomain = new URL(tab.url).hostname.replace('www.', '')
-            await page.waitForURL('**/*' + targetDomain + '*/**', { timeout: 60000 })
-        } catch (_) {
-            await page.waitForTimeout(5000)
-        }
-        onStatus('Login attempt completed')
-    } catch (err) {
-        onStatus(`[WARN] Login failed: ${err.message}`)
     }
+    launchedAppPids = []
 }
 
 // ─── Desktop App Launcher ───────────────────────────────────────────────────────
@@ -380,6 +213,9 @@ function launchDesktopApp(appConfig, onStatus) {
                 detached: true,
                 stdio: 'ignore'
             })
+
+            // Track the PID so we can close it later
+            if (child.pid) launchedAppPids.push(child.pid)
 
             child.unref()
             child.on('error', (err) => {
@@ -397,12 +233,12 @@ function launchDesktopApp(appConfig, onStatus) {
     })
 }
 
-// ─── Main Orchestrator ──────────────────────────────────────────────────────────
+// ─── Daily Workspace Launch ─────────────────────────────────────────────────────
 
-export async function launchWorkspace(workspace, onStatus) {
-    const enabledTabs = (workspace.webTabs || []).filter(t => t.enabled)
+export async function launchWorkspace(workspace, onStatus, savedState) {
+    const savedUrls = (workspace.webTabs || []).filter(t => t.enabled).map(t => t.url)
     const enabledApps = (workspace.desktopApps || []).filter(a => a.enabled)
-    const total = enabledTabs.length + enabledApps.length
+    const total = savedUrls.length + enabledApps.length
 
     if (total === 0) {
         onStatus('No items configured')
@@ -411,22 +247,54 @@ export async function launchWorkspace(workspace, onStatus) {
 
     onStatus(`Launching ${total} items...`)
 
-    // Fire ALL web tabs and desktop apps simultaneously
-    const webPromises = enabledTabs.map((tab, i) =>
-        launchWebTab(tab, (msg) => onStatus(`[Web ${i + 1}] ${msg}`))
-            .then(result => ({ type: 'web', ...result }))
-            .catch(err => ({ type: 'web', url: tab.url, success: false, error: err.message }))
-    )
+    const webResults = []
+
+    if (savedUrls.length > 0) {
+        activeBrowser = await launchChrome()
+
+        const contextOptions = { viewport: null, ignoreHTTPSErrors: true }
+        if (savedState && savedState.cookies && savedState.cookies.length > 0) {
+            onStatus('Restoring saved session...')
+            contextOptions.storageState = savedState
+        }
+
+        activeContext = await activeBrowser.newContext(contextOptions)
+
+        const tabPromises = savedUrls.map((url, i) => {
+            const fullUrl = url.startsWith('http') ? url : `https://${url}`
+            return (async () => {
+                const page = await activeContext.newPage()
+                try {
+                    onStatus(`[Tab ${i + 1}] Loading ${url}...`)
+                    await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 30000 })
+                    onStatus(`[Tab ${i + 1}] [OK] ${url} — ready`)
+                    return { type: 'web', url, success: true }
+                } catch (err) {
+                    onStatus(`[Tab ${i + 1}] [WARN] ${url} — ${err.message}`)
+                    return { type: 'web', url, success: false }
+                }
+            })()
+        })
+
+        const results = await Promise.all(tabPromises)
+        webResults.push(...results)
+
+        try {
+            for (const p of activeContext.pages()) {
+                if (p.url() !== 'about:blank') {
+                    await p.bringToFront().catch(() => { })
+                    break
+                }
+            }
+        } catch (_) { }
+    }
 
     const appPromises = enabledApps.map((appConfig, i) =>
         launchDesktopApp(appConfig, (msg) => onStatus(`[App ${i + 1}] ${msg}`))
             .then(result => ({ type: 'app', ...result }))
     )
+    const appResults = await Promise.all(appPromises)
 
-    const allResults = await Promise.all([...webPromises, ...appPromises])
-    const webResults = allResults.filter(r => r.type === 'web')
-    const appResults = allResults.filter(r => r.type === 'app')
-
-    onStatus(`[OK] All done (${webResults.length} tabs, ${appResults.length} apps)`)
+    onStatus('LAUNCH_COMPLETE')
     return { webResults, appResults }
 }

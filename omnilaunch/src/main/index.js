@@ -1,16 +1,29 @@
 import { app, BrowserWindow, ipcMain, dialog } from 'electron'
 import { join } from 'path'
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { execSync } from 'child_process'
 import crypto from 'crypto'
-import { launchWorkspace } from './engine.js'
+import { launchWorkspace, launchSessionSetup, captureSession, captureCurrentSession, closeBrowser, closeDesktopApps, onBrowserAllClosed } from './engine.js'
+
+// ─── Vault Path Resolution ─────────────────────────────────────────────────────
+function getVaultDir() {
+    if (app.isPackaged) {
+        // In electron-builder portable builds, the actual .exe sits on the USB,
+        // but it extracts and runs from a temporary folder. 
+        // PORTABLE_EXECUTABLE_DIR gives us the actual USB drive path.
+        if (process.env.PORTABLE_EXECUTABLE_DIR) {
+            return process.env.PORTABLE_EXECUTABLE_DIR
+        }
+        return join(app.getPath('exe'), '..')
+    } else {
+        return join(__dirname, '..', '..')
+    }
+}
 
 // ─── Drive Detection ───────────────────────────────────────────────────────────
 function getDriveInfo() {
-    const appPath = app.isPackaged
-        ? join(app.getPath('exe'), '..')
-        : join(__dirname, '..', '..')
-    const driveLetter = appPath.split(':')[0] + ':'
+    const vaultDir = getVaultDir()
+    const driveLetter = vaultDir.split(':')[0] + ':'
 
     try {
         const driveTypeOutput = execSync(
@@ -37,16 +50,12 @@ function getDriveInfo() {
     }
 }
 
-// ─── Vault Path Resolution ─────────────────────────────────────────────────────
-function getVaultDir() {
-    const exeDir = app.isPackaged
-        ? join(app.getPath('exe'), '..')
-        : join(__dirname, '..', '..')
-    return exeDir
-}
-
 function getVaultPath() {
     return join(getVaultDir(), 'vault.json')
+}
+
+function getStatePath() {
+    return join(getVaultDir(), 'vault.state.json')
 }
 
 // ─── AES-256-GCM Encryption ────────────────────────────────────────────────────
@@ -93,12 +102,12 @@ function getMetaPath() {
 }
 
 function saveVaultMeta(meta) {
-    try {
-        writeFileSync(getMetaPath(), JSON.stringify(meta, null, 2), 'utf-8')
-        try { execSync(`attrib +H "${getMetaPath()}"`) } catch (_) { }
-    } catch (e) {
-        console.error('Failed to save vault meta:', e)
+    const metaPath = getMetaPath()
+    if (existsSync(metaPath)) {
+        try { execSync(`attrib -H -R "${metaPath}"`) } catch (_) { }
     }
+    writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8')
+    try { execSync(`attrib +H "${metaPath}"`) } catch (_) { }
 }
 
 function loadVaultMeta() {
@@ -113,22 +122,50 @@ function loadVaultMeta() {
 
 // ─── IPC Handlers ──────────────────────────────────────────────────────────────
 function registerIpcHandlers() {
+    // Master password held in memory for session state encryption/decryption
+    let activeMasterPassword = null
+
     ipcMain.handle('get-drive-info', () => getDriveInfo())
     ipcMain.handle('vault-exists', () => existsSync(getVaultPath()))
     ipcMain.handle('load-vault-meta', () => loadVaultMeta())
 
+    ipcMain.handle('factory-reset', () => {
+        try {
+            const paths = [getVaultPath(), getMetaPath(), getStatePath()]
+            for (const p of paths) {
+                if (existsSync(p)) {
+                    try { execSync(`attrib -H -R "${p}"`) } catch (_) { }
+                    require('fs').unlinkSync(p)
+                }
+            }
+            return { success: true }
+        } catch (e) {
+            return { success: false, error: e.message }
+        }
+    })
+
+    ipcMain.handle('save-workspace', (_, workspace) => {
+        try {
+            if (!activeMasterPassword) throw new Error('Session is locked')
+            const encryptedVault = encrypt(workspace, activeMasterPassword)
+
+            if (existsSync(getVaultPath())) {
+                try { execSync(`attrib -H -R "${getVaultPath()}"`) } catch (_) { }
+            }
+            writeFileSync(getVaultPath(), JSON.stringify(encryptedVault, null, 2), 'utf-8')
+            try { execSync(`attrib +H "${getVaultPath()}"`) } catch (_) { }
+
+            return { success: true }
+        } catch (e) {
+            return { success: false, error: e.message }
+        }
+    })
+
     ipcMain.handle('save-vault', (_, { masterPassword, pin, fastBoot, workspace }) => {
         try {
             const driveInfo = getDriveInfo()
-            const vaultDir = getVaultDir()
-
-            const appsDir = join(vaultDir, 'Apps')
-            if (!existsSync(appsDir)) mkdirSync(appsDir, { recursive: true })
-
             const encryptedVault = encrypt(workspace, masterPassword)
 
-            // Critical File System Fix: Windows blocks `fs.writeFileSync` on files that have the +H (Hidden) attribute.
-            // We must temporarily remove the Hidden attribute before overwriting the vault JSON file, then reapply it.
             if (existsSync(getVaultPath())) {
                 try { execSync(`attrib -H -R "${getVaultPath()}"`) } catch (_) { }
             }
@@ -159,6 +196,58 @@ function registerIpcHandlers() {
             }
 
             saveVaultMeta(meta)
+
+            // Cache the active master password so that subsequent actions 
+            // (like secondary PIN/FastBoot toggles or Workspace edits) process correctly without requiring restart
+            activeMasterPassword = masterPassword
+
+            return { success: true }
+        } catch (e) {
+            return { success: false, error: e.message }
+        }
+    })
+
+    // --- Isolated Security Handlers ---
+    ipcMain.handle('update-pin', (_, newPin) => {
+        try {
+            if (!activeMasterPassword) throw new Error('Session locked')
+            const driveInfo = getDriveInfo()
+            if (!driveInfo.isRemovable) throw new Error('PIN only supported on removable drives')
+
+            let meta = loadVaultMeta() || { version: '1.0.0', createdOn: driveInfo.serialNumber, isRemovable: true }
+
+            if (newPin) {
+                const pinKey = newPin + ':' + driveInfo.serialNumber
+                meta.pinVault = encrypt({ masterPassword: activeMasterPassword }, pinKey)
+                meta.hasPIN = true
+            } else {
+                delete meta.pinVault
+                meta.hasPIN = false
+            }
+            saveVaultMeta(meta)
+            return { success: true }
+        } catch (e) {
+            return { success: false, error: e.message }
+        }
+    })
+
+    ipcMain.handle('update-fastboot', (_, enable) => {
+        try {
+            if (!activeMasterPassword) throw new Error('Session locked')
+            const driveInfo = getDriveInfo()
+            if (!driveInfo.isRemovable) throw new Error('FastBoot only supported on removable drives')
+
+            let meta = loadVaultMeta() || { version: '1.0.0', createdOn: driveInfo.serialNumber, isRemovable: true }
+
+            if (enable) {
+                const serialKey = 'FASTBOOT:' + driveInfo.serialNumber
+                meta.fastBootVault = encrypt({ masterPassword: activeMasterPassword }, serialKey)
+                meta.fastBoot = true
+            } else {
+                delete meta.fastBootVault
+                meta.fastBoot = false
+            }
+            saveVaultMeta(meta)
             return { success: true }
         } catch (e) {
             return { success: false, error: e.message }
@@ -188,6 +277,9 @@ function registerIpcHandlers() {
             const encryptedVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
             const workspace = decrypt(encryptedVault, masterPassword)
 
+            // Cache the actual master password for future localized state saves / setting updates
+            activeMasterPassword = masterPassword
+
             return { success: true, workspace }
         } catch (e) {
             return { success: false, error: 'Invalid PIN' }
@@ -198,6 +290,10 @@ function registerIpcHandlers() {
         try {
             const encryptedVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
             const workspace = decrypt(encryptedVault, password)
+
+            // Cache the actual master password for future localized state saves / setting updates
+            activeMasterPassword = password
+
             return { success: true, workspace }
         } catch (e) {
             return { success: false, error: 'Invalid password' }
@@ -222,6 +318,9 @@ function registerIpcHandlers() {
             const encryptedVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
             const workspace = decrypt(encryptedVault, masterPassword)
 
+            // Store the master password for session state encryption
+            activeMasterPassword = masterPassword
+
             return { success: true, workspace }
         } catch (e) {
             return { success: false }
@@ -237,16 +336,222 @@ function registerIpcHandlers() {
         return result.filePaths[0]
     })
 
-    // ─── Launch Workspace Engine ─────────────────────────────────────────
-    ipcMain.handle('launch-workspace', async (event, workspace) => {
+    // ─── Session State & Setup ─────────────────────────────────────────────
+
+    ipcMain.handle('set-master-password', (_, password) => {
+        activeMasterPassword = password
+        return { success: true }
+    })
+
+    ipcMain.handle('start-session-setup', async (event) => {
         try {
+            await closeBrowser()
+            closeDesktopApps()
+
             const win = BrowserWindow.fromWebContents(event.sender)
-            const results = await launchWorkspace(workspace, (statusMsg) => {
-                // Send real-time status updates to the renderer
+
+            // Register disconnect callback BEFORE launching
+            // This fires when the user closes all Chrome windows
+            onBrowserAllClosed(() => {
+                if (win && !win.isDestroyed()) {
+                    win.webContents.send('browser-disconnected')
+                }
+            })
+
+            const result = await launchSessionSetup((statusMsg) => {
                 if (win && !win.isDestroyed()) {
                     win.webContents.send('launch-status', statusMsg)
                 }
             })
+
+            return result
+        } catch (err) {
+            return { success: false, error: err.message }
+        }
+    })
+
+    ipcMain.handle('capture-session', async (_, { masterPassword: pw }) => {
+        try {
+            const mp = pw || activeMasterPassword
+            if (!mp) return { success: false, error: 'No master password available' }
+
+            const result = await captureSession()
+            if (!result.success) return result
+
+            // 1. Save the captured URLs into the vault workspace
+            const vaultPath = getVaultPath()
+            if (existsSync(vaultPath)) {
+                try { execSync(`attrib -H -R "${vaultPath}"`) } catch (_) { }
+            }
+
+            // Load existing vault and update webTabs with captured URLs
+            let workspace = { webTabs: [], desktopApps: [] }
+            try {
+                const encryptedVault = JSON.parse(readFileSync(vaultPath, 'utf-8'))
+                workspace = decrypt(encryptedVault, mp)
+            } catch (_) { }
+
+            // Replace webTabs with captured URLs
+            workspace.webTabs = result.urls.map(url => ({ url, enabled: true }))
+
+            // Re-encrypt and save the vault
+            const encryptedVault = encrypt(workspace, mp)
+            writeFileSync(vaultPath, JSON.stringify(encryptedVault, null, 2), 'utf-8')
+            try { execSync(`attrib +H "${vaultPath}"`) } catch (_) { }
+
+            // 2. Save the session state (cookies) to vault.state.json
+            const statePath = getStatePath()
+            if (existsSync(statePath)) {
+                try { execSync(`attrib -H -R "${statePath}"`) } catch (_) { }
+            }
+
+            const encryptedState = encrypt(result.state, mp)
+            writeFileSync(statePath, JSON.stringify(encryptedState, null, 2), 'utf-8')
+            try { execSync(`attrib +H "${statePath}"`) } catch (_) { }
+
+            return { success: true, tabCount: result.tabCount, urls: result.urls }
+        } catch (err) {
+            console.error('Failed to capture session:', err)
+            return { success: false, error: err.message }
+        }
+    })
+
+    // ─── Session Edit (opens browser with saved tabs) ────────────────────
+    ipcMain.handle('start-session-edit', async (event) => {
+        try {
+            await closeBrowser()
+            closeDesktopApps()
+
+            const win = BrowserWindow.fromWebContents(event.sender)
+            const mp = activeMasterPassword
+            if (!mp) return { success: false, error: 'No master password' }
+
+            // Load saved state and URLs
+            let savedState = null
+            let urls = []
+
+            try {
+                const statePath = getStatePath()
+                if (existsSync(statePath)) {
+                    const encrypted = JSON.parse(readFileSync(statePath, 'utf-8'))
+                    savedState = decrypt(encrypted, mp)
+                }
+            } catch (_) { }
+
+            try {
+                const vaultPath = getVaultPath()
+                if (existsSync(vaultPath)) {
+                    const encrypted = JSON.parse(readFileSync(vaultPath, 'utf-8'))
+                    const workspace = decrypt(encrypted, mp)
+                    urls = (workspace.webTabs || []).filter(t => t.enabled).map(t => t.url)
+                }
+            } catch (_) { }
+
+            // Register disconnect callback
+            onBrowserAllClosed(() => {
+                if (win && !win.isDestroyed()) {
+                    win.webContents.send('browser-disconnected')
+                }
+            })
+
+            const result = await launchSessionSetup((statusMsg) => {
+                if (win && !win.isDestroyed()) {
+                    win.webContents.send('launch-status', statusMsg)
+                }
+            }, savedState, urls)
+
+            return result
+        } catch (err) {
+            return { success: false, error: err.message }
+        }
+    })
+
+    // ─── Save Current Session (without closing browser) ──────────────────
+    ipcMain.handle('save-current-session', async () => {
+        try {
+            const mp = activeMasterPassword
+            if (!mp) return { success: false, error: 'No master password' }
+
+            const result = await captureCurrentSession()
+            if (!result.success) return result
+
+            // Save URLs to vault
+            const vaultPath = getVaultPath()
+            if (existsSync(vaultPath)) {
+                try { execSync(`attrib -H -R "${vaultPath}"`) } catch (_) { }
+            }
+
+            let workspace = { webTabs: [], desktopApps: [] }
+            try {
+                const encryptedVault = JSON.parse(readFileSync(vaultPath, 'utf-8'))
+                workspace = decrypt(encryptedVault, mp)
+            } catch (_) { }
+
+            workspace.webTabs = result.urls.map(url => ({ url, enabled: true }))
+            const encryptedVault = encrypt(workspace, mp)
+            writeFileSync(vaultPath, JSON.stringify(encryptedVault, null, 2), 'utf-8')
+            try { execSync(`attrib +H "${vaultPath}"`) } catch (_) { }
+
+            // Save state (cookies) 
+            const statePath = getStatePath()
+            if (existsSync(statePath)) {
+                try { execSync(`attrib -H -R "${statePath}"`) } catch (_) { }
+            }
+            const encryptedState = encrypt(result.state, mp)
+            writeFileSync(statePath, JSON.stringify(encryptedState, null, 2), 'utf-8')
+            try { execSync(`attrib +H "${statePath}"`) } catch (_) { }
+
+            return { success: true, tabCount: result.tabCount, urls: result.urls }
+        } catch (err) {
+            return { success: false, error: err.message }
+        }
+    })
+
+    // ─── Quit & Relaunch ─────────────────────────────────────────────────
+    ipcMain.handle('quit-and-relaunch', async (_, { closeApps = false } = {}) => {
+        try {
+            await closeBrowser()
+            if (closeApps) closeDesktopApps()
+
+            app.quit()
+
+            return { success: true }
+        } catch (err) {
+            return { success: false, error: err.message }
+        }
+    })
+
+    // ─── Close Desktop Apps ──────────────────────────────────────────────
+    ipcMain.handle('close-desktop-apps', () => {
+        closeDesktopApps()
+        return { success: true }
+    })
+
+    // ─── Launch Workspace Engine ─────────────────────────────────────────
+    ipcMain.handle('launch-workspace', async (event, workspace) => {
+        try {
+            await closeBrowser()
+            closeDesktopApps()
+
+            const win = BrowserWindow.fromWebContents(event.sender)
+
+            // Attempt to load saved session state for cookie injection
+            let savedState = null
+            try {
+                const statePath = getStatePath()
+                if (existsSync(statePath) && activeMasterPassword) {
+                    const encrypted = JSON.parse(readFileSync(statePath, 'utf-8'))
+                    savedState = decrypt(encrypted, activeMasterPassword)
+                }
+            } catch (_) {
+                // No saved state or decryption failed
+            }
+
+            const results = await launchWorkspace(workspace, (statusMsg) => {
+                if (win && !win.isDestroyed()) {
+                    win.webContents.send('launch-status', statusMsg)
+                }
+            }, savedState)
             return { success: true, results }
         } catch (err) {
             return { success: false, error: err.message }
@@ -257,6 +562,11 @@ function registerIpcHandlers() {
     ipcMain.handle('close-window', () => {
         const win = BrowserWindow.getFocusedWindow()
         if (win) win.close()
+    })
+
+    ipcMain.handle('minimize-window', () => {
+        const win = BrowserWindow.getFocusedWindow()
+        if (win) win.minimize()
     })
 }
 
@@ -269,6 +579,7 @@ function createWindow() {
         frame: false,
         transparent: false,
         backgroundColor: '#1a1a24',
+
         show: false,
         webPreferences: {
             preload: join(__dirname, '../preload/index.js'),
@@ -288,10 +599,7 @@ function createWindow() {
         mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
     }
 
-    // Open DevTools in dev mode for debugging
-    if (!app.isPackaged) {
-        mainWindow.webContents.openDevTools({ mode: 'detach' })
-    }
+
 
     return mainWindow
 }

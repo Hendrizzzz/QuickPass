@@ -1,7 +1,10 @@
 node_modules/
 out/
-Apps/
+dist/
+build/
 vault.json
 vault.meta.json
+vault.state.json
+Apps/
 .DS_Store
 .env

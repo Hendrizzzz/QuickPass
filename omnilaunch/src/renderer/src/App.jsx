@@ -6,10 +6,12 @@ import LaunchingScreen from './components/LaunchingScreen'
 
 export default function App() {
     const [screen, setScreen] = useState('loading')
+    const [previousScreen, setPreviousScreen] = useState(null)
     const [driveInfo, setDriveInfo] = useState(null)
     const [workspace, setWorkspace] = useState(null)
     const [vaultMeta, setVaultMeta] = useState(null)
     const [error, setError] = useState(null)
+    const [autoLaunch, setAutoLaunch] = useState(true)
 
     useEffect(() => {
         async function boot() {
@@ -56,29 +58,73 @@ export default function App() {
         }, 100)
     }
 
-    const handleUnlock = (ws) => {
-        setWorkspace(ws)
+    const handleUnlock = async (workspace, mp) => {
+        setWorkspace(workspace)
+        setAutoLaunch(true) // Always auto-launch from a fresh unlock
         setScreen('launching')
     }
 
-    const handleGearClick = (ws) => {
-        setWorkspace(ws)
+    // Settings from launching screen  
+    const handleSettingsFromLaunch = () => {
+        setPreviousScreen('launching')
         setScreen('dashboard')
     }
 
-    const handleDashboardSave = () => {
-        setScreen('loading')
-        setTimeout(async () => {
-            const meta = await window.omnilaunch.loadVaultMeta()
-            setVaultMeta(meta)
+    // When dashboard saves or closes, return to where we came from
+    const handleDashboardSave = (forceRelaunch = false, newWorkspace = null) => {
+        if (newWorkspace) {
+            setWorkspace(newWorkspace)
+        }
+
+        if (forceRelaunch) {
+            setAutoLaunch(true)
+            setScreen('launching')
+            setPreviousScreen(null)
+            return
+        }
+
+        if (previousScreen === 'launching') {
+            // Return directly to launching — keep current session alive
+            setAutoLaunch(false)
+            setScreen('launching')
+            setPreviousScreen(null)
+        } else {
+            // Came from unlock — need to re-enter password flow
+            setScreen('loading')
+            setTimeout(async () => {
+                const meta = await window.omnilaunch.loadVaultMeta()
+                setVaultMeta(meta)
+                setScreen('unlock')
+            }, 100)
+            setPreviousScreen(null)
+        }
+    }
+
+    const handleDashboardCancel = () => {
+        if (previousScreen === 'launching') {
+            // Return to launching, do not restart current session
+            setAutoLaunch(false)
+            setScreen('launching')
+        } else {
             setScreen('unlock')
-        }, 100)
+        }
+        setPreviousScreen(null)
     }
 
     return (
         <div className="w-full h-full bg-[#1a1a24] relative overflow-hidden flex flex-col">
             {/* Titlebar */}
             <div className="titlebar">
+                <button
+                    onClick={() => window.omnilaunch.minimize()}
+                    className="btn-icon"
+                    style={{ width: 28, height: 28 }}
+                    title="Minimize"
+                >
+                    <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5">
+                        <path d="M1 5h8" />
+                    </svg>
+                </button>
                 <button
                     onClick={() => window.omnilaunch.close()}
                     className="btn-icon"
@@ -109,7 +155,6 @@ export default function App() {
                         driveInfo={driveInfo}
                         vaultMeta={vaultMeta}
                         onUnlock={handleUnlock}
-                        onGearClick={handleGearClick}
                     />
                 )}
 
@@ -119,12 +164,16 @@ export default function App() {
                         workspace={workspace}
                         vaultMeta={vaultMeta}
                         onSave={handleDashboardSave}
-                        onCancel={() => setScreen('unlock')}
+                        onCancel={handleDashboardCancel}
                     />
                 )}
 
                 {screen === 'launching' && (
-                    <LaunchingScreen workspace={workspace} />
+                    <LaunchingScreen
+                        workspace={workspace}
+                        autoLaunch={autoLaunch}
+                        onSettingsClick={handleSettingsFromLaunch}
+                    />
                 )}
             </div>
         </div>

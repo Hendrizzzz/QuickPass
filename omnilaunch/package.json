@@ -11,7 +11,7 @@
     },
     "dependencies": {
         "otplib": "^12.0.1",
-        "playwright": "^1.58.2"
+        "playwright-core": "^1.58.2"
     },
     "devDependencies": {
         "@vitejs/plugin-react": "^4.3.4",
@@ -27,12 +27,13 @@
     },
     "build": {
         "appId": "com.omnilaunch.app",
-        "productName": "OmniLaunch",
+        "productName": "QuickPass",
         "win": {
-            "target": "portable"
+            "target": "portable",
+            "icon": "build/appicon.png"
         },
         "portable": {
-            "artifactName": "OmniLaunch.exe"
+            "artifactName": "QuickPass.exe"
         },
         "files": [
             "out/**/*"
