@@ -5,6 +5,11 @@ import { execSync } from 'child_process'
 import crypto from 'crypto'
 import { launchWorkspace, launchSessionSetup, captureSession, captureCurrentSession, closeBrowser, closeDesktopApps, onBrowserAllClosed } from './engine.js'
 
+// Phase 11: The Honey Token
+const HONEY_TOKEN = {
+    aws_tracking_key: "AKIA-FAKE-DO-NOT-USE-QUICKPASS-HONEY-TOKEN"
+}
+
 // ─── Vault Path Resolution ─────────────────────────────────────────────────────
 function getVaultDir() {
     if (app.isPackaged) {
@@ -21,32 +26,40 @@ function getVaultDir() {
 }
 
 // ─── Drive Detection ───────────────────────────────────────────────────────────
+let cachedDriveInfo = null
 function getDriveInfo() {
+    if (cachedDriveInfo) return cachedDriveInfo
+
     const vaultDir = getVaultDir()
     const driveLetter = vaultDir.split(':')[0] + ':'
 
     try {
-        const driveTypeOutput = execSync(
-            `wmic logicaldisk where "DeviceID='${driveLetter}'" get DriveType /format:value`,
-            { encoding: 'utf-8' }
-        ).trim()
-
-        const serialOutput = execSync(
-            `wmic logicaldisk where "DeviceID='${driveLetter}'" get VolumeSerialNumber /format:value`,
-            { encoding: 'utf-8' }
-        ).trim()
-
-        const driveType = parseInt(driveTypeOutput.split('=')[1]) || 3
-        const serialNumber = serialOutput.split('=')[1]?.trim() || 'UNKNOWN'
-
-        return {
-            driveLetter,
-            isRemovable: driveType === 2,
-            serialNumber,
-            driveType
+        // We no longer rely on DriveType=2 because many USBs report as 3 (Local).
+        // Since this is distributed as a portable USB app, we will assume it's portable.
+        
+        let serialNumber = 'UNKNOWN'
+        
+        // We still need a unique identifier for the PIN feature to detect hardware copies.
+        // Doing this asynchronously isn't strictly necessary if it's fast, but WMI can be slow.
+        // wmic logicaldisk takes ~1s. We use fs.statSync to get volume serial if possible, 
+        // but Node doesn't expose it directly. We'll fallback to a fast cmd:
+        const volOutput = execSync(`vol ${driveLetter}`, { encoding: 'utf-8' }).trim()
+        const lines = volOutput.split('\n')
+        const serialLine = lines.find(l => l.toLowerCase().includes('serial number'))
+        if (serialLine) {
+            serialNumber = serialLine.split(' ').pop().trim()
         }
+
+        cachedDriveInfo = {
+            driveLetter,
+            isRemovable: true, // Always assume removable for the portable build to allow PIN
+            serialNumber,
+            driveType: 2 // Treat as removable
+        }
+        return cachedDriveInfo
     } catch (e) {
-        return { driveLetter, isRemovable: false, serialNumber: 'UNKNOWN', driveType: 3 }
+        cachedDriveInfo = { driveLetter, isRemovable: true, serialNumber: 'UNKNOWN', driveType: 2 }
+        return cachedDriveInfo
     }
 }
 
@@ -59,13 +72,33 @@ function getStatePath() {
 }
 
 // ─── AES-256-GCM Encryption ────────────────────────────────────────────────────
-function deriveKey(password, salt) {
-    return crypto.pbkdf2Sync(password, salt, 100000, 32, 'sha512')
+let cachedHardwareUUID = null
+function getHardwareUUID() {
+    if (cachedHardwareUUID) return cachedHardwareUUID
+
+    try {
+        // Fast UUID fetch
+        cachedHardwareUUID = execSync('wmic csproduct get uuid', { encoding: 'utf-8' }).split('\n')[1].trim()
+        return cachedHardwareUUID
+    } catch (_) {
+        cachedHardwareUUID = 'UNKNOWN_UUID'
+        return cachedHardwareUUID
+    }
 }
 
-function encrypt(data, password) {
+function deriveKey(password, salt, isFixedDrive = false) {
+    let finalSalt = salt
+    if (isFixedDrive) {
+        const uuid = getHardwareUUID()
+        // Removed `path` binding so you can rename the folder or change drive letters!
+        finalSalt = Buffer.concat([salt, Buffer.from(uuid, 'utf-8')])
+    }
+    return crypto.pbkdf2Sync(password, finalSalt, 100000, 32, 'sha512')
+}
+
+function encrypt(data, password, isFixedDrive = false) {
     const salt = crypto.randomBytes(16)
-    const key = deriveKey(password, salt)
+    const key = deriveKey(password, salt, isFixedDrive)
     const iv = crypto.randomBytes(12)
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
 
@@ -77,7 +110,8 @@ function encrypt(data, password) {
         salt: salt.toString('hex'),
         iv: iv.toString('hex'),
         authTag: authTag.toString('hex'),
-        data: encrypted
+        data: encrypted,
+        isHardwareBound: isFixedDrive
     }
 }
 
@@ -85,7 +119,8 @@ function decrypt(encryptedObj, password) {
     const salt = Buffer.from(encryptedObj.salt, 'hex')
     const iv = Buffer.from(encryptedObj.iv, 'hex')
     const authTag = Buffer.from(encryptedObj.authTag, 'hex')
-    const key = deriveKey(password, salt)
+    const isHardwareBound = !!encryptedObj.isHardwareBound
+    const key = deriveKey(password, salt, isHardwareBound)
 
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv)
     decipher.setAuthTag(authTag)
@@ -120,10 +155,21 @@ function loadVaultMeta() {
     }
 }
 
+// ─── Cryptographic Memory Buffer ───────────────────────────────────────────────
+let activeMasterPasswordBuffer = null
+
+function setActiveMasterPassword(password) {
+    if (!password) {
+        if (activeMasterPasswordBuffer) activeMasterPasswordBuffer.fill(0)
+        activeMasterPasswordBuffer = null
+    } else {
+        if (activeMasterPasswordBuffer) activeMasterPasswordBuffer.fill(0)
+        activeMasterPasswordBuffer = Buffer.from(password, 'utf-8')
+    }
+}
+
 // ─── IPC Handlers ──────────────────────────────────────────────────────────────
 function registerIpcHandlers() {
-    // Master password held in memory for session state encryption/decryption
-    let activeMasterPassword = null
 
     ipcMain.handle('get-drive-info', () => getDriveInfo())
     ipcMain.handle('vault-exists', () => existsSync(getVaultPath()))
@@ -146,8 +192,10 @@ function registerIpcHandlers() {
 
     ipcMain.handle('save-workspace', (_, workspace) => {
         try {
-            if (!activeMasterPassword) throw new Error('Session is locked')
-            const encryptedVault = encrypt(workspace, activeMasterPassword)
+            if (!activeMasterPasswordBuffer) throw new Error('Session is locked')
+
+            const payload = { ...workspace, _honeyToken: HONEY_TOKEN }
+            const encryptedVault = encrypt(payload, activeMasterPasswordBuffer.toString('utf-8'), getDriveInfo().driveType === 3)
 
             if (existsSync(getVaultPath())) {
                 try { execSync(`attrib -H -R "${getVaultPath()}"`) } catch (_) { }
@@ -164,7 +212,9 @@ function registerIpcHandlers() {
     ipcMain.handle('save-vault', (_, { masterPassword, pin, fastBoot, workspace }) => {
         try {
             const driveInfo = getDriveInfo()
-            const encryptedVault = encrypt(workspace, masterPassword)
+
+            const payload = { ...workspace, _honeyToken: HONEY_TOKEN }
+            const encryptedVault = encrypt(payload, masterPassword, driveInfo.driveType === 3)
 
             if (existsSync(getVaultPath())) {
                 try { execSync(`attrib -H -R "${getVaultPath()}"`) } catch (_) { }
@@ -199,7 +249,7 @@ function registerIpcHandlers() {
 
             // Cache the active master password so that subsequent actions 
             // (like secondary PIN/FastBoot toggles or Workspace edits) process correctly without requiring restart
-            activeMasterPassword = masterPassword
+            setActiveMasterPassword(masterPassword)
 
             return { success: true }
         } catch (e) {
@@ -210,7 +260,7 @@ function registerIpcHandlers() {
     // --- Isolated Security Handlers ---
     ipcMain.handle('update-pin', (_, newPin) => {
         try {
-            if (!activeMasterPassword) throw new Error('Session locked')
+            if (!activeMasterPasswordBuffer) throw new Error('Session locked')
             const driveInfo = getDriveInfo()
             if (!driveInfo.isRemovable) throw new Error('PIN only supported on removable drives')
 
@@ -218,7 +268,7 @@ function registerIpcHandlers() {
 
             if (newPin) {
                 const pinKey = newPin + ':' + driveInfo.serialNumber
-                meta.pinVault = encrypt({ masterPassword: activeMasterPassword }, pinKey)
+                meta.pinVault = encrypt({ masterPassword: activeMasterPasswordBuffer.toString('utf-8') }, pinKey)
                 meta.hasPIN = true
             } else {
                 delete meta.pinVault
@@ -233,7 +283,7 @@ function registerIpcHandlers() {
 
     ipcMain.handle('update-fastboot', (_, enable) => {
         try {
-            if (!activeMasterPassword) throw new Error('Session locked')
+            if (!activeMasterPasswordBuffer) throw new Error('Session locked')
             const driveInfo = getDriveInfo()
             if (!driveInfo.isRemovable) throw new Error('FastBoot only supported on removable drives')
 
@@ -241,7 +291,7 @@ function registerIpcHandlers() {
 
             if (enable) {
                 const serialKey = 'FASTBOOT:' + driveInfo.serialNumber
-                meta.fastBootVault = encrypt({ masterPassword: activeMasterPassword }, serialKey)
+                meta.fastBootVault = encrypt({ masterPassword: activeMasterPasswordBuffer.toString('utf-8') }, serialKey)
                 meta.fastBoot = true
             } else {
                 delete meta.fastBootVault
@@ -275,10 +325,13 @@ function registerIpcHandlers() {
             const { masterPassword } = decrypt(meta.pinVault, pinKey)
 
             const encryptedVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
-            const workspace = decrypt(encryptedVault, masterPassword)
+            let workspace = decrypt(encryptedVault, masterPassword)
+
+            // Remove honey token before sending to frontend
+            if (workspace._honeyToken) delete workspace._honeyToken
 
             // Cache the actual master password for future localized state saves / setting updates
-            activeMasterPassword = masterPassword
+            setActiveMasterPassword(masterPassword)
 
             return { success: true, workspace }
         } catch (e) {
@@ -289,10 +342,12 @@ function registerIpcHandlers() {
     ipcMain.handle('unlock-with-password', (_, password) => {
         try {
             const encryptedVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
-            const workspace = decrypt(encryptedVault, password)
+            let workspace = decrypt(encryptedVault, password)
+
+            if (workspace._honeyToken) delete workspace._honeyToken
 
             // Cache the actual master password for future localized state saves / setting updates
-            activeMasterPassword = password
+            setActiveMasterPassword(password)
 
             return { success: true, workspace }
         } catch (e) {
@@ -316,10 +371,12 @@ function registerIpcHandlers() {
             const { masterPassword } = decrypt(meta.fastBootVault, serialKey)
 
             const encryptedVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
-            const workspace = decrypt(encryptedVault, masterPassword)
+            let workspace = decrypt(encryptedVault, masterPassword)
+
+            if (workspace._honeyToken) delete workspace._honeyToken
 
             // Store the master password for session state encryption
-            activeMasterPassword = masterPassword
+            setActiveMasterPassword(masterPassword)
 
             return { success: true, workspace }
         } catch (e) {
@@ -330,16 +387,34 @@ function registerIpcHandlers() {
     ipcMain.handle('browse-exe', async () => {
         const result = await dialog.showOpenDialog({
             properties: ['openFile'],
-            filters: [{ name: 'Executables', extensions: ['exe'] }]
+            filters: [{ name: 'Executables', extensions: ['exe', 'bat', 'cmd'] }]
         })
         if (result.canceled) return null
+
+        const vaultDir = getVaultDir()
+        if (result.filePaths[0].startsWith(vaultDir)) {
+            return result.filePaths[0].replace(vaultDir, '[USB]')
+        }
+        return result.filePaths[0]
+    })
+
+    ipcMain.handle('browse-folder', async () => {
+        const result = await dialog.showOpenDialog({
+            properties: ['openDirectory']
+        })
+        if (result.canceled) return null
+
+        const vaultDir = getVaultDir()
+        if (result.filePaths[0].startsWith(vaultDir)) {
+            return result.filePaths[0].replace(vaultDir, '[USB]')
+        }
         return result.filePaths[0]
     })
 
     // ─── Session State & Setup ─────────────────────────────────────────────
 
     ipcMain.handle('set-master-password', (_, password) => {
-        activeMasterPassword = password
+        setActiveMasterPassword(password)
         return { success: true }
     })
 
@@ -372,7 +447,7 @@ function registerIpcHandlers() {
 
     ipcMain.handle('capture-session', async (_, { masterPassword: pw }) => {
         try {
-            const mp = pw || activeMasterPassword
+            const mp = pw || (activeMasterPasswordBuffer ? activeMasterPasswordBuffer.toString('utf-8') : null)
             if (!mp) return { success: false, error: 'No master password available' }
 
             const result = await captureSession()
@@ -389,13 +464,16 @@ function registerIpcHandlers() {
             try {
                 const encryptedVault = JSON.parse(readFileSync(vaultPath, 'utf-8'))
                 workspace = decrypt(encryptedVault, mp)
+                if (workspace._honeyToken) delete workspace._honeyToken // Remove honey token if present
             } catch (_) { }
 
             // Replace webTabs with captured URLs
             workspace.webTabs = result.urls.map(url => ({ url, enabled: true }))
 
+            const payload = { ...workspace, _honeyToken: HONEY_TOKEN }
+
             // Re-encrypt and save the vault
-            const encryptedVault = encrypt(workspace, mp)
+            const encryptedVault = encrypt(payload, mp, getDriveInfo().driveType === 3)
             writeFileSync(vaultPath, JSON.stringify(encryptedVault, null, 2), 'utf-8')
             try { execSync(`attrib +H "${vaultPath}"`) } catch (_) { }
 
@@ -423,7 +501,7 @@ function registerIpcHandlers() {
             closeDesktopApps()
 
             const win = BrowserWindow.fromWebContents(event.sender)
-            const mp = activeMasterPassword
+            const mp = activeMasterPasswordBuffer ? activeMasterPasswordBuffer.toString('utf-8') : null
             if (!mp) return { success: false, error: 'No master password' }
 
             // Load saved state and URLs
@@ -469,7 +547,7 @@ function registerIpcHandlers() {
     // ─── Save Current Session (without closing browser) ──────────────────
     ipcMain.handle('save-current-session', async () => {
         try {
-            const mp = activeMasterPassword
+            const mp = activeMasterPasswordBuffer ? activeMasterPasswordBuffer.toString('utf-8') : null
             if (!mp) return { success: false, error: 'No master password' }
 
             const result = await captureCurrentSession()
@@ -485,10 +563,14 @@ function registerIpcHandlers() {
             try {
                 const encryptedVault = JSON.parse(readFileSync(vaultPath, 'utf-8'))
                 workspace = decrypt(encryptedVault, mp)
+                if (workspace._honeyToken) delete workspace._honeyToken // Remove honey token if present
             } catch (_) { }
 
             workspace.webTabs = result.urls.map(url => ({ url, enabled: true }))
-            const encryptedVault = encrypt(workspace, mp)
+
+            const payload = { ...workspace, _honeyToken: HONEY_TOKEN }
+            const encryptedVault = encrypt(payload, mp, getDriveInfo().driveType === 3)
+
             writeFileSync(vaultPath, JSON.stringify(encryptedVault, null, 2), 'utf-8')
             try { execSync(`attrib +H "${vaultPath}"`) } catch (_) { }
 
@@ -535,13 +617,24 @@ function registerIpcHandlers() {
 
             const win = BrowserWindow.fromWebContents(event.sender)
 
+            // Phase 12: Dynamically resolve [USB] portable macros back into absolute paths
+            const vaultDir = getVaultDir()
+            if (workspace && workspace.desktopApps) {
+                workspace.desktopApps = workspace.desktopApps.map(app => {
+                    if (app.path && app.path.startsWith('[USB]')) {
+                        return { ...app, path: app.path.replace('[USB]', vaultDir) }
+                    }
+                    return app
+                })
+            }
+
             // Attempt to load saved session state for cookie injection
             let savedState = null
             try {
                 const statePath = getStatePath()
-                if (existsSync(statePath) && activeMasterPassword) {
+                if (existsSync(statePath) && activeMasterPasswordBuffer) {
                     const encrypted = JSON.parse(readFileSync(statePath, 'utf-8'))
-                    savedState = decrypt(encrypted, activeMasterPassword)
+                    savedState = decrypt(encrypted, activeMasterPasswordBuffer.toString('utf-8'))
                 }
             } catch (_) {
                 // No saved state or decryption failed
@@ -605,13 +698,58 @@ function createWindow() {
 }
 
 // ─── App Lifecycle ─────────────────────────────────────────────────────────────
+
+function setupKillCord() {
+    const checkYank = () => {
+        const driveInfo = getDriveInfo()
+        if (driveInfo.isRemovable && !existsSync(getVaultDir())) {
+            // Nuke it
+            setActiveMasterPassword(null)
+            closeDesktopApps()
+            process.exit(1)
+        }
+    }
+
+    try {
+        const { usb } = require('usb')
+        const usbListener = () => checkYank()
+        usb.on('detach', usbListener)
+    } catch (_) { }
+
+    setInterval(checkYank, 1000)
+}
+
+// Phase 11: Zero Data Persistence - UserData & Temp redirection
+const vaultDir = getVaultDir()
+const tmpPath = join(vaultDir, '.tmp')
+if (!existsSync(tmpPath)) {
+    try { require('fs').mkdirSync(tmpPath, { recursive: true }) } catch (_) { }
+}
+app.setPath('userData', join(tmpPath, 'electron-user-data'))
+app.setPath('temp', join(tmpPath, 'electron-temp'))
+
 app.whenReady().then(() => {
     registerIpcHandlers()
     createWindow()
+    setupKillCord()
 
     app.on('activate', () => {
         if (BrowserWindow.getAllWindows().length === 0) createWindow()
     })
+})
+
+app.on('will-quit', () => {
+    // Phase 11: Cryptographic Memory Wiping
+    setActiveMasterPassword(null)
+    closeDesktopApps()
+
+    // Phase 11: Cleanup hidden .tmp traces
+    try {
+        if (existsSync(tmpPath)) {
+            const fs = require('fs')
+            fs.rmSync(tmpPath, { recursive: true, force: true })
+        }
+    } catch (_) { }
 })
 
 app.on('window-all-closed', () => {

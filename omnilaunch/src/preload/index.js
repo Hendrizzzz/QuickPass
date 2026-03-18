@@ -22,6 +22,7 @@ contextBridge.exposeInMainWorld('omnilaunch', {
 
     // File Browser
     browseExe: () => ipcRenderer.invoke('browse-exe'),
+    browseFolder: () => ipcRenderer.invoke('browse-folder'),
 
     // Session Setup & Capture
     setMasterPassword: (pw) => ipcRenderer.invoke('set-master-password', pw),

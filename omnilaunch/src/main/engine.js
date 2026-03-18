@@ -60,7 +60,11 @@ async function launchChrome() {
             '--no-default-browser-check',
             '--disable-infobars',
             '--disable-blink-features=AutomationControlled',
-            '--start-maximized'
+            '--start-maximized',
+            // Phase 11: RAM-Only Execution Flags
+            '--disk-cache-size=1',
+            '--media-cache-size=1',
+            '--disable-gpu-shader-disk-cache'
         ]
     })
 }
@@ -107,13 +111,24 @@ export async function launchSessionSetup(onStatus, savedState = null, urls = [])
 
     activeBrowser = await launchChrome()
 
-    const contextOptions = { viewport: null, ignoreHTTPSErrors: true }
+    const contextOptions = { 
+        viewport: null, 
+        ignoreHTTPSErrors: true,
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36'
+    }
     if (savedState && savedState.cookies && savedState.cookies.length > 0) {
         contextOptions.storageState = savedState
         onStatus('Restoring your session...')
     }
 
     activeContext = await activeBrowser.newContext(contextOptions)
+
+    // Phase 11: Bot Mitigation Script Injection
+    await activeContext.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined })
+        window.chrome = { runtime: {} }
+    })
+
     attachPageTracking(activeContext)
 
     if (urls.length > 0) {
@@ -192,7 +207,9 @@ export function closeDesktopApps() {
     for (const pid of launchedAppPids) {
         try {
             if (process.platform === 'win32') {
-                execSync(`taskkill /pid ${pid} /T /F`, { stdio: 'ignore' })
+                // Phase 12: Graceful Process Teardown
+                // Remove /F so apps receive WM_CLOSE and save state cleanly
+                execSync(`taskkill /pid ${pid} /T`, { stdio: 'ignore' })
             } else {
                 process.kill(-pid) // Kill process group on Unix
             }
@@ -208,11 +225,24 @@ function launchDesktopApp(appConfig, onStatus) {
         try {
             onStatus(`Launching ${appConfig.name}...`)
             const args = appConfig.args ? appConfig.args.split(' ').filter(Boolean) : []
+            let child;
 
-            const child = spawn(appConfig.path, args, {
-                detached: true,
-                stdio: 'ignore'
-            })
+            // Phase 12: File Explorer Context Support
+            // If path ends in a common executable extension, spawn normally.
+            // If it's a directory, spawn it using explorer.exe
+            const isExe = appConfig.path.toLowerCase().endsWith('.exe') || appConfig.path.toLowerCase().endsWith('.bat') || appConfig.path.toLowerCase().endsWith('.cmd')
+
+            if (isExe) {
+                child = spawn(appConfig.path, args, {
+                    detached: true,
+                    stdio: 'ignore'
+                })
+            } else {
+                child = spawn('explorer.exe', [appConfig.path, ...args], {
+                    detached: true,
+                    stdio: 'ignore'
+                })
+            }
 
             // Track the PID so we can close it later
             if (child.pid) launchedAppPids.push(child.pid)
@@ -252,13 +282,23 @@ export async function launchWorkspace(workspace, onStatus, savedState) {
     if (savedUrls.length > 0) {
         activeBrowser = await launchChrome()
 
-        const contextOptions = { viewport: null, ignoreHTTPSErrors: true }
+        const contextOptions = { 
+            viewport: null, 
+            ignoreHTTPSErrors: true,
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36'
+        }
         if (savedState && savedState.cookies && savedState.cookies.length > 0) {
             onStatus('Restoring saved session...')
             contextOptions.storageState = savedState
         }
 
         activeContext = await activeBrowser.newContext(contextOptions)
+
+        // Phase 11: Bot Mitigation Script Injection
+        await activeContext.addInitScript(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined })
+            window.chrome = { runtime: {} }
+        })
 
         const tabPromises = savedUrls.map((url, i) => {
             const fullUrl = url.startsWith('http') ? url : `https://${url}`

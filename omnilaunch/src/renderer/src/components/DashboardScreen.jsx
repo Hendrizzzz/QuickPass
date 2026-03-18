@@ -48,6 +48,14 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         }
     }
 
+    const browseFolder = async () => {
+        const folderPath = await window.omnilaunch.browseFolder()
+        if (folderPath) {
+            const name = folderPath.split('\\').pop()
+            setAppForm({ ...appForm, path: folderPath, name })
+        }
+    }
+
     const addDesktopApp = () => {
         if (!appForm.path.trim()) return
         setDesktopApps([...desktopApps, { ...appForm, id: Date.now(), enabled: true }])
@@ -282,11 +290,11 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                 </div>
             )}
 
-            {/* Desktop Apps */}
+            {/* Desktop Apps & Folders */}
             {!isInSessionMode && (
                 <div className="mb-4">
                     <div className="flex items-center justify-between mb-2">
-                        <span className="section-label">Desktop Apps</span>
+                        <span className="section-label">Apps & Folders</span>
                         <button className="btn-secondary text-xs py-1 px-3" onClick={() => setShowAppForm(!showAppForm)}>
                             {showAppForm ? 'Cancel' : '+ Add'}
                         </button>
@@ -294,18 +302,21 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
 
                     {showAppForm && (
                         <div className="flex flex-col gap-2 p-3 rounded-md mb-2 animate-fade-in bg-[#14141c]">
-                            <input className="form-input text-sm" placeholder="App Name" value={appForm.name} onChange={(e) => setAppForm({ ...appForm, name: e.target.value })} />
+                            <input className="form-input text-sm" placeholder="Display Name" value={appForm.name} onChange={(e) => setAppForm({ ...appForm, name: e.target.value })} />
                             <div className="flex gap-2">
-                                <input className="form-input text-sm flex-1" placeholder="Path to .exe" value={appForm.path} readOnly />
-                                <button className="btn-secondary text-xs whitespace-nowrap" onClick={browseExe}>Browse</button>
+                                <input className="form-input text-sm flex-1" placeholder="Path (.exe or folder)" value={appForm.path} readOnly />
+                                <div className="flex flex-col gap-1 justify-center">
+                                    <button className="btn-secondary text-[10px] whitespace-nowrap px-2 py-0.5" onClick={browseExe}>.EXE</button>
+                                    <button className="btn-secondary text-[10px] whitespace-nowrap px-2 py-0.5" onClick={browseFolder}>Folder</button>
+                                </div>
                             </div>
                             <input className="form-input text-sm" placeholder="Launch Args (optional)" value={appForm.args} onChange={(e) => setAppForm({ ...appForm, args: e.target.value })} />
-                            <button className="btn-primary text-sm py-2" onClick={addDesktopApp}>Add</button>
+                            <button className="btn-primary text-sm py-2" onClick={addDesktopApp}>Add Item</button>
                         </div>
                     )}
 
                     {desktopApps.length === 0 && !showAppForm && (
-                        <p className="text-muted text-xs text-center py-3">No desktop apps configured</p>
+                        <p className="text-muted text-xs text-center py-3">No apps or folders configured</p>
                     )}
 
                     {desktopApps.map((dApp, i) => (
