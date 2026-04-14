@@ -8,7 +8,3 @@ vault.state.json
 Apps/
 .DS_Store
 .env
-.tmp/
-scripts/audit-engine.js
-scripts/audit-test.js
-scripts/e2e-ui-test.js

@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld('omnilaunch', {
     // Security Modular Updates
     updatePin: (newPin) => ipcRenderer.invoke('update-pin', newPin),
     updateFastBoot: (enable) => ipcRenderer.invoke('update-fastboot', enable),
+    updateClearCache: (enable) => ipcRenderer.invoke('update-clear-cache', enable),
 
     // Unlock
     unlockWithPin: (pin) => ipcRenderer.invoke('unlock-with-pin', pin),
@@ -23,6 +24,17 @@ contextBridge.exposeInMainWorld('omnilaunch', {
     // File Browser
     browseExe: () => ipcRenderer.invoke('browse-exe'),
     browseFolder: () => ipcRenderer.invoke('browse-folder'),
+
+    // App Import
+    scanApps: () => ipcRenderer.invoke('scan-apps'),
+    importApp: (data) => ipcRenderer.invoke('import-app', data),
+    notifyImportStarted: () => ipcRenderer.send('import-started'),
+    notifyImportFinished: () => ipcRenderer.send('import-finished'),
+    onImportProgress: (callback) => {
+        const listener = (_, data) => callback(data)
+        ipcRenderer.on('import-progress', listener)
+        return () => ipcRenderer.removeListener('import-progress', listener)
+    },
 
     // Session Setup & Capture
     setMasterPassword: (pw) => ipcRenderer.invoke('set-master-password', pw),
@@ -40,6 +52,11 @@ contextBridge.exposeInMainWorld('omnilaunch', {
     onLaunchStatus: (callback) => {
         ipcRenderer.on('launch-status', (_, msg) => callback(msg))
         return () => ipcRenderer.removeAllListeners('launch-status')
+    },
+    // Phase 16: Async launch completion event (non-blocking IPC)
+    onLaunchComplete: (callback) => {
+        ipcRenderer.on('launch-complete', (_, data) => callback(data))
+        return () => ipcRenderer.removeAllListeners('launch-complete')
     },
     onBrowserDisconnect: (callback) => {
         ipcRenderer.on('browser-disconnected', () => callback())

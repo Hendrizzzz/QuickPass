@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import ImportAppsModal from './ImportAppsModal'
 
 export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSave, onCancel }) {
     const [webTabs, setWebTabs] = useState(workspace?.webTabs || [])
@@ -7,7 +8,8 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const [error, setError] = useState('')
 
     const [showAppForm, setShowAppForm] = useState(false)
-    const [appForm, setAppForm] = useState({ name: '', path: '', args: '' })
+    const [appForm, setAppForm] = useState({ name: '', path: '', args: '', portableData: false })
+    const [showImportModal, setShowImportModal] = useState(false)
 
     const [masterPassword, setMasterPassword] = useState('')
     const [confirmMasterPassword, setConfirmMasterPassword] = useState('')
@@ -18,6 +20,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const [pin, setPin] = useState('')
     const [confirmPin, setConfirmPin] = useState('')
     const [fastBoot, setFastBoot] = useState(false)
+    const [clearCacheOnExit, setClearCacheOnExit] = useState(true) // default ON = zero footprint
 
     // Read the freshest meta from disk on mount to perfectly sync security UI toggles
     useEffect(() => {
@@ -26,10 +29,12 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
             if (latestMeta) {
                 setUsePin(latestMeta.hasPIN || false)
                 setFastBoot(latestMeta.fastBoot || false)
+                setClearCacheOnExit(latestMeta.clearCacheOnExit !== false) // default ON
             } else if (vaultMeta) {
                 // Fallback to prop if fetch fails
                 setUsePin(vaultMeta.hasPIN || false)
                 setFastBoot(vaultMeta.fastBoot || false)
+                setClearCacheOnExit(vaultMeta.clearCacheOnExit !== false)
             }
         }
         fetchMeta()
@@ -59,7 +64,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const addDesktopApp = () => {
         if (!appForm.path.trim()) return
         setDesktopApps([...desktopApps, { ...appForm, id: Date.now(), enabled: true }])
-        setAppForm({ name: '', path: '', args: '' })
+        setAppForm({ name: '', path: '', args: '', portableData: false })
         setShowAppForm(false)
     }
 
@@ -131,6 +136,11 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     }
 
     const handleDisablePin = async () => {
+        // Phase 17.2: USB uses hidden password — must keep at least one unlock method
+        if (driveInfo?.isRemovable && !fastBoot) {
+            setError('Enable Fast Boot first — PIN is your only unlock method on USB drives')
+            return
+        }
         setSaving(true)
         setError('')
         const result = await window.omnilaunch.updatePin(null)
@@ -150,12 +160,28 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
 
     const handleToggleFastBoot = async () => {
         const newState = !fastBoot
+        // Phase 17.2: USB uses hidden password — must keep at least one unlock method
+        if (!newState && driveInfo?.isRemovable && !usePin) {
+            setError('Enable PIN first — Fast Boot is your only unlock method on USB drives')
+            return
+        }
         setError('')
         const result = await window.omnilaunch.updateFastBoot(newState)
         if (result.success) {
             setFastBoot(newState)
         } else {
             setError('Failed to update FastBoot')
+        }
+    }
+
+    const handleToggleClearCache = async () => {
+        const newState = !clearCacheOnExit
+        setError('')
+        const result = await window.omnilaunch.updateClearCache(newState)
+        if (result.success) {
+            setClearCacheOnExit(newState)
+        } else {
+            setError('Failed to update setting')
         }
     }
 
@@ -177,7 +203,9 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
 
     // Save and close after edit/recapture
     const handleSessionSave = async () => {
-        if (!masterPassword.trim()) {
+        // Phase 17.2: USB users don't know the hidden master password —
+        // backend falls back to cached activeMasterPasswordBuffer (index.js:1011)
+        if (!driveInfo?.isRemovable && !masterPassword.trim()) {
             setError('Enter your master password first')
             return
         }
@@ -197,13 +225,16 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const isInSessionMode = sessionMode !== null
 
     return (
-        <div className="card p-6 w-full max-w-sm animate-slide-up overflow-y-auto" style={{ maxHeight: 540 }}>
-            <div className="flex items-center justify-between mb-4">
+        <div className="card p-6 w-full max-w-sm animate-slide-up flex flex-col" style={{ maxHeight: 540 }}>
+            <div className="flex items-center justify-between mb-4 flex-shrink-0">
                 <h1 className="text-lg font-semibold text-white">Settings</h1>
                 {!isInSessionMode && (
                     <button className="btn-secondary text-xs py-1 px-3" onClick={onCancel}>Close</button>
                 )}
             </div>
+
+            {/* Scrollable content area */}
+            <div className="flex-1 overflow-y-auto min-h-0">
 
             {/* Session Edit/Recapture Mode */}
             {isInSessionMode && (
@@ -228,13 +259,16 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
 
                     {browserOpen && (
                         <>
-                            <input
-                                type="password"
-                                className="form-input text-sm mb-2"
-                                placeholder="Master Password (to re-encrypt)"
-                                value={masterPassword}
-                                onChange={(e) => { setMasterPassword(e.target.value); setError('') }}
-                            />
+                            {/* Phase 17.2: Hide password input for USB — backend uses cached password */}
+                            {!driveInfo?.isRemovable && (
+                                <input
+                                    type="password"
+                                    className="form-input text-sm mb-2"
+                                    placeholder="Master Password (to re-encrypt)"
+                                    value={masterPassword}
+                                    onChange={(e) => { setMasterPassword(e.target.value); setError('') }}
+                                />
+                            )}
                             <button className="btn-primary w-full mb-2" disabled={saving} onClick={handleSessionSave}>
                                 {saving ? (
                                     <span className="flex items-center justify-center gap-2">
@@ -295,9 +329,14 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                 <div className="mb-4">
                     <div className="flex items-center justify-between mb-2">
                         <span className="section-label">Apps & Folders</span>
-                        <button className="btn-secondary text-xs py-1 px-3" onClick={() => setShowAppForm(!showAppForm)}>
-                            {showAppForm ? 'Cancel' : '+ Add'}
-                        </button>
+                        <div className="flex gap-1">
+                            <button className="btn-secondary text-xs py-1 px-2" onClick={() => setShowImportModal(true)}>
+                                Import from PC
+                            </button>
+                            <button className="btn-secondary text-xs py-1 px-3" onClick={() => setShowAppForm(!showAppForm)}>
+                                {showAppForm ? 'Cancel' : '+ Add'}
+                            </button>
+                        </div>
                     </div>
 
                     {showAppForm && (
@@ -311,6 +350,15 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                 </div>
                             </div>
                             <input className="form-input text-sm" placeholder="Launch Args (optional)" value={appForm.args} onChange={(e) => setAppForm({ ...appForm, args: e.target.value })} />
+                            <label className="flex items-center gap-2 text-xs text-secondary cursor-pointer py-1">
+                                <input
+                                    type="checkbox"
+                                    checked={appForm.portableData}
+                                    onChange={(e) => setAppForm({ ...appForm, portableData: e.target.checked })}
+                                    className="accent-[#5b7bd5]"
+                                />
+                                <span>Keep app data on USB <span className="text-muted">(Electron/Chrome apps)</span></span>
+                            </label>
                             <button className="btn-primary text-sm py-2" onClick={addDesktopApp}>Add Item</button>
                         </div>
                     )}
@@ -328,7 +376,12 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                 <div className="toggle-thumb" />
                             </div>
                             <div className="flex-1 min-w-0">
-                                <p className="text-sm text-white truncate">{dApp.name}</p>
+                                <div className="flex items-center gap-1.5">
+                                    <p className="text-sm text-white truncate">{dApp.name}</p>
+                                    {dApp.portableData && (
+                                        <span className="px-1.5 py-0.5 rounded text-[10px] bg-blue-900/40 text-blue-400 border border-blue-800/40 flex-shrink-0">Portable</span>
+                                    )}
+                                </div>
                                 <p className="text-xs text-muted truncate">{dApp.path}</p>
                             </div>
                             <button className="btn-danger-text" onClick={() => setDesktopApps(desktopApps.filter((_, j) => j !== i))}>Remove</button>
@@ -448,6 +501,17 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                             </div>
                         )}
 
+                        {/* Clear App Cache on Exit Toggle */}
+                        <div className="border border-[#2a2a3a] rounded-md overflow-hidden bg-[#1a1a24] p-3 flex justify-between items-center">
+                            <div>
+                                <p className="text-sm text-white">Clear App Cache on Exit</p>
+                                <p className="text-xs text-muted mt-0.5">{clearCacheOnExit ? 'Apps re-extract on each launch (~2 min)' : 'Instant launches — cached apps persist'}</p>
+                            </div>
+                            <div className={`toggle-track ${clearCacheOnExit ? 'active' : ''}`} onClick={handleToggleClearCache}>
+                                <div className="toggle-thumb" />
+                            </div>
+                        </div>
+
                         {error && !error.includes('assword') && !error.includes('PIN') && (
                             <p className="text-error text-xs text-center mt-1">{error}</p>
                         )}
@@ -455,15 +519,29 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                 </div>
             )}
 
-            {/* Save Desktop Apps Changes */}
+            </div>
+
+            {/* Save Desktop Apps Changes - STICKY */}
             {!isInSessionMode && (
-                <button className="btn-primary w-full" disabled={saving} onClick={handleSaveClick}>
-                    {saving ? (
-                        <span className="flex items-center justify-center gap-2">
-                            <div className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} /> Saving...
-                        </span>
-                    ) : 'Save Changes'}
-                </button>
+                <div className="flex-shrink-0 pt-3">
+                    <button className="btn-primary w-full" disabled={saving} onClick={handleSaveClick}>
+                        {saving ? (
+                            <span className="flex items-center justify-center gap-2">
+                                <div className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} /> Saving...
+                            </span>
+                        ) : 'Save Changes'}
+                    </button>
+                </div>
+            )}
+
+            {showImportModal && (
+                <ImportAppsModal
+                    onClose={() => setShowImportModal(false)}
+                    onImportComplete={(importedApps) => {
+                        setDesktopApps(prev => [...prev, ...importedApps])
+                        setShowImportModal(false)
+                    }}
+                />
             )}
         </div>
     )

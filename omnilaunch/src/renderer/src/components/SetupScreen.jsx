@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import ImportAppsModal from './ImportAppsModal'
 
 export default function SetupScreen({ driveInfo, onComplete }) {
     const isRemovable = driveInfo?.isRemovable
@@ -16,6 +17,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
     const [desktopApps, setDesktopApps] = useState([])
     const [showAppForm, setShowAppForm] = useState(false)
     const [appForm, setAppForm] = useState({ name: '', path: '', args: '' })
+    const [showImportModal, setShowImportModal] = useState(false)
 
     // Session capture state
     const [browserOpen, setBrowserOpen] = useState(false)
@@ -110,9 +112,9 @@ export default function SetupScreen({ driveInfo, onComplete }) {
     const appsStep = 2
 
     return (
-        <div className="card p-6 w-full max-w-sm animate-slide-up overflow-y-auto" style={{ maxHeight: 560 }}>
+        <div className="card p-6 w-full max-w-sm animate-slide-up flex flex-col" style={{ maxHeight: 560 }}>
             {/* Header */}
-            <div className="text-center mb-5">
+            <div className="text-center mb-5 flex-shrink-0">
                 <h1 className="text-lg font-semibold text-white">
                     {step === sessionStep ? 'Set Up Your Browser' : 'Initial Setup'}
                 </h1>
@@ -124,7 +126,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
             </div>
 
             {/* Step Indicator */}
-            <div className="step-indicator mb-5">
+            <div className="step-indicator mb-5 flex-shrink-0">
                 {Array.from({ length: totalSteps }, (_, i) => i + 1).map((s) => (
                     <div key={s} className={`step-dot ${step === s ? 'active' : step > s ? 'done' : ''}`} />
                 ))}
@@ -237,19 +239,27 @@ export default function SetupScreen({ driveInfo, onComplete }) {
 
             {/* Desktop Apps & Folders Step (Step 2) */}
             {step === appsStep && (
-                <div className="flex flex-col gap-4 animate-fade-in">
-                    <p className="text-secondary text-sm">
-                        Add portable apps or project folders to launch with your workspace. You can skip this.
-                    </p>
-
-                    <div>
+                <div className="flex flex-col flex-1 min-h-0 animate-fade-in">
+                    {/* Description + section header - STICKY */}
+                    <div className="flex-shrink-0">
+                        <p className="text-secondary text-sm mb-4">
+                            Add portable apps or project folders to launch with your workspace. You can skip this.
+                        </p>
                         <div className="flex items-center justify-between mb-2">
                             <span className="section-label">Apps & Folders</span>
-                            <button className="btn-secondary text-xs py-1 px-3" onClick={() => setShowAppForm(!showAppForm)}>
-                                {showAppForm ? 'Cancel' : '+ Add'}
-                            </button>
+                            <div className="flex gap-1">
+                                <button className="btn-secondary text-xs py-1 px-2" onClick={() => setShowImportModal(true)}>
+                                    Import from PC
+                                </button>
+                                <button className="btn-secondary text-xs py-1 px-3" onClick={() => setShowAppForm(!showAppForm)}>
+                                    {showAppForm ? 'Cancel' : '+ Add'}
+                                </button>
+                            </div>
                         </div>
+                    </div>
 
+                    {/* App list - SCROLLABLE */}
+                    <div className="flex-1 overflow-y-auto min-h-0 mb-3">
                         {showAppForm && (
                             <div className="flex flex-col gap-2 p-3 rounded-md mb-2 animate-fade-in bg-[#14141c]">
                                 <input className="form-input text-sm" placeholder="Display Name" value={appForm.name} onChange={(e) => setAppForm({ ...appForm, name: e.target.value })} />
@@ -282,21 +292,34 @@ export default function SetupScreen({ driveInfo, onComplete }) {
                         )}
                     </div>
 
-                    <div className="flex gap-2 mt-1">
-                        <button className="btn-secondary flex-1" onClick={() => setStep(isRemovable ? 2 : 1)}>Back</button>
-                        <button
-                            className="btn-primary flex-1"
-                            disabled={saving}
-                            onClick={handleProceedToCapture}
-                        >
-                            {saving ? (
-                                <span className="flex items-center justify-center gap-2">
-                                    <div className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} /> Saving...
-                                </span>
-                            ) : desktopApps.length === 0 ? 'Skip & Continue' : 'Continue'}
-                        </button>
+                    {/* Navigation buttons - STICKY */}
+                    <div className="flex-shrink-0">
+                        <div className="flex gap-2">
+                            <button className="btn-secondary flex-1" onClick={() => setStep(1)}>Back</button>
+                            <button
+                                className="btn-primary flex-1"
+                                disabled={saving}
+                                onClick={handleProceedToCapture}
+                            >
+                                {saving ? (
+                                    <span className="flex items-center justify-center gap-2">
+                                        <div className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} /> Saving...
+                                    </span>
+                                ) : desktopApps.length === 0 ? 'Skip & Continue' : 'Continue'}
+                            </button>
+                        </div>
+                        {error && <p className="text-error text-xs text-center mt-2">{error}</p>}
                     </div>
-                    {error && <p className="text-error text-xs text-center mt-2">{error}</p>}
+
+                    {showImportModal && (
+                        <ImportAppsModal
+                            onClose={() => setShowImportModal(false)}
+                            onImportComplete={(importedApps) => {
+                                setDesktopApps(prev => [...prev, ...importedApps])
+                                setShowImportModal(false)
+                            }}
+                        />
+                    )}
                 </div>
             )}
 

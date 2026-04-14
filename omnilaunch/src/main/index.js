@@ -1,9 +1,12 @@
 import { app, BrowserWindow, ipcMain, dialog } from 'electron'
-import { join } from 'path'
-import { existsSync, readFileSync, writeFileSync } from 'fs'
-import { execSync } from 'child_process'
+import { join, basename } from 'path'
+import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync } from 'fs'
+import { execSync, spawn, exec } from 'child_process'
+import os from 'os'
+import util from 'util'
+const execAsync = util.promisify(exec)
 import crypto from 'crypto'
-import { launchWorkspace, launchSessionSetup, captureSession, captureCurrentSession, closeBrowser, closeDesktopApps, onBrowserAllClosed } from './engine.js'
+import { launchWorkspace, launchSessionSetup, captureSession, captureCurrentSession, closeBrowser, closeDesktopApps, emergencyKillDesktopAppsSync, onBrowserAllClosed, wipeLocalTraces, wipeAllLocalProfiles, wipeAllLocalAppData, wipeLocalAppCache, runDiagnostics, diagError } from './engine.js'
 
 // Phase 11: The Honey Token
 const HONEY_TOKEN = {
@@ -27,28 +30,23 @@ function getVaultDir() {
 
 // ─── Drive Detection ───────────────────────────────────────────────────────────
 let cachedDriveInfo = null
-function getDriveInfo() {
+async function getDriveInfo() {
     if (cachedDriveInfo) return cachedDriveInfo
 
     const vaultDir = getVaultDir()
     const driveLetter = vaultDir.split(':')[0] + ':'
 
     try {
-        // We no longer rely on DriveType=2 because many USBs report as 3 (Local).
-        // Since this is distributed as a portable USB app, we will assume it's portable.
-        
         let serialNumber = 'UNKNOWN'
         
-        // We still need a unique identifier for the PIN feature to detect hardware copies.
-        // Doing this asynchronously isn't strictly necessary if it's fast, but WMI can be slow.
-        // wmic logicaldisk takes ~1s. We use fs.statSync to get volume serial if possible, 
-        // but Node doesn't expose it directly. We'll fallback to a fast cmd:
-        const volOutput = execSync(`vol ${driveLetter}`, { encoding: 'utf-8' }).trim()
-        const lines = volOutput.split('\n')
-        const serialLine = lines.find(l => l.toLowerCase().includes('serial number'))
-        if (serialLine) {
-            serialNumber = serialLine.split(' ').pop().trim()
-        }
+        try {
+            const { stdout } = await execAsync(`vol ${driveLetter}`, { encoding: 'utf-8' })
+            const lines = stdout.trim().split('\n')
+            const serialLine = lines.find(l => l.toLowerCase().includes('serial number'))
+            if (serialLine) {
+                serialNumber = serialLine.split(' ').pop().trim()
+            }
+        } catch (_) {}
 
         cachedDriveInfo = {
             driveLetter,
@@ -171,7 +169,7 @@ function setActiveMasterPassword(password) {
 // ─── IPC Handlers ──────────────────────────────────────────────────────────────
 function registerIpcHandlers() {
 
-    ipcMain.handle('get-drive-info', () => getDriveInfo())
+    ipcMain.handle('get-drive-info', async () => await getDriveInfo())
     ipcMain.handle('vault-exists', () => existsSync(getVaultPath()))
     ipcMain.handle('load-vault-meta', () => loadVaultMeta())
 
@@ -190,12 +188,13 @@ function registerIpcHandlers() {
         }
     })
 
-    ipcMain.handle('save-workspace', (_, workspace) => {
+    ipcMain.handle('save-workspace', async (_, workspace) => {
         try {
             if (!activeMasterPasswordBuffer) throw new Error('Session is locked')
 
             const payload = { ...workspace, _honeyToken: HONEY_TOKEN }
-            const encryptedVault = encrypt(payload, activeMasterPasswordBuffer.toString('utf-8'), getDriveInfo().driveType === 3)
+            const driveInfo = await getDriveInfo()
+            const encryptedVault = encrypt(payload, activeMasterPasswordBuffer.toString('utf-8'), driveInfo.driveType === 3)
 
             if (existsSync(getVaultPath())) {
                 try { execSync(`attrib -H -R "${getVaultPath()}"`) } catch (_) { }
@@ -209,9 +208,9 @@ function registerIpcHandlers() {
         }
     })
 
-    ipcMain.handle('save-vault', (_, { masterPassword, pin, fastBoot, workspace }) => {
+    ipcMain.handle('save-vault', async (_, { masterPassword, pin, fastBoot, workspace }) => {
         try {
-            const driveInfo = getDriveInfo()
+            const driveInfo = await getDriveInfo()
 
             const payload = { ...workspace, _honeyToken: HONEY_TOKEN }
             const encryptedVault = encrypt(payload, masterPassword, driveInfo.driveType === 3)
@@ -258,10 +257,10 @@ function registerIpcHandlers() {
     })
 
     // --- Isolated Security Handlers ---
-    ipcMain.handle('update-pin', (_, newPin) => {
+    ipcMain.handle('update-pin', async (_, newPin) => {
         try {
             if (!activeMasterPasswordBuffer) throw new Error('Session locked')
-            const driveInfo = getDriveInfo()
+            const driveInfo = await getDriveInfo()
             if (!driveInfo.isRemovable) throw new Error('PIN only supported on removable drives')
 
             let meta = loadVaultMeta() || { version: '1.0.0', createdOn: driveInfo.serialNumber, isRemovable: true }
@@ -271,6 +270,10 @@ function registerIpcHandlers() {
                 meta.pinVault = encrypt({ masterPassword: activeMasterPasswordBuffer.toString('utf-8') }, pinKey)
                 meta.hasPIN = true
             } else {
+                // Phase 17.2: Prevent lockout — refuse if FastBoot is also off
+                if (!meta.fastBoot) {
+                    return { success: false, error: 'Cannot disable PIN: no other unlock method is available' }
+                }
                 delete meta.pinVault
                 meta.hasPIN = false
             }
@@ -281,10 +284,10 @@ function registerIpcHandlers() {
         }
     })
 
-    ipcMain.handle('update-fastboot', (_, enable) => {
+    ipcMain.handle('update-fastboot', async (_, enable) => {
         try {
             if (!activeMasterPasswordBuffer) throw new Error('Session locked')
-            const driveInfo = getDriveInfo()
+            const driveInfo = await getDriveInfo()
             if (!driveInfo.isRemovable) throw new Error('FastBoot only supported on removable drives')
 
             let meta = loadVaultMeta() || { version: '1.0.0', createdOn: driveInfo.serialNumber, isRemovable: true }
@@ -294,6 +297,10 @@ function registerIpcHandlers() {
                 meta.fastBootVault = encrypt({ masterPassword: activeMasterPasswordBuffer.toString('utf-8') }, serialKey)
                 meta.fastBoot = true
             } else {
+                // Phase 17.2: Prevent lockout — refuse if PIN is also off
+                if (!meta.hasPIN) {
+                    return { success: false, error: 'Cannot disable Fast Boot: no other unlock method is available' }
+                }
                 delete meta.fastBootVault
                 meta.fastBoot = false
             }
@@ -304,14 +311,28 @@ function registerIpcHandlers() {
         }
     })
 
-    ipcMain.handle('unlock-with-pin', (_, pin) => {
+    // Phase 17.1: Toggle for clearing extracted app cache on exit
+    // ON  = Zero-footprint mode (safe for public/school PCs)
+    // OFF = Keep cache for instant launches (ideal for home PC)
+    ipcMain.handle('update-clear-cache', async (_, enable) => {
+        try {
+            let meta = loadVaultMeta() || { version: '1.0.0' }
+            meta.clearCacheOnExit = enable
+            saveVaultMeta(meta)
+            return { success: true }
+        } catch (e) {
+            return { success: false, error: e.message }
+        }
+    })
+
+    ipcMain.handle('unlock-with-pin', async (_, pin) => {
         try {
             const meta = loadVaultMeta()
             if (!meta || !meta.hasPIN || !meta.pinVault) {
                 return { success: false, error: 'PIN not configured' }
             }
 
-            const driveInfo = getDriveInfo()
+            const driveInfo = await getDriveInfo()
 
             if (meta.createdOn !== driveInfo.serialNumber) {
                 return {
@@ -355,14 +376,14 @@ function registerIpcHandlers() {
         }
     })
 
-    ipcMain.handle('try-fast-boot', () => {
+    ipcMain.handle('try-fast-boot', async () => {
         try {
             const meta = loadVaultMeta()
             if (!meta || !meta.fastBoot || !meta.fastBootVault) {
                 return { success: false }
             }
 
-            const driveInfo = getDriveInfo()
+            const driveInfo = await getDriveInfo()
             if (meta.createdOn !== driveInfo.serialNumber) {
                 return { success: false }
             }
@@ -411,6 +432,554 @@ function registerIpcHandlers() {
         return result.filePaths[0]
     })
 
+    // ─── App Scanner & Importer ────────────────────────────────────────────
+
+    const SKIP_DIRS = new Set([
+        'CachedData', 'Cache', 'Code Cache', 'GPUCache',
+        'GrShaderCache', 'ShaderCache', 'DawnWebGPUCache',
+        'DawnGraphiteCache', 'Service Worker', 'ScriptCache',
+        'Crashpad', 'logs', 'blob_storage',
+        'component_crx_cache', 'extensions_crx_cache',
+        'Safe Browsing', 'WasmTtsEngine', 'BrowserMetrics',
+        'optimization_guide_model_store', 'OnDeviceHeadSuggestModel',
+        'MediaFoundationWidevineCdm'
+    ])
+
+    const SKIP_FILES = new Set(['unins000.exe', 'unins000.dat'])
+
+    function isPortableApp(dirPath) {
+        try {
+            const hasResources = existsSync(join(dirPath, 'resources'))
+            const hasAsar = existsSync(join(dirPath, 'resources', 'app.asar'))
+            const hasAppDir = existsSync(join(dirPath, 'resources', 'app'))
+            const hasLocales = existsSync(join(dirPath, 'locales'))
+            return (hasResources && (hasAsar || hasAppDir)) || hasLocales
+        } catch (_) { return false }
+    }
+
+    function findMainExe(dirPath) {
+        try {
+            const files = readdirSync(dirPath)
+            const exes = files.filter(f =>
+                f.toLowerCase().endsWith('.exe') &&
+                !f.toLowerCase().startsWith('unins') &&
+                !f.toLowerCase().startsWith('update') &&
+                !f.toLowerCase().startsWith('old_') &&
+                !f.toLowerCase().includes('helper') &&
+                !f.toLowerCase().includes('crash') &&
+                !f.toLowerCase().includes('updater')
+            )
+            if (exes.length === 0) return null
+            // Pick the largest .exe (the main binary)
+            let best = exes[0]
+            let bestSize = 0
+            for (const exe of exes) {
+                try {
+                    const size = statSync(join(dirPath, exe)).size
+                    if (size > bestSize) { bestSize = size; best = exe }
+                } catch (_) { }
+            }
+            return best
+        } catch (_) { return null }
+    }
+
+    function getDirSize(dirPath, skipDirs = new Set()) {
+        let total = 0
+        try {
+            const entries = readdirSync(dirPath, { withFileTypes: true })
+            for (const entry of entries) {
+                if (entry.isDirectory()) {
+                    if (skipDirs.has(entry.name)) continue
+                    total += getDirSize(join(dirPath, entry.name), skipDirs)
+                } else {
+                    try { total += statSync(join(dirPath, entry.name)).size } catch (_) { }
+                }
+            }
+        } catch (_) { }
+        return total
+    }
+
+    function findAppDataPath(appName) {
+        const APPDATA = process.env.APPDATA || ''
+        const LOCALAPPDATA = process.env.LOCALAPPDATA || ''
+
+        // Known mappings for browsers
+        const browserMappings = {
+            'chrome': join(LOCALAPPDATA, 'Google', 'Chrome', 'User Data'),
+            'msedge': join(LOCALAPPDATA, 'Microsoft', 'Edge', 'User Data'),
+            'opera': join(APPDATA, 'Opera Software', 'Opera Stable'),
+            'opera gx': join(APPDATA, 'Opera Software', 'Opera GX Stable')
+        }
+
+        const lowerName = appName.toLowerCase()
+        for (const [key, dataPath] of Object.entries(browserMappings)) {
+            if (lowerName.includes(key) && existsSync(dataPath)) return dataPath
+        }
+
+        // Electron apps: try %APPDATA%/<name> (various casings)
+        const tryPaths = [
+            join(APPDATA, appName),
+            join(APPDATA, appName.toLowerCase()),
+            join(APPDATA, appName.charAt(0).toUpperCase() + appName.slice(1))
+        ]
+        for (const p of tryPaths) {
+            if (existsSync(p)) return p
+        }
+
+        // Scan %APPDATA% for case-insensitive match
+        try {
+            const entries = readdirSync(APPDATA)
+            const match = entries.find(e => e.toLowerCase() === lowerName)
+            if (match) return join(APPDATA, match)
+        } catch (_) { }
+
+        return null
+    }
+
+    async function getDirSizeAsync(dirPath, skipDirs = new Set()) {
+        let total = 0
+        try {
+            const fs = require('fs').promises
+            const entries = await fs.readdir(dirPath, { withFileTypes: true })
+            const tasks = entries.map(async (entry) => {
+                if (entry.isDirectory()) {
+                    if (skipDirs.has(entry.name)) return 0
+                    return await getDirSizeAsync(join(dirPath, entry.name), skipDirs)
+                } else {
+                    try { const stat = await fs.stat(join(dirPath, entry.name)); return stat.size } catch (_) { return 0 }
+                }
+            })
+            const sizes = await Promise.all(tasks)
+            total = sizes.reduce((a, b) => a + b, 0)
+        } catch (_) { }
+        return total
+    }
+
+    ipcMain.handle('scan-apps', async () => {
+        const vaultDir = getVaultDir()
+        const appsDir = join(vaultDir, 'Apps')
+        const results = []
+        const seen = new Set()
+
+        // Blacklist: filter out system utilities, runtimes, and drivers
+        const BLACKLIST_PATTERNS = [
+            /microsoft visual c\+\+/i, /microsoft \.net/i, /\.net (framework|runtime|sdk)/i,
+            /windows sdk/i, /windows kit/i, /nvidia/i, /amd software/i, /intel\b/i,
+            /java\b.*\b(update|development|runtime)/i, /python\b/i, /node\.?js/i,
+            /vulkan/i, /directx/i, /microsoft onedrive/i, /microsoft update/i,
+            /microsoft edge update/i, /google update/i, /windows driver/i,
+            /redistributable/i, /bonjour/i, /apple (mobile|application) support/i,
+            /quickpass/i, /omnilaunch/i
+        ]
+
+        function isBlacklisted(name) {
+            return BLACKLIST_PATTERNS.some(pattern => pattern.test(name))
+        }
+
+        function getAppType(dirPath) {
+            try {
+                if (existsSync(join(dirPath, 'resources', 'app.asar')) || existsSync(join(dirPath, 'resources', 'app'))) return 'electron'
+                if (existsSync(join(dirPath, 'locales')) && existsSync(join(dirPath, 'resources'))) return 'electron'
+                // Chrome-like: has a versioned subfolder with chrome.dll
+                try {
+                    const subs = readdirSync(dirPath, { withFileTypes: true }).filter(d => d.isDirectory())
+                    for (const sub of subs) {
+                        if (/^\d+\./.test(sub.name) && existsSync(join(dirPath, sub.name, 'chrome.dll'))) return 'chromium'
+                    }
+                } catch (_) { }
+            } catch (_) { }
+            return 'native'
+        }
+
+        function extractExeFromPath(str) {
+            if (!str) return null
+            // DisplayIcon/UninstallString may look like: "C:\path\app.exe" or C:\path\app.exe,0
+            const match = str.match(/([a-zA-Z]:\\[^"*?<>|]+\.exe)/i)
+            return match ? match[1] : null
+        }
+
+        async function processRegistryEntry(entry, results, seen, appsDir) {
+            const name = entry.displayName
+            if (!name) return
+            const nameKey = name.toLowerCase()
+            if (seen.has(nameKey)) return
+
+            // Find the installation dir and exe
+            let installDir = entry.installLocation?.replace(/["]/g, '').replace(/\\$/, '') || ''
+            let exePath = extractExeFromPath(entry.displayIcon)
+            
+            if (!exePath && installDir && existsSync(installDir)) {
+                const foundExe = findMainExe(installDir)
+                if (foundExe) exePath = join(installDir, foundExe)
+            }
+            
+            if (!exePath || !existsSync(exePath)) return
+            
+            // Phase 15 Fix: If installDir is blank, recursively climb up if we are deep inside \bin\64bit\
+            if (!installDir || !existsSync(installDir)) {
+                let currentDir = require('path').dirname(exePath)
+                const lowerPath = currentDir.toLowerCase()
+                // If we are in \bin, \64bit, \core, or \app-1.x.x, climb up to the true root
+                if (lowerPath.endsWith('\\64bit') || lowerPath.endsWith('\\32bit')) currentDir = require('path').join(currentDir, '..')
+                const lowerPath2 = currentDir.toLowerCase()
+                if (lowerPath2.endsWith('\\bin') || lowerPath2.endsWith('\\core') || RegExp(/\\app-\d+\.\d+\.\d+$/).test(lowerPath2)) currentDir = require('path').join(currentDir, '..')
+                
+                installDir = currentDir
+            }
+
+            // Normalize
+            try { installDir = require('path').resolve(installDir) } catch (_) { }
+
+            if (!existsSync(installDir)) return
+            seen.add(nameKey)
+
+            const exe = basename(exePath)
+            // Phase 15: Store the relative path from installDir to the exe,
+            // so nested exes (e.g. bin\64bit\obs64.exe) resolve correctly after import
+            const relativeExePath = require('path').relative(installDir, exePath)
+            const type = getAppType(installDir)
+            
+            // Calculate sizes async
+            let sizeMB = 0
+            try { sizeMB = Math.round((await getDirSizeAsync(installDir, SKIP_DIRS)) / (1024 * 1024)) } catch (_) { }
+            
+            const dataPath = findAppDataPath(name)
+            let dataSizeMB = 0
+            if (dataPath) {
+                try { dataSizeMB = Math.round((await getDirSizeAsync(dataPath, SKIP_DIRS)) / (1024 * 1024)) } catch (_) { }
+            }
+
+            const alreadyImported = existsSync(join(appsDir, name)) || existsSync(join(appsDir, `${name}.tar.zst`))
+
+            results.push({
+                name,
+                exe,
+                relativeExePath,
+                sourcePath: installDir,
+                sizeMB,
+                type,
+                dataPath: dataPath || null,
+                dataSizeMB,
+                alreadyImported
+            })
+        }
+
+        // ── Phase 1: Registry scan ──────────────────────────────────────
+        const regKeys = [
+            'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+            'HKLM\\SOFTWARE\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+            'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall'
+        ]
+
+        await Promise.all(regKeys.map(async (regKey) => {
+            try {
+                const { stdout } = await execAsync(`reg query "${regKey}" /s`, { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 })
+                // Split into individual entries (each starts with HKEY_)
+                const entries = stdout.split(/\r?\n\r?\n/).filter(e => e.trim())
+                
+                let currentEntry = { displayName: '', installLocation: '', displayIcon: '' }
+                
+                for (const line of stdout.split(/\r?\n/)) {
+                    // New key header
+                    if (line.startsWith('HKEY_')) {
+                        // Process previous entry
+                        if (currentEntry.displayName && !isBlacklisted(currentEntry.displayName)) {
+                            await processRegistryEntry(currentEntry, results, seen, appsDir)
+                        }
+                        currentEntry = { displayName: '', installLocation: '', displayIcon: '' }
+                        continue
+                    }
+                    
+                    const trimmed = line.trim()
+                    if (trimmed.startsWith('DisplayName')) {
+                        currentEntry.displayName = trimmed.split(/\s{2,}REG_[A-Z_]*SZ\s{2,}/)[1]?.trim() || ''
+                    } else if (trimmed.startsWith('InstallLocation')) {
+                        currentEntry.installLocation = trimmed.split(/\s{2,}REG_[A-Z_]*SZ\s{2,}/)[1]?.trim() || ''
+                    } else if (trimmed.startsWith('DisplayIcon')) {
+                        currentEntry.displayIcon = trimmed.split(/\s{2,}REG_[A-Z_]*SZ\s{2,}/)[1]?.trim() || ''
+                    }
+                }
+                // Process last entry
+                if (currentEntry.displayName && !isBlacklisted(currentEntry.displayName)) {
+                    await processRegistryEntry(currentEntry, results, seen, appsDir)
+                }
+            } catch (_) { }
+        }))
+
+        // ── Phase 2: Supplementary filesystem scan for apps not in registry ──
+        const LOCALAPPDATA = process.env.LOCALAPPDATA || ''
+        const PROGRAMFILES = process.env.PROGRAMFILES || ''
+        const PROGRAMFILESX86 = process.env['PROGRAMFILES(X86)'] || ''
+
+        const scanPaths = [
+            join(LOCALAPPDATA, 'Programs'),
+            PROGRAMFILES,
+            PROGRAMFILESX86
+        ].filter(p => p && existsSync(p))
+
+        // Process sequentially so as not to overwhelm I/O, but await sizing
+        for (const scanPath of scanPaths) {
+            let dirs = []
+            try { dirs = readdirSync(scanPath, { withFileTypes: true }).filter(d => d.isDirectory()) } catch (_) { continue }
+
+            for (const dir of dirs) {
+                const fullPath = join(scanPath, dir.name)
+                if (seen.has(dir.name.toLowerCase())) continue
+
+                const checkPaths = [fullPath]
+                try {
+                    const subDirs = readdirSync(fullPath, { withFileTypes: true }).filter(d => d.isDirectory())
+                    for (const sub of subDirs) {
+                        const subPath = join(fullPath, sub.name)
+                        try {
+                            const subSubs = readdirSync(subPath, { withFileTypes: true }).filter(d => d.isDirectory())
+                            for (const ss of subSubs) {
+                                checkPaths.push(join(subPath, ss.name))
+                            }
+                        } catch (_) { }
+                        checkPaths.push(subPath)
+                    }
+                } catch (_) { }
+
+                for (const checkPath of checkPaths) {
+                    if (!isPortableApp(checkPath)) continue
+
+                    const exe = findMainExe(checkPath)
+                    if (!exe) continue
+
+                    const name = exe.replace(/\.exe$/i, '')
+                    const nameKey = name.toLowerCase()
+                    if (seen.has(nameKey)) continue
+                    if (isBlacklisted(name)) continue
+                    seen.add(nameKey)
+
+                    const sizeMB = Math.round((await getDirSizeAsync(checkPath)) / (1024 * 1024))
+                    const dataPath = findAppDataPath(name)
+                    let dataSizeMB = 0
+                    if (dataPath) {
+                        dataSizeMB = Math.round((await getDirSizeAsync(dataPath, SKIP_DIRS)) / (1024 * 1024))
+                    }
+
+                    const alreadyImported = existsSync(join(appsDir, name)) || existsSync(join(appsDir, `${name}.tar.zst`))
+
+                    results.push({
+                        name,
+                        exe,
+                        sourcePath: checkPath,
+                        sizeMB,
+                        type: existsSync(join(checkPath, 'resources')) ? 'electron' : 'chromium',
+                        dataPath: dataPath || null,
+                        dataSizeMB,
+                        alreadyImported
+                    })
+                }
+            }
+        }
+
+        // Sort: Electron apps first, then native, then by name
+        results.sort((a, b) => {
+            const typeOrder = { electron: 0, chromium: 1, native: 2 }
+            const aOrder = typeOrder[a.type] ?? 2
+            const bOrder = typeOrder[b.type] ?? 2
+            if (aOrder !== bOrder) return aOrder - bOrder
+            return a.name.localeCompare(b.name)
+        })
+
+        return results
+    })
+
+    ipcMain.handle('import-app', async (event, { sourcePath, name, exe, relativeExePath, importData, dataPath, sizeMB, dataSizeMB }) => {
+        const win = BrowserWindow.fromWebContents(event.sender)
+        const vaultDir = getVaultDir()
+        // Phase 17.2: Sanitize AppData folder name to match engine.js launch path
+        const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_')
+        const dataDest = join(vaultDir, 'AppData', safeName)
+        // Fix 1: Hoist tempArchive so catch block can clean it up on failure
+        const tempArchive = join(os.tmpdir(), `omnilaunch-import-${name}-${Date.now()}.tar.zst`)
+
+        try {
+            // ─── Phase 17: Archive-Based Import ───────────────────────────
+            // Instead of copying thousands of small files to USB (which chokes
+            // the KIOXIA's flash controller at 0.01 MB/s random write), we:
+            //   1. Compress the source dir on local SSD (fast: SSD→SSD)
+            //   2. Copy ONE large compressed file to USB (fast: sequential write)
+            // This turns a 25-minute import into ~2-3 minutes.
+
+            const archiveName = `${name}.tar.zst`
+            const archiveDest = join(vaultDir, 'Apps', archiveName)
+
+            // Phase 1: Compress on SSD (fast — no USB involved)
+            if (win && !win.isDestroyed()) {
+                win.webContents.send('import-progress', {
+                    name, phase: 'compressing', percent: 0, copiedMB: 0, totalMB: sizeMB || 0
+                })
+            }
+
+            // Build tar args as proper array (NOT string concatenation)
+            // Spaces in dir names like "Code Cache", "Service Worker" break cmd /c
+            const srcParent = require('path').dirname(sourcePath)
+            const srcBasename = require('path').basename(sourcePath)
+
+            const tarArgs = ['--zstd']
+            for (const d of SKIP_DIRS) {
+                tarArgs.push(`--exclude=${d}`)
+            }
+            tarArgs.push('--exclude=unins000.exe', '--exclude=unins000.dat')
+            tarArgs.push('-cf', tempArchive, '-C', srcParent, srcBasename)
+
+            await new Promise((resolve, reject) => {
+                const proc = spawn('tar', tarArgs, { stdio: ['ignore', 'ignore', 'pipe'] })
+                let stderr = ''
+                proc.stderr.on('data', (d) => { stderr += d.toString() })
+                proc.on('close', (code) => {
+                    if (code === 0) resolve()
+                    else reject(new Error(`Compression failed (tar exit ${code}): ${stderr.trim()}`))
+                })
+                proc.on('error', reject)
+            })
+
+            // Get compressed size for accurate progress
+            const fs = require('fs')
+            const compressedSize = fs.statSync(tempArchive).size
+
+            if (win && !win.isDestroyed()) {
+                win.webContents.send('import-progress', {
+                    name, phase: 'compressing', percent: 100, copiedMB: sizeMB || 0, totalMB: sizeMB || 0
+                })
+            }
+
+            // Phase 2: Copy single file to USB (fast — sequential write)
+            // Ensure Apps directory exists
+            const appsDir = join(vaultDir, 'Apps')
+            if (!existsSync(appsDir)) mkdirSync(appsDir, { recursive: true })
+
+            await copyFileWithProgress(tempArchive, archiveDest, compressedSize, (progress) => {
+                if (win && !win.isDestroyed()) {
+                    win.webContents.send('import-progress', { name, phase: 'binary', ...progress })
+                }
+            })
+
+            // Cleanup temp archive
+            try { fs.unlinkSync(tempArchive) } catch (_) {}
+
+            // Phase 3: Copy user data (if requested) — still uses robocopy
+            // because AppData needs incremental sync (robocopy /MIR) later
+            if (importData && dataPath && existsSync(dataPath)) {
+                await copyDirWithProgress(dataPath, dataDest, SKIP_DIRS, (progress) => {
+                    if (win && !win.isDestroyed()) {
+                        win.webContents.send('import-progress', { name, phase: 'data', ...progress })
+                    }
+                }, dataSizeMB || 0)
+            }
+
+            // Phase 15: Use relativeExePath so nested exes (e.g. bin\64bit\obs64.exe) resolve correctly
+            const exePathInApp = relativeExePath || exe
+
+            return {
+                success: true,
+                appConfig: {
+                    name,
+                    // Store the ORIGINAL relative exe path — launch flow will handle extraction
+                    path: `[USB]\\Apps\\${name}\\${exePathInApp}`,
+                    args: '',
+                    portableData: !!importData,
+                    id: Date.now(),
+                    enabled: true
+                }
+            }
+        } catch (err) {
+            // Fix 1: Clean up the ACTUAL temp archive (not a new Date.now() filename)
+            try { require('fs').unlinkSync(tempArchive) } catch (_) {}
+            return { success: false, error: err.message }
+        }
+    })
+
+    /**
+     * Copy a single file with byte-level progress tracking.
+     * Used for copying compressed archives to USB (sequential write = fast).
+     */
+    async function copyFileWithProgress(src, dest, totalBytes, onProgress) {
+        const fs = require('fs')
+        const totalMB = Math.round(totalBytes / (1024 * 1024))
+
+        return new Promise((resolve, reject) => {
+            const readStream = fs.createReadStream(src, { highWaterMark: 1024 * 1024 }) // 1 MB chunks
+            const writeStream = fs.createWriteStream(dest)
+            let copiedBytes = 0
+            let lastEmit = 0
+
+            readStream.on('data', (chunk) => {
+                copiedBytes += chunk.length
+                const now = Date.now()
+                if (now - lastEmit >= 500) {
+                    lastEmit = now
+                    onProgress({
+                        copiedMB: Math.round(copiedBytes / (1024 * 1024)),
+                        totalMB,
+                        percent: totalBytes > 0 ? Math.min(99, Math.round((copiedBytes / totalBytes) * 100)) : 0
+                    })
+                }
+            })
+
+            writeStream.on('finish', () => {
+                onProgress({ copiedMB: totalMB, totalMB, percent: 100 })
+                resolve()
+            })
+
+            // Fix 2: Destroy both streams on error to prevent file descriptor leaks
+            readStream.on('error', (err) => { readStream.destroy(); writeStream.destroy(); reject(err) })
+            writeStream.on('error', (err) => { readStream.destroy(); writeStream.destroy(); reject(err) })
+            readStream.pipe(writeStream)
+        })
+    }
+
+    /**
+     * Copy a directory with progress tracking (robocopy).
+     * Still used for AppData imports (needs incremental sync later).
+     */
+    async function copyDirWithProgress(src, dest, skipDirs, onProgress, knownSizeMB = 0) {
+        let totalBytes = knownSizeMB * 1024 * 1024
+        if (totalBytes === 0) {
+            try { totalBytes = await getDirSizeAsync(src, skipDirs) } catch (_) {}
+        }
+        const totalMB = knownSizeMB || Math.round(totalBytes / (1024 * 1024))
+
+        // Single-threaded for USB — /MT:N overwhelms cheap flash controllers
+        const args = [src, dest, '/E', '/R:0', '/W:0', '/BYTES', '/NJH', '/NJS', '/NDL', '/NC']
+        if (skipDirs.size > 0) args.push('/XD', ...skipDirs)
+        args.push('/XF', 'unins000.exe', 'unins000.dat')
+
+        return new Promise((resolve, reject) => {
+            const proc = spawn('robocopy', args, { stdio: ['ignore', 'pipe', 'ignore'] })
+            let copiedBytes = 0
+            let lastEmit = 0
+
+            proc.stdout.on('data', (data) => {
+                for (const line of data.toString().split('\n')) {
+                    const match = line.match(/\s+(\d+)\s+[^\s]+/)
+                    if (match && parseInt(match[1]) > 100) {
+                        copiedBytes += parseInt(match[1])
+                        const now = Date.now()
+                        if (now - lastEmit >= 500) {
+                            lastEmit = now
+                            onProgress({
+                                copiedMB: Math.round(copiedBytes / (1024 * 1024)),
+                                totalMB,
+                                percent: totalBytes > 0 ? Math.min(99, Math.round((copiedBytes / totalBytes) * 100)) : 0
+                            })
+                        }
+                    }
+                }
+            })
+
+            proc.on('close', (code) => {
+                onProgress({ copiedMB: totalMB, totalMB, percent: 100 })
+                if (code >= 16) reject(new Error(`Copy failed (robocopy exit ${code})`))
+                else resolve()
+            })
+        })
+    }
+
     // ─── Session State & Setup ─────────────────────────────────────────────
 
     ipcMain.handle('set-master-password', (_, password) => {
@@ -421,9 +990,10 @@ function registerIpcHandlers() {
     ipcMain.handle('start-session-setup', async (event) => {
         try {
             await closeBrowser()
-            closeDesktopApps()
+            await closeDesktopApps()
 
             const win = BrowserWindow.fromWebContents(event.sender)
+            const vaultDir = getVaultDir()
 
             // Register disconnect callback BEFORE launching
             // This fires when the user closes all Chrome windows
@@ -433,11 +1003,12 @@ function registerIpcHandlers() {
                 }
             })
 
+            // Phase 13: Pass vaultDir for persistent Chrome profile on USB
             const result = await launchSessionSetup((statusMsg) => {
                 if (win && !win.isDestroyed()) {
                     win.webContents.send('launch-status', statusMsg)
                 }
-            })
+            }, vaultDir)
 
             return result
         } catch (err) {
@@ -453,7 +1024,9 @@ function registerIpcHandlers() {
             const result = await captureSession()
             if (!result.success) return result
 
-            // 1. Save the captured URLs into the vault workspace
+            // Save the captured URLs into the vault workspace
+            // Phase 13: No longer saving cookies to vault.state.json —
+            // persistent Chrome profile on USB handles all auth data
             const vaultPath = getVaultPath()
             if (existsSync(vaultPath)) {
                 try { execSync(`attrib -H -R "${vaultPath}"`) } catch (_) { }
@@ -464,7 +1037,7 @@ function registerIpcHandlers() {
             try {
                 const encryptedVault = JSON.parse(readFileSync(vaultPath, 'utf-8'))
                 workspace = decrypt(encryptedVault, mp)
-                if (workspace._honeyToken) delete workspace._honeyToken // Remove honey token if present
+                if (workspace._honeyToken) delete workspace._honeyToken
             } catch (_) { }
 
             // Replace webTabs with captured URLs
@@ -473,19 +1046,10 @@ function registerIpcHandlers() {
             const payload = { ...workspace, _honeyToken: HONEY_TOKEN }
 
             // Re-encrypt and save the vault
-            const encryptedVault = encrypt(payload, mp, getDriveInfo().driveType === 3)
+            const driveInfo = await getDriveInfo()
+            const encryptedVault = encrypt(payload, mp, driveInfo.driveType === 3)
             writeFileSync(vaultPath, JSON.stringify(encryptedVault, null, 2), 'utf-8')
             try { execSync(`attrib +H "${vaultPath}"`) } catch (_) { }
-
-            // 2. Save the session state (cookies) to vault.state.json
-            const statePath = getStatePath()
-            if (existsSync(statePath)) {
-                try { execSync(`attrib -H -R "${statePath}"`) } catch (_) { }
-            }
-
-            const encryptedState = encrypt(result.state, mp)
-            writeFileSync(statePath, JSON.stringify(encryptedState, null, 2), 'utf-8')
-            try { execSync(`attrib +H "${statePath}"`) } catch (_) { }
 
             return { success: true, tabCount: result.tabCount, urls: result.urls }
         } catch (err) {
@@ -498,24 +1062,17 @@ function registerIpcHandlers() {
     ipcMain.handle('start-session-edit', async (event) => {
         try {
             await closeBrowser()
-            closeDesktopApps()
+            await closeDesktopApps()
 
             const win = BrowserWindow.fromWebContents(event.sender)
             const mp = activeMasterPasswordBuffer ? activeMasterPasswordBuffer.toString('utf-8') : null
             if (!mp) return { success: false, error: 'No master password' }
 
-            // Load saved state and URLs
-            let savedState = null
+            const vaultDir = getVaultDir()
+
+            // Phase 13: No longer loading savedState (cookies) —
+            // persistent Chrome profile handles auth. Only load URLs.
             let urls = []
-
-            try {
-                const statePath = getStatePath()
-                if (existsSync(statePath)) {
-                    const encrypted = JSON.parse(readFileSync(statePath, 'utf-8'))
-                    savedState = decrypt(encrypted, mp)
-                }
-            } catch (_) { }
-
             try {
                 const vaultPath = getVaultPath()
                 if (existsSync(vaultPath)) {
@@ -532,11 +1089,12 @@ function registerIpcHandlers() {
                 }
             })
 
+            // Phase 13: Pass vaultDir for persistent profile, urls for tab restoration
             const result = await launchSessionSetup((statusMsg) => {
                 if (win && !win.isDestroyed()) {
                     win.webContents.send('launch-status', statusMsg)
                 }
-            }, savedState, urls)
+            }, vaultDir, urls)
 
             return result
         } catch (err) {
@@ -553,7 +1111,7 @@ function registerIpcHandlers() {
             const result = await captureCurrentSession()
             if (!result.success) return result
 
-            // Save URLs to vault
+            // Phase 13: Save URLs only — persistent Chrome profile handles auth
             const vaultPath = getVaultPath()
             if (existsSync(vaultPath)) {
                 try { execSync(`attrib -H -R "${vaultPath}"`) } catch (_) { }
@@ -563,25 +1121,17 @@ function registerIpcHandlers() {
             try {
                 const encryptedVault = JSON.parse(readFileSync(vaultPath, 'utf-8'))
                 workspace = decrypt(encryptedVault, mp)
-                if (workspace._honeyToken) delete workspace._honeyToken // Remove honey token if present
+                if (workspace._honeyToken) delete workspace._honeyToken
             } catch (_) { }
 
             workspace.webTabs = result.urls.map(url => ({ url, enabled: true }))
 
             const payload = { ...workspace, _honeyToken: HONEY_TOKEN }
-            const encryptedVault = encrypt(payload, mp, getDriveInfo().driveType === 3)
+            const driveInfo = await getDriveInfo()
+            const encryptedVault = encrypt(payload, mp, driveInfo.driveType === 3)
 
             writeFileSync(vaultPath, JSON.stringify(encryptedVault, null, 2), 'utf-8')
             try { execSync(`attrib +H "${vaultPath}"`) } catch (_) { }
-
-            // Save state (cookies) 
-            const statePath = getStatePath()
-            if (existsSync(statePath)) {
-                try { execSync(`attrib -H -R "${statePath}"`) } catch (_) { }
-            }
-            const encryptedState = encrypt(result.state, mp)
-            writeFileSync(statePath, JSON.stringify(encryptedState, null, 2), 'utf-8')
-            try { execSync(`attrib +H "${statePath}"`) } catch (_) { }
 
             return { success: true, tabCount: result.tabCount, urls: result.urls }
         } catch (err) {
@@ -593,7 +1143,7 @@ function registerIpcHandlers() {
     ipcMain.handle('quit-and-relaunch', async (_, { closeApps = false } = {}) => {
         try {
             await closeBrowser()
-            if (closeApps) closeDesktopApps()
+            if (closeApps) await closeDesktopApps()
 
             app.quit()
 
@@ -604,17 +1154,14 @@ function registerIpcHandlers() {
     })
 
     // ─── Close Desktop Apps ──────────────────────────────────────────────
-    ipcMain.handle('close-desktop-apps', () => {
-        closeDesktopApps()
+    ipcMain.handle('close-desktop-apps', async () => {
+        await closeDesktopApps()
         return { success: true }
     })
 
     // ─── Launch Workspace Engine ─────────────────────────────────────────
-    ipcMain.handle('launch-workspace', async (event, workspace) => {
+    ipcMain.handle('launch-workspace', (event, workspace) => {
         try {
-            await closeBrowser()
-            closeDesktopApps()
-
             const win = BrowserWindow.fromWebContents(event.sender)
 
             // Phase 12: Dynamically resolve [USB] portable macros back into absolute paths
@@ -628,24 +1175,31 @@ function registerIpcHandlers() {
                 })
             }
 
-            // Attempt to load saved session state for cookie injection
-            let savedState = null
-            try {
-                const statePath = getStatePath()
-                if (existsSync(statePath) && activeMasterPasswordBuffer) {
-                    const encrypted = JSON.parse(readFileSync(statePath, 'utf-8'))
-                    savedState = decrypt(encrypted, activeMasterPasswordBuffer.toString('utf-8'))
-                }
-            } catch (_) {
-                // No saved state or decryption failed
+            // Phase 16: Fire-and-forget — the ENTIRE sequence (close previous + launch new)
+            // runs asynchronously so the IPC response is instant and the UI stays responsive.
+            const doLaunch = async () => {
+                await closeBrowser()
+                await closeDesktopApps()
+                return launchWorkspace(workspace, (statusMsg) => {
+                    if (win && !win.isDestroyed()) {
+                        win.webContents.send('launch-status', statusMsg)
+                    }
+                }, vaultDir)
             }
 
-            const results = await launchWorkspace(workspace, (statusMsg) => {
+            doLaunch().then((results) => {
                 if (win && !win.isDestroyed()) {
-                    win.webContents.send('launch-status', statusMsg)
+                    win.webContents.send('launch-complete', { success: true, results })
                 }
-            }, savedState)
-            return { success: true, results }
+            }).catch((err) => {
+                diagError('launch-workspace', err.message)
+                if (win && !win.isDestroyed()) {
+                    win.webContents.send('launch-complete', { success: false, error: err.message })
+                }
+            })
+
+            // Return immediately — status updates come via 'launch-status' events
+            return { success: true }
         } catch (err) {
             return { success: false, error: err.message }
         }
@@ -661,7 +1215,19 @@ function registerIpcHandlers() {
         const win = BrowserWindow.getFocusedWindow()
         if (win) win.minimize()
     })
+
+    // ─── Import Close Guard ─────────────────────────────────────────────
+    ipcMain.on('import-started', (event) => {
+        importInProgress = true
+    })
+
+    ipcMain.on('import-finished', (event) => {
+        importInProgress = false
+    })
 }
+
+// ─── Import Guard State ────────────────────────────────────────────────────────
+let importInProgress = false
 
 // ─── Window Creation ───────────────────────────────────────────────────────────
 function createWindow() {
@@ -686,6 +1252,27 @@ function createWindow() {
         mainWindow.show()
     })
 
+    // Import close guard — prevent accidental close during import
+    mainWindow.on('close', (e) => {
+        if (importInProgress) {
+            e.preventDefault()
+            dialog.showMessageBox(mainWindow, {
+                type: 'warning',
+                title: 'Import in Progress',
+                message: 'An app import is currently in progress.',
+                detail: 'Closing now may corrupt the imported files. Are you sure you want to close?',
+                buttons: ['Keep Open', 'Close Anyway'],
+                defaultId: 0,
+                cancelId: 0
+            }).then(({ response }) => {
+                if (response === 1) {
+                    importInProgress = false
+                    mainWindow.close()
+                }
+            })
+        }
+    })
+
     if (process.env['ELECTRON_RENDERER_URL']) {
         mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
     } else {
@@ -700,12 +1287,19 @@ function createWindow() {
 // ─── App Lifecycle ─────────────────────────────────────────────────────────────
 
 function setupKillCord() {
-    const checkYank = () => {
-        const driveInfo = getDriveInfo()
+    const checkYank = async () => {
+        const driveInfo = await getDriveInfo()
         if (driveInfo.isRemovable && !existsSync(getVaultDir())) {
-            // Nuke it
+            // Nuke it — wipe credentials + local traces
+            // USB is GONE — never attempt sync, only kill + wipe
             setActiveMasterPassword(null)
-            closeDesktopApps()
+            emergencyKillDesktopAppsSync()
+            // Phase 14: Wipe local Chrome profile + Electron temp traces
+            try { wipeLocalTraces(getVaultDir()) } catch (_) { }
+            // Kill cord = security emergency: ALWAYS wipe everything
+            try { wipeAllLocalAppData() } catch (_) { }
+            try { wipeLocalAppCache() } catch (_) { }
+            try { require('fs').rmSync(tmpPath, { recursive: true, force: true }) } catch (_) { }
             process.exit(1)
         }
     }
@@ -719,9 +1313,8 @@ function setupKillCord() {
     setInterval(checkYank, 1000)
 }
 
-// Phase 11: Zero Data Persistence - UserData & Temp redirection
-const vaultDir = getVaultDir()
-const tmpPath = join(vaultDir, '.tmp')
+// Phase 14: Redirect Electron temp to LOCAL PC (not USB) to avoid USB I/O
+const tmpPath = join(require('os').tmpdir(), 'QuickPass-electron')
 if (!existsSync(tmpPath)) {
     try { require('fs').mkdirSync(tmpPath, { recursive: true }) } catch (_) { }
 }
@@ -729,6 +1322,13 @@ app.setPath('userData', join(tmpPath, 'electron-user-data'))
 app.setPath('temp', join(tmpPath, 'electron-temp'))
 
 app.whenReady().then(() => {
+    runDiagnostics.machineId = crypto.createHash('sha256')
+        .update(`${os.hostname()}:${os.userInfo().username}`)
+        .digest('hex')
+        .slice(0, 16)
+    runDiagnostics.osVersion = os.release()
+    runDiagnostics.startTime = Date.now()
+
     registerIpcHandlers()
     createWindow()
     setupKillCord()
@@ -738,18 +1338,52 @@ app.whenReady().then(() => {
     })
 })
 
-app.on('will-quit', () => {
-    // Phase 11: Cryptographic Memory Wiping
-    setActiveMasterPassword(null)
-    closeDesktopApps()
+// Phase 14: before-quit with try/finally — guarantees profile sync + cleanup
+let isQuitting = false
+app.on('before-quit', async (e) => {
+    if (isQuitting) return
+    e.preventDefault()
 
-    // Phase 11: Cleanup hidden .tmp traces
     try {
-        if (existsSync(tmpPath)) {
-            const fs = require('fs')
-            fs.rmSync(tmpPath, { recursive: true, force: true })
-        }
-    } catch (_) { }
+        // Sync Chrome profile back to USB + wipe local copy
+        await closeBrowser()
+    } catch (err) {
+        console.error('[QuickPass] Profile sync during quit failed:', err)
+        diagError('before-quit', err.message)
+    } finally {
+        // Cryptographic memory wipe
+        setActiveMasterPassword(null)
+        await closeDesktopApps()
+        try {
+            const vd = getVaultDir()
+            if (existsSync(vd)) {
+                writeFileSync(join(vd, 'run-diagnostics.json'), JSON.stringify(runDiagnostics, null, 2), 'utf-8')
+            }
+        } catch (_) { }
+        // Wipe Electron temp traces from local PC
+        try { require('fs').rmSync(tmpPath, { recursive: true, force: true }) } catch (_) { }
+        isQuitting = true
+        app.quit()
+    }
+})
+
+// Belt-and-suspenders: wipe ALL traces on ANY exit path (including kill cord crash)
+process.on('exit', () => {
+    const fs = require('fs')
+    // Wipe Electron temp
+    try { fs.rmSync(tmpPath, { recursive: true, force: true }) } catch (_) { }
+    // Wipe ALL QuickPass Chrome profiles (wildcard — no dependency on vault dir)
+    wipeAllLocalProfiles()
+    // ALWAYS wipe auth tokens/profiles — these must never persist on host PCs
+    wipeAllLocalAppData()
+    // Only wipe app BINARY cache if clearCacheOnExit toggle is ON (default: true)
+    try {
+        const meta = loadVaultMeta()
+        const shouldClear = !meta || meta.clearCacheOnExit !== false
+        if (shouldClear) wipeLocalAppCache()
+    } catch (_) {
+        wipeLocalAppCache() // If we can't read meta, wipe for safety
+    }
 })
 
 app.on('window-all-closed', () => {
