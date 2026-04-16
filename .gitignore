@@ -8,3 +8,9 @@ vault.state.json
 Apps/
 .DS_Store
 .env
+_planning/
+.tmp/
+AppData/
+temp-profile/
+.codex-tar-probe/
+diff.txt
