@@ -6,7 +6,7 @@ import os from 'os'
 import util from 'util'
 const execAsync = util.promisify(exec)
 import crypto from 'crypto'
-import { launchWorkspace, launchSessionSetup, captureSession, captureCurrentSession, closeBrowser, closeDesktopApps, emergencyKillDesktopAppsSync, onBrowserAllClosed, wipeLocalTraces, wipeAllLocalProfiles, wipeAllLocalAppData, wipeLocalAppCache, runDiagnostics, diagError } from './engine.js'
+import { launchWorkspace, launchSessionSetup, captureSession, captureCurrentSession, closeBrowser, closeDesktopApps, emergencyKillDesktopAppsSync, onBrowserAllClosed, hasActiveBrowserSession, wipeLocalTraces, wipeAllLocalProfiles, wipeAllLocalAppData, wipeLocalAppCache, runDiagnostics, diagError } from './engine.js'
 
 // Phase 11: The Honey Token
 const HONEY_TOKEN = {
@@ -1013,6 +1013,14 @@ function registerIpcHandlers() {
             return result
         } catch (err) {
             return { success: false, error: err.message }
+        }
+    })
+
+    ipcMain.handle('has-active-browser-session', async () => {
+        try {
+            return { success: true, active: hasActiveBrowserSession() }
+        } catch (err) {
+            return { success: false, active: false, error: err.message }
         }
     })
 

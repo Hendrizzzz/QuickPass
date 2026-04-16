@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import ImportAppsModal from './ImportAppsModal'
 
 export default function SetupScreen({ driveInfo, onComplete }) {
@@ -20,10 +20,14 @@ export default function SetupScreen({ driveInfo, onComplete }) {
     const [showImportModal, setShowImportModal] = useState(false)
 
     // Session capture state
-    const [browserOpen, setBrowserOpen] = useState(false)
-    const [capturing, setCapturing] = useState(false)
+    const [sessionState, setSessionState] = useState('idle')
     const [capturedCount, setCapturedCount] = useState(0)
     const [capturedUrls, setCapturedUrls] = useState([])
+
+    const sessionDisconnected = sessionState === 'disconnected'
+    const browserReady = sessionState === 'open' || sessionState === 'saving'
+    const openingBrowser = sessionState === 'opening'
+    const savingSession = sessionState === 'saving'
 
     const browseExe = async () => {
         const filePath = await window.omnilaunch.browseExe()
@@ -64,6 +68,9 @@ export default function SetupScreen({ driveInfo, onComplete }) {
 
         if (result.success) {
             setSaving(false)
+            setSessionState('idle')
+            setCapturedCount(0)
+            setCapturedUrls([])
             setStep(3) // Advance to the browser session step
         } else {
             setError(result.error || 'Failed to save vault')
@@ -75,34 +82,62 @@ export default function SetupScreen({ driveInfo, onComplete }) {
     // Uses a dedicated polling-based IPC channel — fires within 1 second
     useEffect(() => {
         const cleanup = window.omnilaunch.onBrowserDisconnect(() => {
-            setBrowserOpen(false)
-            setCapturing(false)
-            setError('Chrome was closed. Click "Open Browser" to try again.')
+            setSessionState((prev) => (prev === 'complete' ? prev : 'disconnected'))
+            setError('Chrome was closed. Click "Reopen Browser" to try again.')
         })
         return cleanup
     }, [])
 
     // Open browser for session setup
     const handleOpenBrowser = async () => {
-        setBrowserOpen(true)
+        setSessionState('opening')
         setError('')
-        await window.omnilaunch.startSessionSetup()
+        const result = await window.omnilaunch.startSessionSetup()
+        if (!result.success) {
+            setSessionState('idle')
+            setError(result.error || 'Failed to open browser')
+            return
+        }
+
+        const sessionCheck = await window.omnilaunch.hasActiveBrowserSession()
+        if (sessionCheck.success && sessionCheck.active) {
+            setSessionState('open')
+            return
+        }
+
+        setSessionState('disconnected')
+        setError('Chrome was closed. Click "Reopen Browser" to try again.')
     }
 
     // Capture session and finish setup
     const handleSaveAndFinish = async () => {
-        setCapturing(true)
         setError('')
+        const sessionCheck = await window.omnilaunch.hasActiveBrowserSession()
+
+        if (!sessionCheck.success || !sessionCheck.active) {
+            setSessionState('disconnected')
+            setError('Chrome was closed. Click "Reopen Browser" to try again.')
+            return
+        }
+
+        setSessionState('saving')
 
         const result = await window.omnilaunch.captureSession({ masterPassword: isRemovable ? hiddenMasterPassword : masterPassword })
         if (result.success) {
             setCapturedCount(result.tabCount)
             setCapturedUrls(result.urls || [])
+            setSessionState('complete')
             // Show success briefly, then complete setup
             setTimeout(() => onComplete(), 1500)
         } else {
+            if (result.error === 'No active browser session') {
+                setSessionState('disconnected')
+                setError('Chrome was closed. Click "Reopen Browser" to try again.')
+                return
+            }
+
+            setSessionState('open')
             setError(result.error || 'Failed to capture session')
-            setCapturing(false)
         }
     }
 
@@ -327,7 +362,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
             {step === sessionStep && (
                 <div className="flex flex-col gap-4 animate-fade-in">
                     {/* Before browser is opened */}
-                    {!browserOpen && !capturedCount && (
+                    {sessionState === 'idle' && !capturedCount && (
                         <>
                             <div className="p-4 rounded-lg bg-[#14141c] border border-[#2a2a3a]">
                                 <div className="flex items-start gap-3 mb-3">
@@ -370,21 +405,60 @@ export default function SetupScreen({ driveInfo, onComplete }) {
                     )}
 
                     {/* Browser is open — waiting for user */}
-                    {browserOpen && !capturedCount && (
+                    {openingBrowser && !capturedCount && (
+                        <div className="text-center py-6 animate-fade-in">
+                            <div className="w-12 h-12 mx-auto mb-3 rounded-full flex items-center justify-center bg-[#1a1a2e]">
+                                <div className="spinner" style={{ width: 18, height: 18, borderWidth: 2 }} />
+                            </div>
+                            <p className="text-sm text-white font-medium">Opening browser...</p>
+                            <p className="text-xs text-secondary mt-1">Preparing your setup session</p>
+                        </div>
+                    )}
+
+                    {sessionDisconnected && !capturedCount && (
+                        <>
+                            <div className="p-4 rounded-lg bg-[#14141c] border border-[#3a2a2a] animate-fade-in">
+                                <div className="flex items-start gap-3">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#d4a44a" strokeWidth="2" strokeLinecap="round" className="mt-0.5 flex-shrink-0">
+                                        <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                                        <line x1="12" y1="9" x2="12" y2="13" />
+                                        <line x1="12" y1="17" x2="12.01" y2="17" />
+                                    </svg>
+                                    <div>
+                                        <p className="text-sm text-white font-medium mb-1">Browser was closed</p>
+                                        <p className="text-xs text-secondary">
+                                            Reopen the browser, sign in again if needed, then click Save & Finish.
+                                        </p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {error && <p className="text-error text-xs text-center animate-fade-in">{error}</p>}
+
+                            <button className="btn-primary w-full" onClick={handleOpenBrowser}>
+                                Reopen Browser
+                            </button>
+                            <button className="btn-secondary w-full text-xs" onClick={() => setStep(appsStep)}>
+                                Back
+                            </button>
+                        </>
+                    )}
+
+                    {browserReady && !capturedCount && (
                         <>
                             <div className="text-center py-4">
                                 <div className="w-12 h-12 mx-auto mb-3 rounded-full flex items-center justify-center bg-[#1a1a2e]">
-                                    {!capturing ? (
+                                    {!savingSession ? (
                                         <div className="w-3 h-3 rounded-full bg-[#4a9]" style={{ animation: 'pulse 2s infinite' }} />
                                     ) : (
                                         <div className="spinner" style={{ width: 18, height: 18, borderWidth: 2 }} />
                                     )}
                                 </div>
                                 <p className="text-sm text-white font-medium">
-                                    {capturing ? 'Saving your session...' : 'Browser is open'}
+                                    {savingSession ? 'Saving your session...' : 'Browser is open'}
                                 </p>
                                 <p className="text-xs text-secondary mt-1">
-                                    {capturing
+                                    {savingSession
                                         ? 'Encrypting cookies and tabs...'
                                         : 'Log into your sites, then come back here'}
                                 </p>
@@ -392,10 +466,10 @@ export default function SetupScreen({ driveInfo, onComplete }) {
 
                             <button
                                 className="btn-primary w-full"
-                                disabled={capturing}
+                                disabled={savingSession}
                                 onClick={handleSaveAndFinish}
                             >
-                                {capturing ? (
+                                {savingSession ? (
                                     <span className="flex items-center justify-center gap-2">
                                         <div className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
                                         Saving...

@@ -40,6 +40,7 @@ contextBridge.exposeInMainWorld('omnilaunch', {
     setMasterPassword: (pw) => ipcRenderer.invoke('set-master-password', pw),
     startSessionSetup: () => ipcRenderer.invoke('start-session-setup'),
     startSessionEdit: () => ipcRenderer.invoke('start-session-edit'),
+    hasActiveBrowserSession: () => ipcRenderer.invoke('has-active-browser-session'),
     captureSession: (data) => ipcRenderer.invoke('capture-session', data),
 
     // Live Session Management

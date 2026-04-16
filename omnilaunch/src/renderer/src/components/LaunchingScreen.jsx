@@ -1,14 +1,219 @@
-import { useState, useEffect } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+
+function normalizeStatusMessage(message) {
+    return String(message || '')
+        .replace(/[â€”â€“]/g, '-')
+        .replace(/\s+/g, ' ')
+        .trim()
+}
+
+function parseScopedStatus(message) {
+    const normalized = normalizeStatusMessage(message)
+    const match = normalized.match(/^\[(Tab|App)\s+(\d+)\]\s*(.*)$/)
+    if (!match) {
+        return {
+            normalized,
+            scope: null,
+            index: null,
+            itemKey: null,
+            body: normalized
+        }
+    }
+
+    const scope = match[1].toLowerCase()
+    const index = Number(match[2])
+
+    return {
+        normalized,
+        scope,
+        index,
+        itemKey: `${scope}-${index}`,
+        body: match[3].trim()
+    }
+}
+
+function createLooseItemKey(kind, label) {
+    return `${kind}:${String(label || '').trim().toLowerCase()}`
+}
+
+function buildLaunchItem({ itemKey, scope, label, kind = 'item' }) {
+    const trimmedLabel = String(label || '').trim()
+    if (!trimmedLabel) return null
+
+    return {
+        itemKey: itemKey || createLooseItemKey(kind || scope || 'item', trimmedLabel),
+        label: trimmedLabel
+    }
+}
+
+function cleanDisplayLabel(item) {
+    if (!item) return ''
+    if (item.includes('.') && (item.startsWith('http') || item.includes('://'))) {
+        try {
+            return new URL(item.startsWith('http') ? item : `https://${item}`).hostname.replace('www.', '')
+        } catch {
+            return item
+        }
+    }
+    return item
+}
+
+function parseSuccessItem(message) {
+    const { itemKey, scope, body } = parseScopedStatus(message)
+    if (!itemKey) return null
+    const match = body.match(/^\[OK\]\s+(.+?)(?:\s+-\s+(?:ready|launched))?$/)
+    if (!match) return null
+
+    return buildLaunchItem({
+        itemKey,
+        scope,
+        label: match[1],
+        kind: 'success'
+    })
+}
+
+function parseFailureItem(message) {
+    const { itemKey, scope, body } = parseScopedStatus(message)
+    if (!itemKey) return null
+    const itemMatch = body.match(/^\[WARN\]\s+(.+?)(?:\s+-\s+(.+))?$/)
+    if (!itemMatch) return null
+
+    const item = buildLaunchItem({
+        itemKey,
+        scope,
+        label: itemMatch[1],
+        kind: 'failure'
+    })
+    if (!item) return null
+
+    return {
+        ...item,
+        reason: (itemMatch[2] || 'Launch failed').trim()
+    }
+}
+
+function cleanNotice(message) {
+    return normalizeStatusMessage(message)
+        .replace(/^\[(?:Tab|App)\s+\d+\]\s*/, '')
+        .replace(/^\[(?:INFO|WARN|OK)\]\s*/, '')
+        .trim()
+}
+
+function parseNoticeItem(message) {
+    const { itemKey, body } = parseScopedStatus(message)
+    if (!/^\[(?:INFO|WARN)\]\s+/.test(body)) return null
+
+    const cleaned = cleanNotice(message)
+    if (!cleaned) return null
+
+    return {
+        noticeKey: itemKey ? `${itemKey}:${cleaned}` : `notice:${cleaned}`,
+        itemKey,
+        message: cleaned
+    }
+}
+
+function buildResultLaunchItem(item, index, fallbackType) {
+    const itemType = item?.type || fallbackType
+    const label = itemType === 'web' ? item?.url : item?.name
+    if (!label) return null
+
+    return buildLaunchItem({
+        itemKey: item?.itemKey || `${itemType === 'web' ? 'tab' : 'app'}-${index + 1}`,
+        scope: itemType === 'web' ? 'tab' : 'app',
+        label,
+        kind: itemType === 'web' ? 'tab' : 'app'
+    })
+}
+
+function mergeLoadedItem(existing, nextItem) {
+    if (!nextItem?.itemKey) return existing
+
+    const existingIndex = existing.findIndex((item) => item.itemKey === nextItem.itemKey)
+    if (existingIndex === -1) return [...existing, nextItem]
+
+    const updated = [...existing]
+    updated[existingIndex] = { ...updated[existingIndex], ...nextItem }
+    return updated
+}
+
+function mergeFailedItem(existing, nextFailure) {
+    if (!nextFailure?.itemKey) return existing
+
+    const existingIndex = existing.findIndex((item) => item.itemKey === nextFailure.itemKey)
+    if (existingIndex === -1) return [...existing, nextFailure]
+
+    const updated = [...existing]
+    updated[existingIndex] = { ...updated[existingIndex], ...nextFailure }
+    return updated
+}
+
+function mergeNoticeItem(existing, nextNotice) {
+    if (!nextNotice?.noticeKey) return existing
+
+    const existingIndex = existing.findIndex((notice) => notice.noticeKey === nextNotice.noticeKey)
+    if (existingIndex === -1) return [...existing, nextNotice]
+
+    const updated = [...existing]
+    updated[existingIndex] = { ...updated[existingIndex], ...nextNotice }
+    return updated
+}
+
+function removeFailureByKey(existing, itemKey) {
+    if (!itemKey) return existing
+    return existing.filter((item) => item.itemKey !== itemKey)
+}
+
+function removeLoadedByKey(existing, itemKey) {
+    if (!itemKey) return existing
+    return existing.filter((item) => item.itemKey !== itemKey)
+}
+
+function removeNoticesByItemKey(existing, itemKey) {
+    if (!itemKey) return existing
+    return existing.filter((notice) => notice.itemKey !== itemKey)
+}
+
+function reconcileFinalNotices(existing, finalLoaded, finalFailed) {
+    const resolvedKeys = new Set([
+        ...finalLoaded.map((item) => item.itemKey).filter(Boolean),
+        ...finalFailed.map((item) => item.itemKey).filter(Boolean)
+    ])
+
+    return existing.filter((notice) => !notice.itemKey || !resolvedKeys.has(notice.itemKey))
+}
 
 export default function LaunchingScreen({ workspace, autoLaunch = true, onSettingsClick }) {
     const [phase, setPhase] = useState('launching')
     const [progress, setProgress] = useState(0)
     const [totalItems, setTotalItems] = useState(0)
     const [loadedItems, setLoadedItems] = useState([])
+    const [failedItems, setFailedItems] = useState([])
+    const [notices, setNotices] = useState([])
+    const [liveStatus, setLiveStatus] = useState('Preparing workspace...')
     const [errorMsg, setErrorMsg] = useState(null)
     const [savingSession, setSavingSession] = useState(false)
     const [saveSuccess, setSaveSuccess] = useState(false)
     const [isClosing, setIsClosing] = useState(false)
+
+    useEffect(() => {
+        setLoadedItems([])
+        setFailedItems([])
+        setNotices([])
+        setLiveStatus('Preparing workspace...')
+        setErrorMsg(null)
+        setProgress(0)
+        setPhase('launching')
+    }, [workspace, autoLaunch])
+
+    useEffect(() => {
+        if (totalItems === 0) {
+            setProgress(100)
+            return
+        }
+        const processed = loadedItems.length + failedItems.length
+        setProgress(Math.min(100, Math.round((processed / totalItems) * 100)))
+    }, [loadedItems, failedItems, totalItems])
 
     useEffect(() => {
         if (!workspace) return
@@ -19,63 +224,96 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
 
         if (total === 0) {
             setPhase('ready')
+            setProgress(100)
             return
         }
 
         setTotalItems(total)
 
-        // If returning from settings, skip launching and jump straight to ready
         if (!autoLaunch) {
             setPhase('ready')
             setProgress(100)
             return
         }
 
-        const cleanup = window.omnilaunch.onLaunchStatus((msg) => {
-            if (msg.includes('[OK]')) {
-                const cleanName = msg
-                    .replace(/\[Tab \d+\]\s*/, '')
-                    .replace(/\[App \d+\]\s*/, '')
-                    .replace('[OK] ', '')
-                    .replace(' — ready', '')
-                    .replace(' — launched', '')
-                    .replace(/\s+-\s+(ready|launched)$/, '')
-                    .trim()
+        const cleanupStatus = window.omnilaunch.onLaunchStatus((rawMessage) => {
+            const message = normalizeStatusMessage(rawMessage)
+            if (!message) return
 
-                if (cleanName) {
-                    setLoadedItems(prev => {
-                        const updated = [...prev, cleanName]
-                        setProgress(Math.round((updated.length / total) * 100))
-                        return updated
-                    })
-                }
+            setLiveStatus(cleanNotice(message))
+
+            const successItem = parseSuccessItem(message)
+            if (successItem) {
+                setFailedItems((prev) => removeFailureByKey(prev, successItem.itemKey))
+                setNotices((prev) => removeNoticesByItemKey(prev, successItem.itemKey))
+                setLoadedItems((prev) => mergeLoadedItem(prev, successItem))
+                return
+            }
+
+            const failureItem = parseFailureItem(message)
+            if (failureItem) {
+                setLoadedItems((prev) => removeLoadedByKey(prev, failureItem.itemKey))
+                setNotices((prev) => removeNoticesByItemKey(prev, failureItem.itemKey))
+                setFailedItems((prev) => mergeFailedItem(prev, failureItem))
+                return
+            }
+
+            if (message.includes('[INFO]') || message.includes('[WARN]')) {
+                const notice = parseNoticeItem(message)
+                setNotices((prev) => mergeNoticeItem(prev, notice))
             }
         })
 
-        // Phase 16: Listen for completion via event (non-blocking IPC)
         const cleanupComplete = window.omnilaunch.onLaunchComplete((result) => {
-            if (result.success) {
-                setPhase('ready')
-                setProgress(100)
-            } else {
+            if (!result.success) {
                 setPhase('error')
                 setErrorMsg(result.error)
+                return
             }
+
+            const finalLoaded = []
+            const finalFailed = []
+            const webResults = result.results?.webResults || []
+            const appResults = result.results?.appResults || []
+
+            const appendFinalResults = (items, fallbackType) => {
+                for (const [index, item] of items.entries()) {
+                    const finalItem = buildResultLaunchItem(item, index, fallbackType)
+                    if (!finalItem) continue
+
+                    if (item.success) {
+                        finalLoaded.push(finalItem)
+                    } else {
+                        finalFailed.push({
+                            ...finalItem,
+                            reason: item.error || 'Launch failed'
+                        })
+                    }
+                }
+            }
+
+            appendFinalResults(webResults, 'web')
+            appendFinalResults(appResults, 'app')
+
+            setLoadedItems(finalLoaded)
+            setFailedItems(finalFailed)
+            setNotices((prev) => reconcileFinalNotices(prev, finalLoaded, finalFailed))
+            setPhase('ready')
+            setProgress(100)
+            setLiveStatus(finalFailed.length > 0 ? 'Workspace finished with some failures.' : 'Workspace launch complete.')
         })
 
-        // Fire launch — returns immediately, status updates come via events
         window.omnilaunch.launchWorkspace(workspace).catch((err) => {
             setPhase('error')
             setErrorMsg(err.message)
         })
 
         return () => {
-            cleanup()
+            cleanupStatus()
             cleanupComplete()
         }
-    }, [workspace])
+    }, [workspace, autoLaunch])
 
-    // Save current browser state mid-session
     const handleSaveSession = async () => {
         setSavingSession(true)
         setSaveSuccess(false)
@@ -87,9 +325,8 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
         }
     }
 
-    // Quit: close browser + desktop apps + exit
     const handleQuit = async () => {
-        if (isClosing) return // Prevent double-click
+        if (isClosing) return
         setIsClosing(true)
         try {
             await window.omnilaunch.quitAndRelaunch({ closeApps: true })
@@ -97,38 +334,40 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
         window.omnilaunch.close()
     }
 
-    // Friendly display name from URL or app name
-    const getDisplayName = (item) => {
-        // If it looks like a URL, extract the domain
-        if (item.includes('.') && (item.startsWith('http') || item.includes('://'))) {
-            try {
-                return new URL(item.startsWith('http') ? item : `https://${item}`).hostname.replace('www.', '')
-            } catch {
-                return item
-            }
+    const statusSummary = useMemo(() => {
+        if (failedItems.length > 0) {
+            return `${loadedItems.length} loaded, ${failedItems.length} failed`
         }
-        // Desktop app name — display as-is
-        return item
-    }
+        return `${loadedItems.length} of ${totalItems} items loaded`
+    }, [loadedItems.length, failedItems.length, totalItems])
+
+    const readyTitle = failedItems.length > 0 ? 'Workspace Partially Ready' : 'Workspace Ready'
+    const readySubtitle = failedItems.length > 0
+        ? `${loadedItems.length} launched, ${failedItems.length} failed`
+        : loadedItems.length > 0
+            ? `${loadedItems.length} item${loadedItems.length !== 1 ? 's' : ''} launched`
+            : 'All set'
 
     return (
         <>
-            {/* ─── CLOSING OVERLAY ─── */}
             {isClosing && (
-                <div style={{
-                    position: 'fixed', inset: 0, zIndex: 100,
-                    display: 'flex', flexDirection: 'column',
-                    alignItems: 'center', justifyContent: 'center',
-                    background: 'rgba(10, 10, 20, 0.97)'
-                }} className="animate-fade-in">
+                <div
+                    style={{
+                        position: 'fixed', inset: 0, zIndex: 100,
+                        display: 'flex', flexDirection: 'column',
+                        alignItems: 'center', justifyContent: 'center',
+                        background: 'rgba(10, 10, 20, 0.97)'
+                    }}
+                    className="animate-fade-in"
+                >
                     <div className="spinner" style={{ width: 28, height: 28, marginBottom: 16 }} />
                     <h2 style={{ fontSize: 16, fontWeight: 600, color: '#fff', marginBottom: 6 }}>Closing Workspace</h2>
                     <p style={{ fontSize: 12, color: '#8888a0' }}>Syncing data & cleaning up...</p>
-                    <p style={{ fontSize: 10, color: '#555568', marginTop: 16 }}>Please don't unplug your USB drive</p>
+                    <p style={{ fontSize: 10, color: '#555568', marginTop: 16 }}>Please don&apos;t unplug your USB drive</p>
                 </div>
             )}
-            <div className="card p-6 w-full max-w-sm animate-slide-up" style={{ maxHeight: 520 }}>
-                {/* ─── LAUNCHING STATE ─── */}
+
+            <div className="card p-6 w-full max-w-sm animate-slide-up" style={{ maxHeight: 560 }}>
                 {phase === 'launching' && (
                     <div className="flex flex-col items-center animate-fade-in">
                         <div className="w-14 h-14 mx-auto mb-4 rounded-full flex items-center justify-center bg-[#1a1a2e]">
@@ -136,73 +375,139 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
                         </div>
 
                         <h1 className="text-base font-semibold text-white mb-1">Launching Workspace</h1>
-                        <p className="text-secondary text-xs mb-4">
-                            {loadedItems.length} of {totalItems} items loaded
+                        <p className="text-secondary text-xs mb-2">{statusSummary}</p>
+                        <p className="text-muted text-center mb-4" style={{ fontSize: 10, minHeight: 28 }}>
+                            {liveStatus}
                         </p>
 
-                        {/* Progress Bar */}
                         <div className="w-full h-1.5 rounded-full bg-[#14141c] mb-4 overflow-hidden">
                             <div
                                 className="h-full rounded-full transition-all duration-500 ease-out"
                                 style={{
                                     width: `${progress}%`,
-                                    background: 'linear-gradient(90deg, #5b7bd5, #7b5bd5)'
+                                    background: failedItems.length > 0
+                                        ? 'linear-gradient(90deg, #d59a5b, #d57b5b)'
+                                        : 'linear-gradient(90deg, #5b7bd5, #7b5bd5)'
                                 }}
                             />
                         </div>
 
-                        <div className="w-full space-y-1.5" style={{ maxHeight: 200, overflowY: 'auto' }}>
-                            {loadedItems.map((item, i) => (
-                                <div key={i} className="flex items-center gap-2 animate-fade-in">
-                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#4a9" strokeWidth="3" strokeLinecap="round">
-                                        <polyline points="20 6 9 17 4 12" />
-                                    </svg>
-                                    <span className="text-xs text-secondary truncate">{getDisplayName(item)}</span>
+                        <div className="w-full space-y-3" style={{ maxHeight: 260, overflowY: 'auto' }}>
+                            {loadedItems.length > 0 && (
+                                <div className="space-y-1.5">
+                                    {loadedItems.map((item, i) => (
+                                        <div key={item.itemKey || `ok-${i}`} className="flex items-center gap-2 animate-fade-in">
+                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#4a9" strokeWidth="3" strokeLinecap="round">
+                                                <polyline points="20 6 9 17 4 12" />
+                                            </svg>
+                                            <span className="text-xs text-secondary truncate">{cleanDisplayLabel(item.label)}</span>
+                                        </div>
+                                    ))}
                                 </div>
-                            ))}
+                            )}
+
+                            {failedItems.length > 0 && (
+                                <div className="pt-2 border-t border-[#2a2432] space-y-2">
+                                    <p className="text-xs font-medium text-[#f0b36b]">Failed items</p>
+                                    {failedItems.map((item, i) => (
+                                        <div key={item.itemKey || `warn-${i}`} className="flex items-start gap-2 animate-fade-in">
+                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#d57b5b" strokeWidth="2.5" strokeLinecap="round">
+                                                <circle cx="12" cy="12" r="9" />
+                                                <line x1="12" y1="8" x2="12" y2="13" />
+                                                <circle cx="12" cy="16.5" r="0.8" fill="#d57b5b" stroke="none" />
+                                            </svg>
+                                            <div className="min-w-0">
+                                                <div className="text-xs text-white truncate">{cleanDisplayLabel(item.label)}</div>
+                                                <div className="text-[10px] text-[#c08e86] break-words">{item.reason}</div>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+
+                            {notices.length > 0 && (
+                                <div className="pt-2 border-t border-[#232335] space-y-1.5">
+                                    <p className="text-xs font-medium text-[#9ab0ff]">Notes</p>
+                                    {notices.map((notice, i) => (
+                                        <div key={notice.noticeKey || `note-${i}`} className="text-[10px] text-[#9ca3c8] break-words">
+                                            {notice.message}
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
                         </div>
                     </div>
                 )}
 
-                {/* ─── READY STATE ─── */}
                 {phase === 'ready' && (
                     <div className="flex flex-col animate-fade-in">
-                        {/* Success Header */}
                         <div className="text-center mb-4">
-                            <div className="w-14 h-14 mx-auto mb-3 rounded-full flex items-center justify-center bg-[#1a2a1a]">
-                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#4a9" strokeWidth="2.5" strokeLinecap="round">
-                                    <polyline points="20 6 9 17 4 12" />
-                                </svg>
+                            <div
+                                className="w-14 h-14 mx-auto mb-3 rounded-full flex items-center justify-center"
+                                style={{ background: failedItems.length > 0 ? '#2a2416' : '#1a2a1a' }}
+                            >
+                                {failedItems.length > 0 ? (
+                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#f0b36b" strokeWidth="2.5" strokeLinecap="round">
+                                        <path d="M12 9v4" />
+                                        <circle cx="12" cy="16.5" r="0.8" fill="#f0b36b" stroke="none" />
+                                        <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                                    </svg>
+                                ) : (
+                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#4a9" strokeWidth="2.5" strokeLinecap="round">
+                                        <polyline points="20 6 9 17 4 12" />
+                                    </svg>
+                                )}
                             </div>
-                            <h1 className="text-lg font-semibold text-white">Workspace Ready</h1>
-                            <p className="text-secondary text-xs mt-1">
-                                {loadedItems.length > 0
-                                    ? `${loadedItems.length} item${loadedItems.length !== 1 ? 's' : ''} launched`
-                                    : 'All set'}
-                            </p>
+                            <h1 className="text-lg font-semibold text-white">{readyTitle}</h1>
+                            <p className="text-secondary text-xs mt-1">{readySubtitle}</p>
                         </div>
 
-                        {/* Loaded Items */}
-                        {loadedItems.length > 0 && (
-                            <div className="mb-4 p-3 rounded-lg bg-[#14141c]" style={{ maxHeight: 140, overflowY: 'auto' }}>
+                        {(loadedItems.length > 0 || failedItems.length > 0) && (
+                            <div className="mb-4 p-3 rounded-lg bg-[#14141c]" style={{ maxHeight: 180, overflowY: 'auto' }}>
                                 <div className="space-y-2">
                                     {loadedItems.map((item, i) => (
-                                        <div key={i} className="flex items-center gap-2.5">
+                                        <div key={item.itemKey || `ready-ok-${i}`} className="flex items-center gap-2.5">
                                             <div className="w-5 h-5 rounded flex items-center justify-center flex-shrink-0" style={{ background: '#1a2a1a' }}>
                                                 <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#4a9" strokeWidth="3" strokeLinecap="round">
                                                     <polyline points="20 6 9 17 4 12" />
                                                 </svg>
                                             </div>
-                                            <span className="text-xs text-white truncate">{getDisplayName(item)}</span>
+                                            <span className="text-xs text-white truncate">{cleanDisplayLabel(item.label)}</span>
+                                        </div>
+                                    ))}
+
+                                    {failedItems.map((item, i) => (
+                                        <div key={item.itemKey || `ready-warn-${i}`} className="flex items-start gap-2.5">
+                                            <div className="w-5 h-5 rounded flex items-center justify-center flex-shrink-0" style={{ background: '#2a1e1a' }}>
+                                                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#d57b5b" strokeWidth="2.5" strokeLinecap="round">
+                                                    <line x1="12" y1="7" x2="12" y2="13" />
+                                                    <circle cx="12" cy="17" r="0.8" fill="#d57b5b" stroke="none" />
+                                                    <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                                                </svg>
+                                            </div>
+                                            <div className="min-w-0">
+                                                <div className="text-xs text-white truncate">{cleanDisplayLabel(item.label)}</div>
+                                                <div className="text-[10px] text-[#c08e86] break-words">{item.reason}</div>
+                                            </div>
                                         </div>
                                     ))}
                                 </div>
                             </div>
                         )}
 
-                        {/* Action Buttons — Clean 3-button layout */}
+                        {notices.length > 0 && (
+                            <div className="mb-4 p-3 rounded-lg bg-[#121626] border border-[#27304d]">
+                                <div className="space-y-1.5">
+                                    {notices.map((notice, i) => (
+                                        <div key={notice.noticeKey || `ready-note-${i}`} className="text-[10px] text-[#aab7e8] break-words">
+                                            {notice.message}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
                         <div className="space-y-2">
-                            {/* Save Session — full width, primary */}
                             <button
                                 className="btn-primary w-full text-sm py-2.5"
                                 disabled={savingSession}
@@ -232,12 +537,8 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
                                 )}
                             </button>
 
-                            {/* Settings + Quit row */}
                             <div className="flex gap-2">
-                                <button
-                                    className="btn-secondary flex-1 text-xs py-2"
-                                    onClick={onSettingsClick}
-                                >
+                                <button className="btn-secondary flex-1 text-xs py-2" onClick={onSettingsClick}>
                                     <span className="flex items-center justify-center gap-1.5">
                                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
                                             <circle cx="12" cy="12" r="3" />
@@ -269,7 +570,6 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
                     </div>
                 )}
 
-                {/* ─── ERROR STATE ─── */}
                 {phase === 'error' && (
                     <div className="flex flex-col items-center animate-fade-in">
                         <div className="w-14 h-14 mx-auto mb-4 rounded-full flex items-center justify-center bg-[#2a1a1a]">

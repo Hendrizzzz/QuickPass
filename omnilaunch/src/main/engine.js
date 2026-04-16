@@ -19,13 +19,11 @@
  * - abandonSync Flag: Prevents ghost writes during Node.js shutdown
  */
 import { chromium } from 'playwright-core'
-import { spawn, execSync, exec } from 'child_process'
+import { spawn, execSync } from 'child_process'
 import { join, parse as pathParse } from 'path'
 import { mkdirSync, existsSync, rmSync, readdirSync, renameSync } from 'fs'
 import os from 'os'
 import crypto from 'crypto'
-import { promisify } from 'util'
-const execAsync = promisify(exec)
 
 // Active browser/context references
 let activeBrowser = null
@@ -41,8 +39,16 @@ export const runDiagnostics = {
     osVersion: null,
     startTime: null,
     phases: [],             // { name, startMs, endMs, durationMs, status, detail }
-    appResults: [],         // { name, pid, realPid, exePath, isLauncher, closeMethod }
+    appResults: [],         // { name, pid, realPid, exePath, isLauncher, closeMethod, status, launchStage, error, ... }
     browserSync: { copyInMs: null, copyOutMs: null, migrated: false },
+    runtimeChecks: {
+        extractor: {
+            checked: false,
+            tarAvailable: null,
+            zstdSupported: null,
+            detail: ''
+        }
+    },
     errors: []
 }
 
@@ -67,8 +73,156 @@ export function diagError(context, message) {
 }
 
 function updateAppDiagnostic(appObj, patch) {
+    if (!appObj?.diagRef || !patch) return
+
+    const nextPatch = { ...patch }
+    const diagRef = appObj.diagRef
+    const launchAlreadyFinal = diagRef.status === 'ok' || diagRef.status === 'failed'
+
+    if (launchAlreadyFinal) {
+        delete nextPatch.status
+        delete nextPatch.launchStage
+        delete nextPatch.error
+        delete nextPatch.finalizedBy
+    }
+
+    Object.assign(diagRef, nextPatch)
+}
+
+function createAppDiagnostic(appConfig, attemptedPath) {
+    return {
+        name: appConfig.name,
+        pid: null,
+        realPid: null,
+        exePath: null,
+        isLauncher: false,
+        closeMethod: null,
+        status: 'starting',
+        launchStage: 'resolving',
+        attemptedPath: attemptedPath || null,
+        resolvedPath: null,
+        launchSource: 'raw-path',
+        archivePath: null,
+        archiveExists: false,
+        directoryExists: false,
+        localExeExists: false,
+        error: null,
+        launchVerifiedBy: null,
+        launcherDetectionAttempts: 0,
+        launcherDetectionMs: 0,
+        handoffObserved: false,
+        handoffSignal: null,
+        handoffTimeoutMs: null,
+        finalizedBy: null
+    }
+}
+
+const DEFAULT_LAUNCHER_HANDOFF_TIMEOUT_MS = 8000
+const LAUNCHER_HANDOFF_TIMEOUT_OVERRIDES_MS = {
+    slack: 10000
+}
+
+function getLauncherHandoffTimeoutMs(appName) {
+    const key = String(appName || '').trim().toLowerCase()
+    return LAUNCHER_HANDOFF_TIMEOUT_OVERRIDES_MS[key] || DEFAULT_LAUNCHER_HANDOFF_TIMEOUT_MS
+}
+
+function setDiagnosticLaunchFinal(diagRef, patch) {
+    if (!diagRef || !patch) return
+    Object.assign(diagRef, patch)
+}
+
+function finalizeLaunchSuccess(appObj, {
+    launchVerifiedBy,
+    finalizedBy,
+    extra = {}
+} = {}) {
     if (!appObj?.diagRef) return
-    Object.assign(appObj.diagRef, patch)
+
+    setDiagnosticLaunchFinal(appObj.diagRef, {
+        ...extra,
+        status: 'ok',
+        launchStage: 'ok',
+        error: null,
+        launchVerifiedBy: launchVerifiedBy || appObj.diagRef.launchVerifiedBy || null,
+        finalizedBy: finalizedBy || launchVerifiedBy || appObj.diagRef.finalizedBy || null
+    })
+}
+
+function finalizeLaunchFailure(appObj, {
+    message,
+    stage = 'failed',
+    finalizedBy,
+    extra = {}
+} = {}) {
+    if (!appObj?.diagRef) return
+
+    setDiagnosticLaunchFinal(appObj.diagRef, {
+        ...extra,
+        status: 'failed',
+        launchStage: stage,
+        error: message || 'Launch failed',
+        finalizedBy: finalizedBy || appObj.diagRef.finalizedBy || null
+    })
+}
+
+function ensureExtractorPreflight() {
+    const existing = runDiagnostics.runtimeChecks?.extractor
+    if (existing?.checked) return existing
+
+    const result = {
+        checked: true,
+        tarAvailable: false,
+        zstdSupported: false,
+        detail: ''
+    }
+
+    try {
+        const versionOutput = execSync('tar --version', {
+            encoding: 'utf8',
+            timeout: 3000,
+            stdio: ['ignore', 'pipe', 'ignore']
+        })
+        result.tarAvailable = true
+        result.detail = versionOutput.split(/\r?\n/).find(Boolean) || 'tar available'
+    } catch (err) {
+        result.detail = err.message
+        runDiagnostics.runtimeChecks.extractor = result
+        diagError('extractor-preflight', `tar unavailable: ${err.message}`)
+        return result
+    }
+
+    const probeDir = join(os.tmpdir(), `QuickPass-TarProbe-${Date.now()}-${Math.random().toString(16).slice(2)}`)
+    try {
+        const probeFile = join(probeDir, 'probe.txt')
+        const probeArchive = join(probeDir, 'probe.tar.zst')
+        mkdirSync(probeDir, { recursive: true })
+        require('fs').writeFileSync(probeFile, 'probe', 'utf8')
+
+        execSync(`tar --zstd -cf "${probeArchive}" -C "${probeDir}" probe.txt`, {
+            encoding: 'utf8',
+            timeout: 5000,
+            stdio: ['ignore', 'ignore', 'ignore']
+        })
+        execSync(`tar --zstd -tf "${probeArchive}"`, {
+            encoding: 'utf8',
+            timeout: 5000,
+            stdio: ['ignore', 'ignore', 'ignore']
+        })
+        result.zstdSupported = true
+    } catch (err) {
+        result.detail = `${result.detail}; zstd probe failed: ${err.message}`
+        diagError('extractor-preflight', `tar zstd probe failed: ${err.message}`)
+    } finally {
+        try { rmSync(probeDir, { recursive: true, force: true }) } catch (_) { }
+    }
+
+    if (!result.zstdSupported) {
+        diagError('extractor-preflight', 'tar available but --zstd probe failed')
+    }
+
+    runDiagnostics.runtimeChecks.extractor = result
+    return result
 }
 
 // ─── WQL Escape Helpers ─────────────────────────────────────────────────────
@@ -329,6 +483,17 @@ export function wipeLocalAppCache() {
 
 export function onBrowserAllClosed(cb) {
     onDisconnectCallback = cb
+}
+
+export function hasActiveBrowserSession() {
+    if (!activeContext) return false
+
+    try {
+        const pages = activeContext.pages().filter((page) => !page.isClosed())
+        return pages.length > 0
+    } catch (_) {
+        return false
+    }
 }
 
 function attachPageTracking(context) {
@@ -819,6 +984,177 @@ function findPidsByProcessName(exePath, spawnTime) {
     } catch (_) { return [] }
 }
 
+function getKnownSuccessorDetails(appObj) {
+    if (appObj?.realPid && appObj.realPid !== appObj.pid) {
+        return {
+            pids: [appObj.realPid],
+            signal: appObj.diagRef?.handoffSignal || 'known-real-pid'
+        }
+    }
+
+    return null
+}
+
+async function findSuccessorDetails(appObj) {
+    if (!appObj) {
+        return { pids: [], signal: null }
+    }
+
+    const knownDetails = getKnownSuccessorDetails(appObj)
+    if (knownDetails) return knownDetails
+
+    if (appObj.localPath) {
+        const commandLinePids = (await findRealPidAsync(appObj.localPath))
+            .filter((pid) => pid !== appObj.pid)
+
+        if (commandLinePids.length > 0) {
+            return { pids: commandLinePids, signal: 'command-line' }
+        }
+    }
+
+    if (appObj.exePath) {
+        const processNamePids = findPidsByProcessName(appObj.exePath, appObj.spawnTime)
+            .filter((pid) => pid !== appObj.pid)
+
+        if (processNamePids.length > 0) {
+            return { pids: processNamePids, signal: 'process-name' }
+        }
+    }
+
+    return { pids: [], signal: null }
+}
+
+function findSuccessorDetailsSync(appObj) {
+    if (!appObj) {
+        return { pids: [], signal: null }
+    }
+
+    const knownDetails = getKnownSuccessorDetails(appObj)
+    if (knownDetails) return knownDetails
+
+    if (appObj.localPath) {
+        const commandLinePids = findRealPidsByCommandLine(appObj.localPath)
+            .filter((pid) => pid !== appObj.pid)
+
+        if (commandLinePids.length > 0) {
+            return { pids: commandLinePids, signal: 'command-line' }
+        }
+    }
+
+    if (appObj.exePath) {
+        const processNamePids = findPidsByProcessName(appObj.exePath, appObj.spawnTime)
+            .filter((pid) => pid !== appObj.pid)
+
+        if (processNamePids.length > 0) {
+            return { pids: processNamePids, signal: 'process-name' }
+        }
+    }
+
+    return { pids: [], signal: null }
+}
+
+function ensureLauncherHandoff(appObj, {
+    timeoutMs = getLauncherHandoffTimeoutMs(appObj?.diagRef?.name),
+    intervalMs = 500
+} = {}) {
+    if (!appObj) {
+        return Promise.resolve({
+            success: false,
+            attempts: 0,
+            durationMs: 0,
+            pids: [],
+            realPid: null,
+            signal: null,
+            timeoutMs
+        })
+    }
+
+    if (appObj.launcherHandoffPromise) return appObj.launcherHandoffPromise
+
+    updateAppDiagnostic(appObj, {
+        isLauncher: true,
+        handoffTimeoutMs: timeoutMs
+    })
+
+    appObj.launcherHandoffPromise = (async () => {
+        const startedAt = Date.now()
+        let attempts = 0
+
+        while (Date.now() - startedAt <= timeoutMs) {
+            attempts += 1
+            const details = await findSuccessorDetails(appObj)
+            if (details.pids.length > 0) {
+                const realPid = details.pids[0]
+                startLauncherMonitor(appObj, realPid)
+
+                return {
+                    success: true,
+                    attempts,
+                    durationMs: Date.now() - startedAt,
+                    pids: details.pids,
+                    realPid,
+                    signal: details.signal,
+                    timeoutMs
+                }
+            }
+
+            if (Date.now() - startedAt + intervalMs > timeoutMs) break
+            await new Promise((resolve) => setTimeout(resolve, intervalMs))
+        }
+
+        return {
+            success: false,
+            attempts,
+            durationMs: Date.now() - startedAt,
+            pids: [],
+            realPid: null,
+            signal: null,
+            timeoutMs
+        }
+    })().then((result) => {
+        updateAppDiagnostic(appObj, {
+            handoffObserved: result.success,
+            handoffSignal: result.signal,
+            handoffTimeoutMs: result.timeoutMs,
+            launcherDetectionAttempts: result.attempts,
+            launcherDetectionMs: result.durationMs,
+            ...(result.realPid ? { realPid: result.realPid } : {})
+        })
+
+        return result
+    })
+
+    return appObj.launcherHandoffPromise
+}
+
+function startLauncherMonitor(appObj, realPid) {
+    if (!realPid || appObj.launcherMonitorStarted) return
+
+    appObj.launcherMonitorStarted = true
+    appObj.realPid = realPid
+    updateAppDiagnostic(appObj, {
+        isLauncher: true,
+        realPid,
+        launchVerifiedBy: 'launcher-handoff'
+    })
+
+    const checkInterval = setInterval(() => {
+        if (appObj.abandonSync || closeInProgress) {
+            clearInterval(checkInterval)
+            return
+        }
+        try {
+            process.kill(realPid, 0)
+        } catch (_) {
+            clearInterval(checkInterval)
+            console.log(`[QuickPass] ${appObj.diagRef.name} manual close detected. Syncing to USB...`)
+            if (appObj.usbPath && appObj.localPath && !appObj.syncPromise && !appObj.abandonSync) {
+                appObj.syncPromise = enqueueSync(appObj.usbPath, appObj.localPath)
+            }
+        }
+    }, 5000)
+}
+
 /**
  * Gracefully close all tracked desktop apps, sync their data to USB,
  * and wipe local traces.
@@ -896,21 +1232,14 @@ export async function closeDesktopApps() {
         // Multi-signal approach: command-line fingerprint (primary), process-name (fallback)
         for (const app of launchedApps) {
             if (app.isLauncherPattern) {
-                let realPids = []
-                // Signal 1: command-line fingerprint (most precise for imported apps)
-                if (app.localPath) {
-                    realPids = findRealPidsByCommandLine(app.localPath)
-                }
-                // Signal 2: process name + creation-time window (for manually-added apps)
-                if (realPids.length === 0 && app.exePath) {
-                    realPids = findPidsByProcessName(app.exePath, app.spawnTime)
-                    realPids = realPids.filter(p => p !== app.pid)
-                }
+                const successorDetails = findSuccessorDetailsSync(app)
+                const realPids = successorDetails.pids
                 if (realPids.length > 0) {
                     app.closeMethod = 'launcher-kill'
                     updateAppDiagnostic(app, {
                         closeMethod: app.closeMethod,
                         isLauncher: true,
+                        ...(successorDetails.signal ? { handoffSignal: app.diagRef?.handoffSignal || successorDetails.signal } : {}),
                         realPid: app.realPid || realPids[0] || null
                     })
                 }
@@ -952,14 +1281,8 @@ export function emergencyKillDesktopAppsSync() {
         }
         // Also kill launcher-pattern orphans using multi-signal approach
         if (app.isLauncherPattern) {
-            let realPids = []
-            if (app.localPath) {
-                realPids = findRealPidsByCommandLine(app.localPath)
-            }
-            if (realPids.length === 0 && app.exePath) {
-                realPids = findPidsByProcessName(app.exePath, app.spawnTime)
-                realPids = realPids.filter(p => p !== app.pid)
-            }
+            const successorDetails = findSuccessorDetailsSync(app)
+            const realPids = successorDetails.pids
             for (const pid of realPids) {
                 try { execSync(`taskkill /pid ${pid} /F`, { stdio: 'ignore' }) } catch (_) { }
             }
@@ -970,7 +1293,7 @@ export function emergencyKillDesktopAppsSync() {
 
 // ─── Desktop App Launcher ───────────────────────────────────────────────────────
 
-async function launchDesktopApp(appConfig, onStatus, vaultDir) {
+async function launchDesktopAppLegacy(appConfig, onStatus, vaultDir) {
     try {
         onStatus(`Launching ${appConfig.name}...`)
         let args = appConfig.args ? appConfig.args.split(' ').filter(Boolean) : []
@@ -1246,6 +1569,308 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
  * wait for robocopy + Chrome + tab loading to finish first. A 1.5s stagger between
  * apps prevents CPU/disk saturation when multiple Electron apps initialize.
  */
+async function launchDesktopApp(appConfig, onStatus, vaultDir) {
+    const diagRef = createAppDiagnostic(appConfig, appConfig.path)
+    runDiagnostics.appResults.push(diagRef)
+    let appObj = null
+
+    const failLaunch = (context, message, stage = 'failed') => {
+        if (appObj) {
+            finalizeLaunchFailure(appObj, {
+                message,
+                stage,
+                finalizedBy: context
+            })
+        } else {
+            Object.assign(diagRef, {
+                status: 'failed',
+                launchStage: stage,
+                error: message,
+                finalizedBy: context
+            })
+        }
+        diagError(context, `${appConfig.name}: ${message}`)
+        onStatus(`[WARN] ${appConfig.name} - ${message}`)
+        return { success: false, name: appConfig.name, error: message }
+    }
+
+    try {
+        onStatus(`Launching ${appConfig.name}...`)
+        let args = appConfig.args ? appConfig.args.split(' ').filter(Boolean) : []
+        let appPath = appConfig.path
+        let launchSource = 'raw-path'
+        let usbPath = null
+        let localPath = null
+
+        if (vaultDir && appPath.startsWith(vaultDir)) {
+            const relPath = appPath.substring(vaultDir.length)
+            const parts = relPath.split(/[\\/]/).filter(Boolean)
+            if (parts[0] === 'Apps' && parts.length >= 3) {
+                const appName = parts[1]
+                const safeName = appName.replace(/[^a-zA-Z0-9_-]/g, '_')
+                const exeRelative = parts.slice(2).join('\\')
+                const archivePath = join(vaultDir, 'Apps', `${appName}.tar.zst`)
+                const dirPath = join(vaultDir, 'Apps', appName)
+                const archiveExists = existsSync(archivePath)
+                const directoryExists = existsSync(dirPath)
+                const localAppDir = join(os.tmpdir(), `QuickPass-App-${safeName}`)
+                const localAppRoot = join(localAppDir, appName)
+                const localExePath = join(localAppRoot, exeRelative)
+
+                Object.assign(diagRef, {
+                    archivePath,
+                    archiveExists,
+                    directoryExists
+                })
+
+                if (archiveExists && !directoryExists) {
+                    const extractor = ensureExtractorPreflight()
+                    launchSource = 'archive'
+                    diagRef.launchStage = 'extracting'
+                    onStatus(`Extracting ${appConfig.name}...`)
+
+                    if (!extractor.tarAvailable || !extractor.zstdSupported) {
+                        return failLaunch('app-extract', 'Extractor unavailable for .tar.zst payloads on this PC', 'extracting')
+                    }
+
+                    if (!existsSync(localExePath)) {
+                        const extractPhase = `app-extract:${safeName}`
+                        diagPhaseStart(extractPhase)
+                        mkdirSync(localAppRoot, { recursive: true })
+                        try {
+                            await new Promise((resolve, reject) => {
+                                const proc = spawn('tar', ['--zstd', '--strip-components=1', '-xf', archivePath, '-C', localAppRoot], { stdio: 'ignore' })
+                                proc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`tar exit ${code}`)))
+                                proc.on('error', reject)
+                            })
+                            diagPhaseEnd(extractPhase)
+                        } catch (err) {
+                            diagPhaseEnd(extractPhase, 'failed', err.message)
+                            console.error(`[QuickPass] Failed to extract ${appName}:`, err)
+                            try { rmSync(localAppRoot, { recursive: true, force: true }) } catch (_) { }
+                            return failLaunch('app-extract', `Extraction failed (${err.message})`, 'extracting')
+                        }
+                    }
+
+                    diagRef.localExeExists = existsSync(localExePath)
+                    if (!diagRef.localExeExists) {
+                        return failLaunch('app-exe-missing', `Extracted executable not found at ${localExePath}`, 'extracting')
+                    }
+
+                    appPath = localExePath
+                    onStatus(`Launching ${appConfig.name} from local...`)
+                } else if (!archiveExists && !directoryExists) {
+                    launchSource = 'local-cache'
+                    diagRef.localExeExists = existsSync(localExePath)
+                    if (diagRef.localExeExists) {
+                        appPath = localExePath
+                    } else {
+                        return failLaunch('app-payload-missing', 'No app archive, directory, or local cache was found', 'resolving')
+                    }
+                } else {
+                    launchSource = 'usb-directory'
+                }
+            }
+        }
+
+        if (appConfig.portableData && vaultDir) {
+            const safeName = appConfig.name.replace(/[^a-zA-Z0-9_-]/g, '_')
+            const sanitizedPath = join(vaultDir, 'AppData', safeName)
+            const rawPath = join(vaultDir, 'AppData', appConfig.name)
+
+            if (safeName !== appConfig.name && existsSync(rawPath)) {
+                usbPath = rawPath
+                if (existsSync(sanitizedPath)) {
+                    const bakPath = `${sanitizedPath}.bak-${Date.now()}`
+                    try {
+                        renameSync(sanitizedPath, bakPath)
+                        console.log(`[QuickPass] Legacy conflict: backed up ${sanitizedPath} -> ${bakPath}`)
+                    } catch (e) {
+                        console.warn(`[QuickPass] Failed to backup sanitized folder: ${e.message}`)
+                    }
+                }
+            } else {
+                usbPath = sanitizedPath
+            }
+
+            localPath = join(os.tmpdir(), `QuickPass-AppData-${safeName}`)
+
+            mkdirSync(usbPath, { recursive: true })
+            mkdirSync(localPath, { recursive: true })
+
+            try {
+                diagRef.launchStage = 'syncing-data'
+                onStatus(`Syncing ${appConfig.name} data to local...`)
+                await robocopyAsync(usbPath, localPath)
+            } catch (err) {
+                console.error(`[QuickPass] Failed to sync AppData for ${appConfig.name}:`, err)
+                diagError('app-data-sync', `${appConfig.name}: ${err.message}`)
+            }
+
+            args = [`--user-data-dir=${localPath}`, ...args]
+        }
+
+        warnOnEmbeddedHostPaths(localPath, appConfig, onStatus)
+
+        const isExe = appPath.toLowerCase().endsWith('.exe') || appPath.toLowerCase().endsWith('.bat') || appPath.toLowerCase().endsWith('.cmd')
+        const targetExists = appPath ? existsSync(appPath) : false
+
+        Object.assign(diagRef, {
+            exePath: appPath,
+            resolvedPath: appPath,
+            launchSource,
+            launchStage: 'spawning'
+        })
+
+        if (!targetExists) {
+            return failLaunch('app-path-missing', `Resolved path not found: ${appPath}`, 'resolving')
+        }
+
+        let cwd
+        if (isExe) {
+            cwd = require('path').dirname(appPath)
+        }
+
+        let child
+        try {
+            child = isExe
+                ? spawn(appPath, args, {
+                    detached: true,
+                    stdio: 'ignore',
+                    ...(cwd ? { cwd } : {})
+                })
+                : spawn('explorer.exe', [appPath, ...args], {
+                    detached: true,
+                    stdio: 'ignore',
+                    ...(cwd ? { cwd } : {})
+                })
+        } catch (err) {
+            return failLaunch('app-spawn', err.message, 'spawning')
+        }
+
+        if (!child.pid) {
+            return failLaunch('app-spawn', 'Failed to spawn process', 'spawning')
+        }
+
+        const spawnTime = Date.now()
+        appObj = {
+            pid: child.pid,
+            child,
+            usbPath,
+            localPath,
+            exited: false,
+            syncPromise: null,
+            abandonSync: false,
+            isLauncherPattern: false,
+            launcherMonitorStarted: false,
+            launcherHandoffPromise: null,
+            exePath: appConfig.path,
+            spawnTime,
+            closeMethod: null,
+            diagRef
+        }
+
+        Object.assign(diagRef, {
+            pid: child.pid,
+            status: 'spawning'
+        })
+
+        launchedApps.push(appObj)
+        child.unref()
+
+        child.once('exit', () => {
+            appObj.exited = true
+            if (appObj.abandonSync) return
+
+            const lifetime = Date.now() - spawnTime
+            if (lifetime < 15000) {
+                appObj.isLauncherPattern = true
+                updateAppDiagnostic(appObj, {
+                    isLauncher: true,
+                    launchStage: 'handoff-pending'
+                })
+                console.log(`[QuickPass] ${appConfig.name} exited in ${lifetime}ms - likely a launcher, deferring sync`)
+
+                ensureLauncherHandoff(appObj).catch(() => {})
+
+                return
+            }
+
+            if (appObj.usbPath && appObj.localPath && !appObj.syncPromise) {
+                appObj.syncPromise = enqueueSync(appObj.usbPath, appObj.localPath)
+            }
+        })
+
+        const result = await new Promise((resolve) => {
+            let settled = false
+            const finish = (payload) => {
+                if (settled) return
+                settled = true
+                resolve(payload)
+            }
+
+            child.once('error', (err) => {
+                finish(failLaunch('app-spawn', err.message, 'spawning'))
+            })
+
+            setTimeout(async () => {
+                if (settled) return
+
+                if (appObj.exited) {
+                    updateAppDiagnostic(appObj, {
+                        status: 'launcher-detecting',
+                        launchStage: 'launcher-detecting'
+                    })
+                    onStatus(`[INFO] ${appConfig.name} is handing off to its main process...`)
+
+                    const handoff = await ensureLauncherHandoff(appObj)
+
+                    if (!handoff.success) {
+                        finish(failLaunch('app-spawn', 'Launcher process exited before handoff was observed', 'launcher-detecting'))
+                        return
+                    }
+
+                    appObj.isLauncherPattern = true
+                    finalizeLaunchSuccess(appObj, {
+                        launchVerifiedBy: 'launcher-handoff',
+                        finalizedBy: 'launcher-handoff',
+                        extra: {
+                            handoffObserved: true,
+                            handoffSignal: handoff.signal,
+                            handoffTimeoutMs: handoff.timeoutMs,
+                            launcherDetectionAttempts: handoff.attempts,
+                            launcherDetectionMs: handoff.durationMs,
+                            ...(handoff.realPid ? { realPid: handoff.realPid } : {})
+                        }
+                    })
+                    onStatus(`[OK] ${appConfig.name} - launched`)
+                    finish({ success: true, name: appConfig.name })
+                    return
+                } else {
+                    try {
+                        process.kill(child.pid, 0)
+                    } catch (_) {
+                        finish(failLaunch('app-spawn', 'Process terminated immediately after launch', 'spawning'))
+                        return
+                    }
+
+                    finalizeLaunchSuccess(appObj, {
+                        launchVerifiedBy: 'initial-pid',
+                        finalizedBy: 'initial-pid'
+                    })
+                    onStatus(`[OK] ${appConfig.name} - launched`)
+                    finish({ success: true, name: appConfig.name })
+                    return
+                }
+            }, 1000)
+        })
+
+        return result
+    } catch (err) {
+        return failLaunch('app-launch', err.message)
+    }
+}
+
 export async function launchWorkspace(workspace, onStatus, vaultDir) {
     const savedUrls = (workspace.webTabs || []).filter(t => t.enabled).map(t => t.url)
     const enabledApps = (workspace.desktopApps || []).filter(a => a.enabled)
@@ -1324,6 +1949,9 @@ export async function launchWorkspace(workspace, onStatus, vaultDir) {
     // of pure waste to every workspace launch.
     const appsTrack = async () => {
         const appResults = []
+        if (enabledApps.length > 0) {
+            ensureExtractorPreflight()
+        }
         for (let i = 0; i < enabledApps.length; i++) {
             const appConfig = enabledApps[i]
             const result = await launchDesktopApp(appConfig, (msg) => onStatus(`[App ${i + 1}] ${msg}`), vaultDir)
