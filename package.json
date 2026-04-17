@@ -10,6 +10,7 @@
         "package": "electron-vite build && node -e \"delete process.env.ELECTRON_RUN_AS_NODE; require('child_process').execSync('npx electron-builder --win zip', {stdio:'inherit', env:process.env})\""
     },
     "dependencies": {
+        "chromium-bidi": "15.0.0",
         "otplib": "^12.0.1",
         "playwright-core": "^1.58.2",
         "usb": "^2.17.0"

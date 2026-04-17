@@ -7,6 +7,21 @@ import util from 'util'
 const execAsync = util.promisify(exec)
 import crypto from 'crypto'
 import { launchWorkspace, launchSessionSetup, captureSession, captureCurrentSession, closeBrowser, closeDesktopApps, emergencyKillDesktopAppsSync, onBrowserAllClosed, hasActiveBrowserSession, wipeLocalTraces, wipeAllLocalProfiles, wipeAllLocalAppData, wipeLocalAppCache, runDiagnostics, diagError } from './engine.js'
+import {
+    APPDATA_SKIP_DIRS,
+    BINARY_ARCHIVE_EXCLUDE_DIRS,
+    BINARY_ARCHIVE_EXCLUDE_FILES,
+    BINARY_ARCHIVE_POLICY_VERSION,
+    createImportManifest,
+    detectRequiredFilesFromRoot,
+    extractExeFromCommand,
+    hashFile,
+    inferAppType,
+    repairLegacyAppConfig,
+    safeAppName,
+    selectBestExecutable,
+    writeAppManifest
+} from './appManifest.js'
 
 // Phase 11: The Honey Token
 const HONEY_TOKEN = {
@@ -434,19 +449,6 @@ function registerIpcHandlers() {
 
     // ─── App Scanner & Importer ────────────────────────────────────────────
 
-    const SKIP_DIRS = new Set([
-        'CachedData', 'Cache', 'Code Cache', 'GPUCache',
-        'GrShaderCache', 'ShaderCache', 'DawnWebGPUCache',
-        'DawnGraphiteCache', 'Service Worker', 'ScriptCache',
-        'Crashpad', 'logs', 'blob_storage',
-        'component_crx_cache', 'extensions_crx_cache',
-        'Safe Browsing', 'WasmTtsEngine', 'BrowserMetrics',
-        'optimization_guide_model_store', 'OnDeviceHeadSuggestModel',
-        'MediaFoundationWidevineCdm'
-    ])
-
-    const SKIP_FILES = new Set(['unins000.exe', 'unins000.dat'])
-
     function isPortableApp(dirPath) {
         try {
             const hasResources = existsSync(join(dirPath, 'resources'))
@@ -455,32 +457,6 @@ function registerIpcHandlers() {
             const hasLocales = existsSync(join(dirPath, 'locales'))
             return (hasResources && (hasAsar || hasAppDir)) || hasLocales
         } catch (_) { return false }
-    }
-
-    function findMainExe(dirPath) {
-        try {
-            const files = readdirSync(dirPath)
-            const exes = files.filter(f =>
-                f.toLowerCase().endsWith('.exe') &&
-                !f.toLowerCase().startsWith('unins') &&
-                !f.toLowerCase().startsWith('update') &&
-                !f.toLowerCase().startsWith('old_') &&
-                !f.toLowerCase().includes('helper') &&
-                !f.toLowerCase().includes('crash') &&
-                !f.toLowerCase().includes('updater')
-            )
-            if (exes.length === 0) return null
-            // Pick the largest .exe (the main binary)
-            let best = exes[0]
-            let bestSize = 0
-            for (const exe of exes) {
-                try {
-                    const size = statSync(join(dirPath, exe)).size
-                    if (size > bestSize) { bestSize = size; best = exe }
-                } catch (_) { }
-            }
-            return best
-        } catch (_) { return null }
     }
 
     function getDirSize(dirPath, skipDirs = new Set()) {
@@ -576,85 +552,78 @@ function registerIpcHandlers() {
             return BLACKLIST_PATTERNS.some(pattern => pattern.test(name))
         }
 
-        function getAppType(dirPath) {
-            try {
-                if (existsSync(join(dirPath, 'resources', 'app.asar')) || existsSync(join(dirPath, 'resources', 'app'))) return 'electron'
-                if (existsSync(join(dirPath, 'locales')) && existsSync(join(dirPath, 'resources'))) return 'electron'
-                // Chrome-like: has a versioned subfolder with chrome.dll
-                try {
-                    const subs = readdirSync(dirPath, { withFileTypes: true }).filter(d => d.isDirectory())
-                    for (const sub of subs) {
-                        if (/^\d+\./.test(sub.name) && existsSync(join(dirPath, sub.name, 'chrome.dll'))) return 'chromium'
-                    }
-                } catch (_) { }
-            } catch (_) { }
-            return 'native'
-        }
-
-        function extractExeFromPath(str) {
-            if (!str) return null
-            // DisplayIcon/UninstallString may look like: "C:\path\app.exe" or C:\path\app.exe,0
-            const match = str.match(/([a-zA-Z]:\\[^"*?<>|]+\.exe)/i)
-            return match ? match[1] : null
-        }
-
         async function processRegistryEntry(entry, results, seen, appsDir) {
             const name = entry.displayName
             if (!name) return
             const nameKey = name.toLowerCase()
             if (seen.has(nameKey)) return
 
-            // Find the installation dir and exe
+            // Find the installation root and treat registry DisplayIcon as a hint,
+            // not as the final executable. DisplayIcon often points at uninstallers.
             let installDir = entry.installLocation?.replace(/["]/g, '').replace(/\\$/, '') || ''
-            let exePath = extractExeFromPath(entry.displayIcon)
-            
-            if (!exePath && installDir && existsSync(installDir)) {
-                const foundExe = findMainExe(installDir)
-                if (foundExe) exePath = join(installDir, foundExe)
-            }
-            
-            if (!exePath || !existsSync(exePath)) return
-            
-            // Phase 15 Fix: If installDir is blank, recursively climb up if we are deep inside \bin\64bit\
+            const displayIconExe = extractExeFromCommand(entry.displayIcon)
+
             if (!installDir || !existsSync(installDir)) {
-                let currentDir = require('path').dirname(exePath)
-                const lowerPath = currentDir.toLowerCase()
-                // If we are in \bin, \64bit, \core, or \app-1.x.x, climb up to the true root
-                if (lowerPath.endsWith('\\64bit') || lowerPath.endsWith('\\32bit')) currentDir = require('path').join(currentDir, '..')
-                const lowerPath2 = currentDir.toLowerCase()
-                if (lowerPath2.endsWith('\\bin') || lowerPath2.endsWith('\\core') || RegExp(/\\app-\d+\.\d+\.\d+$/).test(lowerPath2)) currentDir = require('path').join(currentDir, '..')
-                
-                installDir = currentDir
+                if (!displayIconExe || !existsSync(displayIconExe)) return
+                installDir = require('path').dirname(displayIconExe)
             }
 
-            // Normalize
-            try { installDir = require('path').resolve(installDir) } catch (_) { }
+            // Phase 15 plus import hardening: climb out of launcher/helper folders
+            // such as \bin\64bit or \uninst before scoring candidate executables.
+            try {
+                let currentDir = require('path').resolve(installDir)
+                for (let i = 0; i < 3; i++) {
+                    const base = basename(currentDir).toLowerCase()
+                    if (base === '64bit' || base === '32bit' || base === 'bin' || base === 'core' || base === 'uninst' || /^app-\d+\.\d+\.\d+$/.test(base)) {
+                        currentDir = require('path').resolve(currentDir, '..')
+                        continue
+                    }
+                    break
+                }
+                installDir = currentDir
+            } catch (_) { }
 
             if (!existsSync(installDir)) return
+
+            const selection = selectBestExecutable(installDir, name, displayIconExe ? [{ path: displayIconExe, source: 'registry-display-icon' }] : [])
+            if (!selection.selected) return
+
+            const relativeExePath = selection.selected.relativePath
+            const exePath = join(installDir, relativeExePath)
+            if (!existsSync(exePath)) return
+
             seen.add(nameKey)
 
             const exe = basename(exePath)
             // Phase 15: Store the relative path from installDir to the exe,
             // so nested exes (e.g. bin\64bit\obs64.exe) resolve correctly after import
-            const relativeExePath = require('path').relative(installDir, exePath)
-            const type = getAppType(installDir)
+            const type = inferAppType(installDir)
             
             // Calculate sizes async
             let sizeMB = 0
-            try { sizeMB = Math.round((await getDirSizeAsync(installDir, SKIP_DIRS)) / (1024 * 1024)) } catch (_) { }
+            try { sizeMB = Math.round((await getDirSizeAsync(installDir, BINARY_ARCHIVE_EXCLUDE_DIRS)) / (1024 * 1024)) } catch (_) { }
             
             const dataPath = findAppDataPath(name)
             let dataSizeMB = 0
             if (dataPath) {
-                try { dataSizeMB = Math.round((await getDirSizeAsync(dataPath, SKIP_DIRS)) / (1024 * 1024)) } catch (_) { }
+                try { dataSizeMB = Math.round((await getDirSizeAsync(dataPath, APPDATA_SKIP_DIRS)) / (1024 * 1024)) } catch (_) { }
             }
 
-            const alreadyImported = existsSync(join(appsDir, name)) || existsSync(join(appsDir, `${name}.tar.zst`))
+            const alreadyImported = existsSync(join(appsDir, name)) ||
+                existsSync(join(appsDir, `${name}.tar.zst`)) ||
+                existsSync(join(appsDir, `${safeAppName(name)}.quickpass-app.json`))
 
             results.push({
                 name,
                 exe,
                 relativeExePath,
+                selectedExecutable: {
+                    relativePath: relativeExePath,
+                    confidence: selection.selected.confidence,
+                    score: selection.selected.score,
+                    reasons: selection.selected.reasons || []
+                },
+                candidateExecutables: selection.candidates,
                 sourcePath: installDir,
                 sizeMB,
                 type,
@@ -744,30 +713,42 @@ function registerIpcHandlers() {
                 for (const checkPath of checkPaths) {
                     if (!isPortableApp(checkPath)) continue
 
-                    const exe = findMainExe(checkPath)
-                    if (!exe) continue
+                    const selection = selectBestExecutable(checkPath, dir.name)
+                    if (!selection.selected) continue
 
+                    const relativeExePath = selection.selected.relativePath
+                    const exe = basename(relativeExePath)
                     const name = exe.replace(/\.exe$/i, '')
                     const nameKey = name.toLowerCase()
                     if (seen.has(nameKey)) continue
                     if (isBlacklisted(name)) continue
                     seen.add(nameKey)
 
-                    const sizeMB = Math.round((await getDirSizeAsync(checkPath)) / (1024 * 1024))
+                    const sizeMB = Math.round((await getDirSizeAsync(checkPath, BINARY_ARCHIVE_EXCLUDE_DIRS)) / (1024 * 1024))
                     const dataPath = findAppDataPath(name)
                     let dataSizeMB = 0
                     if (dataPath) {
-                        dataSizeMB = Math.round((await getDirSizeAsync(dataPath, SKIP_DIRS)) / (1024 * 1024))
+                        dataSizeMB = Math.round((await getDirSizeAsync(dataPath, APPDATA_SKIP_DIRS)) / (1024 * 1024))
                     }
 
-                    const alreadyImported = existsSync(join(appsDir, name)) || existsSync(join(appsDir, `${name}.tar.zst`))
+                    const alreadyImported = existsSync(join(appsDir, name)) ||
+                        existsSync(join(appsDir, `${name}.tar.zst`)) ||
+                        existsSync(join(appsDir, `${safeAppName(name)}.quickpass-app.json`))
 
                     results.push({
                         name,
                         exe,
+                        relativeExePath,
+                        selectedExecutable: {
+                            relativePath: relativeExePath,
+                            confidence: selection.selected.confidence,
+                            score: selection.selected.score,
+                            reasons: selection.selected.reasons || []
+                        },
+                        candidateExecutables: selection.candidates,
                         sourcePath: checkPath,
                         sizeMB,
-                        type: existsSync(join(checkPath, 'resources')) ? 'electron' : 'chromium',
+                        type: inferAppType(checkPath),
                         dataPath: dataPath || null,
                         dataSizeMB,
                         alreadyImported
@@ -792,12 +773,43 @@ function registerIpcHandlers() {
         const win = BrowserWindow.fromWebContents(event.sender)
         const vaultDir = getVaultDir()
         // Phase 17.2: Sanitize AppData folder name to match engine.js launch path
-        const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_')
+        const safeName = safeAppName(name)
         const dataDest = join(vaultDir, 'AppData', safeName)
         // Fix 1: Hoist tempArchive so catch block can clean it up on failure
         const tempArchive = join(os.tmpdir(), `omnilaunch-import-${name}-${Date.now()}.tar.zst`)
 
         try {
+            if (!sourcePath || !existsSync(sourcePath)) {
+                throw new Error(`Source app folder not found: ${sourcePath}`)
+            }
+
+            const seedExePath = relativeExePath
+                ? join(sourcePath, relativeExePath)
+                : (exe ? join(sourcePath, exe) : null)
+            const selection = selectBestExecutable(sourcePath, name, seedExePath ? [{ path: seedExePath, source: 'import-selection' }] : [])
+            if (!selection.selected) {
+                throw new Error(`No safe launch executable found for ${name}`)
+            }
+            if (selection.selected.confidence === 'low') {
+                const candidates = (selection.candidates || [])
+                    .filter(candidate => !candidate.dangerous)
+                    .slice(0, 5)
+                    .map(candidate => `${candidate.relativePath} (${candidate.confidence}, score ${candidate.score})`)
+                    .join('; ')
+                throw new Error(`Executable selection for ${name} is low confidence. Manual executable selection is required before importing.${candidates ? ` Candidates: ${candidates}` : ''}`)
+            }
+
+            const selectedExecutable = {
+                relativePath: selection.selected.relativePath,
+                selectionSource: selection.selected.source || 'scored-candidate',
+                confidence: selection.selected.confidence,
+                score: selection.selected.score,
+                reasons: selection.selected.reasons || []
+            }
+            const exePathInApp = selectedExecutable.relativePath
+            const appType = inferAppType(sourcePath)
+            const requiredFiles = detectRequiredFilesFromRoot(sourcePath)
+
             // ─── Phase 17: Archive-Based Import ───────────────────────────
             // Instead of copying thousands of small files to USB (which chokes
             // the KIOXIA's flash controller at 0.01 MB/s random write), we:
@@ -821,10 +833,12 @@ function registerIpcHandlers() {
             const srcBasename = require('path').basename(sourcePath)
 
             const tarArgs = ['--zstd']
-            for (const d of SKIP_DIRS) {
+            for (const d of BINARY_ARCHIVE_EXCLUDE_DIRS) {
                 tarArgs.push(`--exclude=${d}`)
             }
-            tarArgs.push('--exclude=unins000.exe', '--exclude=unins000.dat')
+            for (const f of BINARY_ARCHIVE_EXCLUDE_FILES) {
+                tarArgs.push(`--exclude=${f}`)
+            }
             tarArgs.push('-cf', tempArchive, '-C', srcParent, srcBasename)
 
             await new Promise((resolve, reject) => {
@@ -859,21 +873,37 @@ function registerIpcHandlers() {
                 }
             })
 
+            const archiveHash = await hashFile(archiveDest)
+
             // Cleanup temp archive
             try { fs.unlinkSync(tempArchive) } catch (_) {}
 
             // Phase 3: Copy user data (if requested) — still uses robocopy
             // because AppData needs incremental sync (robocopy /MIR) later
             if (importData && dataPath && existsSync(dataPath)) {
-                await copyDirWithProgress(dataPath, dataDest, SKIP_DIRS, (progress) => {
+                await copyDirWithProgress(dataPath, dataDest, APPDATA_SKIP_DIRS, (progress) => {
                     if (win && !win.isDestroyed()) {
                         win.webContents.send('import-progress', { name, phase: 'data', ...progress })
                     }
                 }, dataSizeMB || 0)
             }
 
-            // Phase 15: Use relativeExePath so nested exes (e.g. bin\64bit\obs64.exe) resolve correctly
-            const exePathInApp = relativeExePath || exe
+            const manifest = createImportManifest({
+                displayName: name,
+                safeName,
+                sourcePath,
+                archiveName,
+                archiveRoot: srcBasename,
+                selectedExecutable,
+                candidateExecutables: selection.candidates,
+                appType,
+                importData,
+                archiveHash,
+                archiveSizeBytes: compressedSize,
+                legacyPath: `[USB]\\Apps\\${name}\\${exePathInApp}`,
+                requiredFiles
+            })
+            writeAppManifest(vaultDir, manifest)
 
             return {
                 success: true,
@@ -883,6 +913,11 @@ function registerIpcHandlers() {
                     path: `[USB]\\Apps\\${name}\\${exePathInApp}`,
                     args: '',
                     portableData: !!importData,
+                    manifestId: manifest.manifestId,
+                    launchProfile: manifest.launchProfile,
+                    dataProfile: manifest.dataProfile,
+                    readinessProfile: manifest.readinessProfile,
+                    binaryArchivePolicyVersion: BINARY_ARCHIVE_POLICY_VERSION,
                     id: Date.now(),
                     enabled: true
                 }
@@ -1188,7 +1223,23 @@ function registerIpcHandlers() {
             const doLaunch = async () => {
                 await closeBrowser()
                 await closeDesktopApps()
-                return launchWorkspace(workspace, (statusMsg) => {
+                const launchWorkspaceConfig = {
+                    ...workspace,
+                    desktopApps: (workspace.desktopApps || []).map((desktopApp) => {
+                        try {
+                            const repair = repairLegacyAppConfig(desktopApp, vaultDir)
+                            return {
+                                ...repair.appConfig,
+                                ...(repair.manifest ? { manifest: repair.manifest } : {})
+                            }
+                        } catch (err) {
+                            diagError('app-legacy-repair', `${desktopApp.name || desktopApp.path}: ${err.message}`)
+                            return desktopApp
+                        }
+                    })
+                }
+
+                return launchWorkspace(launchWorkspaceConfig, (statusMsg) => {
                     if (win && !win.isDestroyed()) {
                         win.webContents.send('launch-status', statusMsg)
                     }

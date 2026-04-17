@@ -12,6 +12,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
     const [confirmPin, setConfirmPin] = useState('')
     const [fastBoot, setFastBoot] = useState(false)
     const [error, setError] = useState('')
+    const [sessionWarning, setSessionWarning] = useState('')
     const [saving, setSaving] = useState(false)
 
     const [desktopApps, setDesktopApps] = useState([])
@@ -56,8 +57,9 @@ export default function SetupScreen({ driveInfo, onComplete }) {
     const handleProceedToCapture = async () => {
         setSaving(true)
         setError('')
+        setSessionWarning('')
 
-        // Save vault with desktop apps only (no webTabs yet — those come from session capture)
+        // Save vault with desktop apps only; web tabs come from session capture.
         const workspace = { webTabs: [], desktopApps }
         const result = await window.omnilaunch.saveVault({
             masterPassword: isRemovable ? hiddenMasterPassword : masterPassword,
@@ -79,10 +81,11 @@ export default function SetupScreen({ driveInfo, onComplete }) {
     }
 
     // Listen for browser disconnect (user accidentally closed Chrome)
-    // Uses a dedicated polling-based IPC channel — fires within 1 second
+    // Uses a dedicated polling-based IPC channel and fires within 1 second.
     useEffect(() => {
         const cleanup = window.omnilaunch.onBrowserDisconnect(() => {
             setSessionState((prev) => (prev === 'complete' ? prev : 'disconnected'))
+            setSessionWarning('')
             setError('Chrome was closed. Click "Reopen Browser" to try again.')
         })
         return cleanup
@@ -92,26 +95,46 @@ export default function SetupScreen({ driveInfo, onComplete }) {
     const handleOpenBrowser = async () => {
         setSessionState('opening')
         setError('')
-        const result = await window.omnilaunch.startSessionSetup()
-        if (!result.success) {
+        setSessionWarning('')
+
+        try {
+            const result = await window.omnilaunch.startSessionSetup()
+            if (!result?.success) {
+                setSessionState('idle')
+                setError(result?.error || 'Failed to open browser')
+                return
+            }
+
+            if (result.tabsSuccessful === false) {
+                const failedCount = (result.webResults || []).filter((tab) => !tab.success).length
+                setSessionWarning(
+                    failedCount > 0
+                        ? `${failedCount} tab${failedCount === 1 ? '' : 's'} failed to load. Reload manually before saving.`
+                        : 'Browser opened, but one or more tabs failed to load. Reload manually before saving.'
+                )
+            }
+
+            const sessionCheck = await window.omnilaunch.hasActiveBrowserSession()
+            if (sessionCheck.success && sessionCheck.active) {
+                setSessionState('open')
+                return
+            }
+
+            setSessionState('disconnected')
+            setSessionWarning('')
+            setError('Chrome was closed. Click "Reopen Browser" to try again.')
+        } catch (err) {
             setSessionState('idle')
-            setError(result.error || 'Failed to open browser')
+            setSessionWarning('')
+            setError(err?.message || 'Failed to open browser')
             return
         }
-
-        const sessionCheck = await window.omnilaunch.hasActiveBrowserSession()
-        if (sessionCheck.success && sessionCheck.active) {
-            setSessionState('open')
-            return
-        }
-
-        setSessionState('disconnected')
-        setError('Chrome was closed. Click "Reopen Browser" to try again.')
     }
 
     // Capture session and finish setup
     const handleSaveAndFinish = async () => {
         setError('')
+        setSessionWarning('')
         const sessionCheck = await window.omnilaunch.hasActiveBrowserSession()
 
         if (!sessionCheck.success || !sessionCheck.active) {
@@ -156,7 +179,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
                 <p className="text-secondary text-xs mt-1">
                     {step === sessionStep
                         ? 'Log into your sites and we\'ll remember them'
-                        : isRemovable ? 'USB Drive — PIN unlock available' : 'Local Drive'}
+                        : isRemovable ? 'USB Drive - PIN unlock available' : 'Local Drive'}
                 </p>
             </div>
 
@@ -242,7 +265,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
                     <div className="flex items-center justify-between p-3 rounded-md bg-[#14141c]">
                         <div>
                             <p className="text-sm text-white font-medium">Fast Boot</p>
-                            <p className="text-xs text-muted">Skip PIN — hardware-only unlock</p>
+                            <p className="text-xs text-muted">Skip PIN - hardware-only unlock</p>
                         </div>
                         <div
                             className={`toggle-track ${fastBoot ? 'active' : ''}`}
@@ -404,7 +427,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
                         </>
                     )}
 
-                    {/* Browser is open — waiting for user */}
+                    {/* Browser is opening */}
                     {openingBrowser && !capturedCount && (
                         <div className="text-center py-6 animate-fade-in">
                             <div className="w-12 h-12 mx-auto mb-3 rounded-full flex items-center justify-center bg-[#1a1a2e]">
@@ -463,6 +486,10 @@ export default function SetupScreen({ driveInfo, onComplete }) {
                                         : 'Log into your sites, then come back here'}
                                 </p>
                             </div>
+
+                            {sessionWarning && (
+                                <p className="text-xs text-center text-[#d4a44a] animate-fade-in">{sessionWarning}</p>
+                            )}
 
                             <button
                                 className="btn-primary w-full"

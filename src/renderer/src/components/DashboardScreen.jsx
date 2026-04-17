@@ -6,6 +6,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const [desktopApps, setDesktopApps] = useState(workspace?.desktopApps || [])
     const [saving, setSaving] = useState(false)
     const [error, setError] = useState('')
+    const [sessionWarning, setSessionWarning] = useState('')
 
     const [showAppForm, setShowAppForm] = useState(false)
     const [appForm, setAppForm] = useState({ name: '', path: '', args: '', portableData: false })
@@ -136,9 +137,9 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     }
 
     const handleDisablePin = async () => {
-        // Phase 17.2: USB uses hidden password — must keep at least one unlock method
+        // Phase 17.2: USB uses hidden password and must keep at least one unlock method.
         if (driveInfo?.isRemovable && !fastBoot) {
-            setError('Enable Fast Boot first — PIN is your only unlock method on USB drives')
+            setError('Enable Fast Boot first - PIN is your only unlock method on USB drives')
             return
         }
         setSaving(true)
@@ -160,9 +161,9 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
 
     const handleToggleFastBoot = async () => {
         const newState = !fastBoot
-        // Phase 17.2: USB uses hidden password — must keep at least one unlock method
+        // Phase 17.2: USB uses hidden password and must keep at least one unlock method.
         if (!newState && driveInfo?.isRemovable && !usePin) {
-            setError('Enable PIN first — Fast Boot is your only unlock method on USB drives')
+            setError('Enable PIN first - Fast Boot is your only unlock method on USB drives')
             return
         }
         setError('')
@@ -185,25 +186,51 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         }
     }
 
-    // Edit: opens browser with current saved tabs
-    const handleEdit = async () => {
-        setSessionMode('edit')
+    const getTabLoadWarning = (result) => {
+        if (result?.tabsSuccessful !== false) return ''
+        const failedCount = (result.webResults || []).filter((tab) => !tab.success).length
+        return failedCount > 0
+            ? `${failedCount} tab${failedCount === 1 ? '' : 's'} failed to load. Reload manually before saving.`
+            : 'Browser opened, but one or more tabs failed to load. Reload manually before saving.'
+    }
+
+    const startBrowserSession = async (mode, launcher) => {
+        setSessionMode(mode)
         setBrowserOpen(true)
         setError('')
-        await window.omnilaunch.startSessionEdit()
+        setSessionWarning('')
+
+        try {
+            const result = await launcher()
+            if (!result?.success) {
+                setSessionMode(null)
+                setBrowserOpen(false)
+                setError(result?.error || 'Failed to open browser')
+                return
+            }
+
+            setSessionWarning(getTabLoadWarning(result))
+        } catch (err) {
+            setSessionMode(null)
+            setBrowserOpen(false)
+            setSessionWarning('')
+            setError(err?.message || 'Failed to open browser')
+        }
+    }
+
+    // Edit: opens browser with current saved tabs
+    const handleEdit = async () => {
+        await startBrowserSession('edit', () => window.omnilaunch.startSessionEdit())
     }
 
     // Re-capture: opens fresh browser from scratch
     const handleRecapture = async () => {
-        setSessionMode('recapture')
-        setBrowserOpen(true)
-        setError('')
-        await window.omnilaunch.startSessionSetup()
+        await startBrowserSession('recapture', () => window.omnilaunch.startSessionSetup())
     }
 
     // Save and close after edit/recapture
     const handleSessionSave = async () => {
-        // Phase 17.2: USB users don't know the hidden master password —
+        // Phase 17.2: USB users do not know the hidden master password.
         // backend falls back to cached activeMasterPasswordBuffer (index.js:1011)
         if (!driveInfo?.isRemovable && !masterPassword.trim()) {
             setError('Enter your master password first')
@@ -211,6 +238,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         }
         setSaving(true)
         setError('')
+        setSessionWarning('')
         const result = await window.omnilaunch.captureSession({ masterPassword })
         if (result.success) {
             const newWebTabs = result.urls.map(url => ({ url, enabled: true }))
@@ -253,13 +281,17 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                 : `${webTabs.length} tabs saved`}
                         </p>
                         {browserOpen && (
-                            <p className="text-xs text-[#d4a44a] mt-2">⚠ Don't close Chrome until you save!</p>
+                            <p className="text-xs text-[#d4a44a] mt-2">Do not close Chrome until you save.</p>
                         )}
                     </div>
 
+                    {browserOpen && sessionWarning && (
+                        <p className="text-xs text-[#d4a44a] text-center mb-2">{sessionWarning}</p>
+                    )}
+
                     {browserOpen && (
                         <>
-                            {/* Phase 17.2: Hide password input for USB — backend uses cached password */}
+                            {/* Phase 17.2: Hide password input for USB; backend uses cached password. */}
                             {!driveInfo?.isRemovable && (
                                 <input
                                     type="password"
@@ -279,6 +311,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                             <button className="btn-secondary w-full text-xs" onClick={() => {
                                 setSessionMode(null)
                                 setBrowserOpen(false)
+                                setSessionWarning('')
                             }}>
                                 Cancel
                             </button>
@@ -407,7 +440,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                     onClick={() => setExpandedSecurityOption(expandedSecurityOption === 'password' ? null : 'password')}
                                 >
                                     <span>Change Master Password</span>
-                                    <span className="text-secondary text-xs">{expandedSecurityOption === 'password' ? '▲' : '▼'}</span>
+                                    <span className="text-secondary text-xs">{expandedSecurityOption === 'password' ? '^' : 'v'}</span>
                                 </button>
                                 {expandedSecurityOption === 'password' && (
                                     <div className="p-3 bg-[#14141c] flex flex-col gap-2 animate-fade-in border-t border-[#2a2a3a]">
@@ -447,7 +480,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                         <span>PIN Access</span>
                                         {usePin && <span className="px-1.5 py-0.5 rounded text-[10px] bg-green-900/40 text-green-400 border border-green-800/40">Active</span>}
                                     </div>
-                                    <span className="text-secondary text-xs">{expandedSecurityOption === 'pin' ? '▲' : '▼'}</span>
+                                    <span className="text-secondary text-xs">{expandedSecurityOption === 'pin' ? '^' : 'v'}</span>
                                 </button>
                                 {expandedSecurityOption === 'pin' && (
                                     <div className="p-3 bg-[#14141c] flex flex-col gap-2 animate-fade-in border-t border-[#2a2a3a]">
@@ -505,7 +538,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                         <div className="border border-[#2a2a3a] rounded-md overflow-hidden bg-[#1a1a24] p-3 flex justify-between items-center">
                             <div>
                                 <p className="text-sm text-white">Clear App Cache on Exit</p>
-                                <p className="text-xs text-muted mt-0.5">{clearCacheOnExit ? 'Apps re-extract on each launch (~2 min)' : 'Instant launches — cached apps persist'}</p>
+                                <p className="text-xs text-muted mt-0.5">{clearCacheOnExit ? 'Apps re-extract on each launch (~2 min)' : 'Instant launches - cached apps persist'}</p>
                             </div>
                             <div className={`toggle-track ${clearCacheOnExit ? 'active' : ''}`} onClick={handleToggleClearCache}>
                                 <div className="toggle-thumb" />
