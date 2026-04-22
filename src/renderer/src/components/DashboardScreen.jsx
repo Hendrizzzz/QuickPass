@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import ImportAppsModal from './ImportAppsModal'
 
 export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSave, onCancel }) {
@@ -7,6 +7,11 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const [saving, setSaving] = useState(false)
     const [error, setError] = useState('')
     const [sessionWarning, setSessionWarning] = useState('')
+    const [staleAppDataPayloads, setStaleAppDataPayloads] = useState([])
+    const [staleAppDataLoading, setStaleAppDataLoading] = useState(false)
+    const [staleAppDataStatus, setStaleAppDataStatus] = useState('')
+    const [showStaleCleanupConfirm, setShowStaleCleanupConfirm] = useState(false)
+    const staleAppDataScanRef = useRef(0)
 
     const [showAppForm, setShowAppForm] = useState(false)
     const [appForm, setAppForm] = useState({ name: '', path: '', args: '', portableData: false })
@@ -45,6 +50,8 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const [sessionMode, setSessionMode] = useState(null) // 'edit' | 'recapture'
     const [browserOpen, setBrowserOpen] = useState(false)
     const [captureSuccess, setCaptureSuccess] = useState(false)
+    const isInSessionMode = sessionMode !== null
+    const hasUnsavedAppChanges = JSON.stringify(desktopApps) !== JSON.stringify(workspace?.desktopApps || [])
 
     const browseExe = async () => {
         const filePath = await window.omnilaunch.browseExe()
@@ -186,12 +193,78 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         }
     }
 
+    const refreshStaleAppDataPayloads = async () => {
+        if (!window.omnilaunch?.scanStaleAppData) return
+        const requestId = ++staleAppDataScanRef.current
+        setStaleAppDataLoading(true)
+        try {
+            const result = await window.omnilaunch.scanStaleAppData()
+            if (requestId === staleAppDataScanRef.current && result?.success) {
+                setStaleAppDataPayloads(result.payloads || [])
+            }
+        } finally {
+            if (requestId === staleAppDataScanRef.current) {
+                setStaleAppDataLoading(false)
+            }
+        }
+    }
+
+    useEffect(() => {
+        if (isInSessionMode || hasUnsavedAppChanges) {
+            staleAppDataScanRef.current += 1
+            setStaleAppDataPayloads([])
+            setStaleAppDataLoading(false)
+            setShowStaleCleanupConfirm(false)
+            return
+        }
+
+        const timer = setTimeout(() => {
+            refreshStaleAppDataPayloads()
+        }, 400)
+
+        return () => clearTimeout(timer)
+    }, [hasUnsavedAppChanges, isInSessionMode])
+
+    const handleCleanupStaleAppData = async () => {
+        if (hasUnsavedAppChanges) {
+            setError('Save or discard workspace changes before removing unused AppData.')
+            setShowStaleCleanupConfirm(false)
+            return
+        }
+        const removablePayloads = staleAppDataPayloads.filter(payload => !payload.cleanupBlocked)
+        if (removablePayloads.length === 0 || staleAppDataLoading) return
+        setStaleAppDataLoading(true)
+        setStaleAppDataStatus('')
+        setError('')
+        try {
+            const result = await window.omnilaunch.cleanupStaleAppData({
+                payloadIds: removablePayloads.map(payload => payload.id)
+            })
+            if (result?.success) {
+                setStaleAppDataPayloads(result.remainingPayloads || [])
+                setShowStaleCleanupConfirm(false)
+                setStaleAppDataStatus(`${result.removed?.length || 0} unused AppData payload${result.removed?.length === 1 ? '' : 's'} removed.`)
+                setTimeout(() => setStaleAppDataStatus(''), 4000)
+            } else {
+                setStaleAppDataPayloads(result?.remainingPayloads || staleAppDataPayloads)
+                setError(result?.error || 'Could not remove unused AppData')
+            }
+        } finally {
+            setStaleAppDataLoading(false)
+        }
+    }
+
     const getTabLoadWarning = (result) => {
         if (result?.tabsSuccessful !== false) return ''
-        const failedCount = (result.webResults || []).filter((tab) => !tab.success).length
-        return failedCount > 0
-            ? `${failedCount} tab${failedCount === 1 ? '' : 's'} failed to load. Reload manually before saving.`
-            : 'Browser opened, but one or more tabs failed to load. Reload manually before saving.'
+        const skippedCount = (result.webResults || []).filter((tab) => tab.skipped).length
+        const failedCount = (result.webResults || []).filter((tab) => !tab.success && !tab.skipped).length
+        if (failedCount > 0) {
+            return `${failedCount} tab${failedCount === 1 ? '' : 's'} failed to load. Reload manually before saving.`
+        }
+        if (skippedCount > 0) {
+            return `${skippedCount} browser-owned tab${skippedCount === 1 ? '' : 's'} will be skipped when you save.`
+        }
+        return 'Browser opened, but one or more tabs failed to load. Reload manually before saving.'
     }
 
     const startBrowserSession = async (mode, launcher) => {
@@ -250,7 +323,8 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         }
     }
 
-    const isInSessionMode = sessionMode !== null
+    const staleAppDataTotalMB = staleAppDataPayloads.reduce((total, payload) => total + (payload.sizeMB || 0), 0)
+    const removableStaleAppDataPayloads = staleAppDataPayloads.filter(payload => !payload.cleanupBlocked)
 
     return (
         <div className="card p-6 w-full max-w-sm animate-slide-up flex flex-col" style={{ maxHeight: 540 }}>
@@ -420,6 +494,38 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                             <button className="btn-danger-text" onClick={() => setDesktopApps(desktopApps.filter((_, j) => j !== i))}>Remove</button>
                         </div>
                     ))}
+
+                    {hasUnsavedAppChanges && (
+                        <div className="mt-3 p-3 rounded-md border border-[#4d5a7d]/70 bg-[#111827]">
+                            <p className="text-xs text-[#b8c7ff] font-medium">Cleanup paused while changes are unsaved</p>
+                            <p className="text-[11px] text-[#aab5d6] mt-1">
+                                Save or discard workspace changes before removing unused AppData.
+                            </p>
+                        </div>
+                    )}
+
+                    {!hasUnsavedAppChanges && staleAppDataPayloads.length > 0 && (
+                        <div className="mt-3 p-3 rounded-md border border-[#6f4b1f]/70 bg-[#22170c]">
+                            <p className="text-xs text-[#f0c978] font-medium">Unused imported AppData found</p>
+                            <p className="text-[11px] text-[#d8b985] mt-1">
+                                QuickPass no longer uses this data because the app profile is unsupported or no saved app references the payload.
+                            </p>
+                            <p className="text-[11px] text-muted mt-1 truncate">
+                                {staleAppDataPayloads.map(payload => payload.name).join(', ')}
+                            </p>
+                            <button
+                                className="btn-secondary text-[11px] py-1.5 px-2 mt-2"
+                                disabled={staleAppDataLoading}
+                                onClick={() => setShowStaleCleanupConfirm(true)}
+                            >
+                                {staleAppDataLoading ? 'Checking...' : `Review cleanup (${staleAppDataTotalMB} MB)`}
+                            </button>
+                        </div>
+                    )}
+
+                    {staleAppDataStatus && (
+                        <p className="text-xs text-[#6fd68a] text-center mt-2">{staleAppDataStatus}</p>
+                    )}
                 </div>
             )}
 
@@ -575,6 +681,45 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                         setShowImportModal(false)
                     }}
                 />
+            )}
+
+            {showStaleCleanupConfirm && (
+                <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4">
+                    <div className="w-full max-w-sm rounded-lg border border-[#6f4b1f] bg-[#17110a] shadow-2xl p-4">
+                        <p className="text-sm text-white font-semibold">Delete unused AppData?</p>
+                        <p className="text-xs text-[#d8b985] mt-2">
+                            This permanently removes the listed AppData payloads from the vault. Only data unused by the saved workspace is eligible.
+                        </p>
+                        <div className="mt-3 max-h-36 overflow-y-auto flex flex-col gap-2">
+                            {staleAppDataPayloads.map(payload => (
+                                <div key={payload.id} className="rounded bg-black/20 border border-[#3a2a18] p-2">
+                                    <p className="text-xs text-white truncate">{payload.name}</p>
+                                    <p className="text-[11px] text-muted">{payload.sizeMB || 0} MB - {payload.orphaned ? 'orphaned' : 'unsupported'}</p>
+                                    <p className="text-[10px] text-[#d8b985] truncate">{payload.reason}</p>
+                                    {payload.cleanupBlocked && (
+                                        <p className="text-[10px] text-red-300 truncate">{payload.cleanupBlockedReason || 'Cleanup blocked for safety.'}</p>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                        <div className="flex gap-2 mt-4">
+                            <button
+                                className="btn-secondary flex-1 text-xs"
+                                disabled={staleAppDataLoading}
+                                onClick={() => setShowStaleCleanupConfirm(false)}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                className="btn-danger-text flex-1 text-xs border border-red-900/50 rounded-md py-2"
+                                disabled={staleAppDataLoading || removableStaleAppDataPayloads.length === 0}
+                                onClick={handleCleanupStaleAppData}
+                            >
+                                {staleAppDataLoading ? 'Deleting...' : 'Delete unused AppData'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
             )}
         </div>
     )
