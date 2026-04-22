@@ -1,12 +1,12 @@
 import { app, BrowserWindow, ipcMain, dialog } from 'electron'
 import { join, basename } from 'path'
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, rmSync } from 'fs'
 import { execSync, spawn, exec } from 'child_process'
 import os from 'os'
 import util from 'util'
 const execAsync = util.promisify(exec)
 import crypto from 'crypto'
-import { launchWorkspace, launchSessionSetup, captureSession, captureCurrentSession, closeBrowser, closeDesktopApps, emergencyKillDesktopAppsSync, onBrowserAllClosed, hasActiveBrowserSession, wipeLocalTraces, wipeAllLocalProfiles, wipeAllLocalAppData, wipeLocalAppCache, runDiagnostics, diagError } from './engine.js'
+import { launchWorkspace, launchSessionSetup, captureSession, captureCurrentSession, closeBrowser, closeDesktopApps, emergencyKillDesktopAppsSync, onBrowserAllClosed, hasActiveBrowserSession, wipeLocalTraces, wipeAllLocalProfiles, wipeAllLocalAppData, wipeLocalAppCache, wipeAllRuntimeAppProfiles, runDiagnostics, diagError, beginDiagnosticsCycle } from './engine.js'
 import {
     APPDATA_SKIP_DIRS,
     BINARY_ARCHIVE_EXCLUDE_DIRS,
@@ -18,10 +18,16 @@ import {
     hashFile,
     inferAppType,
     repairLegacyAppConfig,
+    resolveImportedAppDataCapability,
     safeAppName,
     selectBestExecutable,
     writeAppManifest
 } from './appManifest.js'
+import {
+    findStaleUnsupportedAppDataPayloads,
+    isSafePayloadDirectory,
+    selectStaleAppDataPayloads
+} from './staleAppData.js'
 
 // Phase 11: The Honey Token
 const HONEY_TOKEN = {
@@ -142,6 +148,21 @@ function decrypt(encryptedObj, password) {
     decrypted += decipher.final('utf-8')
 
     return JSON.parse(decrypted)
+}
+
+function loadActiveVaultWorkspace() {
+    if (!activeMasterPasswordBuffer) throw new Error('Session is locked')
+    if (!existsSync(getVaultPath())) return { webTabs: [], desktopApps: [] }
+
+    const encryptedVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
+    const workspace = decrypt(encryptedVault, activeMasterPasswordBuffer.toString('utf-8'))
+    if (workspace?._honeyToken) delete workspace._honeyToken
+
+    return {
+        ...workspace,
+        webTabs: Array.isArray(workspace?.webTabs) ? workspace.webTabs : [],
+        desktopApps: Array.isArray(workspace?.desktopApps) ? workspace.desktopApps : []
+    }
 }
 
 // ─── Vault Metadata ────────────────────────────────────────────────────────────
@@ -531,6 +552,64 @@ function registerIpcHandlers() {
         return total
     }
 
+    ipcMain.handle('scan-stale-appdata', async () => {
+        try {
+            const workspace = loadActiveVaultWorkspace()
+            const payloads = await findStaleUnsupportedAppDataPayloads(workspace, getVaultDir(), {
+                onError: (desktopApp, err) => diagError('unsupported-appdata-scan', `${desktopApp?.name || desktopApp?.path || 'unknown'}: ${err.message}`)
+            })
+            return { success: true, payloads }
+        } catch (e) {
+            return { success: false, error: e.message, payloads: [] }
+        }
+    })
+
+    ipcMain.handle('cleanup-stale-appdata', async (_, { payloadIds } = {}) => {
+        try {
+            if (!Array.isArray(payloadIds) || payloadIds.length === 0) {
+                throw new Error('Select at least one AppData payload to remove.')
+            }
+
+            const workspace = loadActiveVaultWorkspace()
+            const appDataRoot = join(getVaultDir(), 'AppData')
+            const payloads = await findStaleUnsupportedAppDataPayloads(workspace, getVaultDir(), {
+                onError: (desktopApp, err) => diagError('unsupported-appdata-scan', `${desktopApp?.name || desktopApp?.path || 'unknown'}: ${err.message}`)
+            })
+            const selectedPayloads = selectStaleAppDataPayloads(payloadIds, payloads)
+
+            const removed = []
+            const failed = []
+            for (const payload of selectedPayloads) {
+                const safety = isSafePayloadDirectory(appDataRoot, payload.path)
+                if (!safety.safe) {
+                    failed.push({ ...payload, error: safety.reason })
+                    continue
+                }
+
+                try {
+                    rmSync(payload.path, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 })
+                    console.log(`[QuickPass] Removed stale AppData payload: ${payload.path} (${payload.sizeBytes || 0} bytes)`)
+                    removed.push(payload)
+                } catch (err) {
+                    failed.push({ ...payload, error: err.message })
+                }
+            }
+
+            const remainingPayloads = await findStaleUnsupportedAppDataPayloads(workspace, getVaultDir(), {
+                onError: (desktopApp, err) => diagError('unsupported-appdata-scan', `${desktopApp?.name || desktopApp?.path || 'unknown'}: ${err.message}`)
+            })
+            return {
+                success: failed.length === 0,
+                removed,
+                failed,
+                remainingPayloads,
+                error: failed.length > 0 ? 'Some stale AppData payloads could not be removed.' : null
+            }
+        } catch (e) {
+            return { success: false, error: e.message, removed: [], failed: [], remainingPayloads: [] }
+        }
+    })
+
     ipcMain.handle('scan-apps', async () => {
         const vaultDir = getVaultDir()
         const appsDir = join(vaultDir, 'Apps')
@@ -608,6 +687,10 @@ function registerIpcHandlers() {
             if (dataPath) {
                 try { dataSizeMB = Math.round((await getDirSizeAsync(dataPath, APPDATA_SKIP_DIRS)) / (1024 * 1024)) } catch (_) { }
             }
+            const importedDataCapability = resolveImportedAppDataCapability({
+                appType: type,
+                appName: name
+            })
 
             const alreadyImported = existsSync(join(appsDir, name)) ||
                 existsSync(join(appsDir, `${name}.tar.zst`)) ||
@@ -629,6 +712,9 @@ function registerIpcHandlers() {
                 type,
                 dataPath: dataPath || null,
                 dataSizeMB,
+                importedDataSupported: importedDataCapability.importedDataSupported,
+                importedDataSupportLevel: importedDataCapability.importedDataSupportLevel,
+                importedDataSupportReason: importedDataCapability.importedDataSupportReason,
                 alreadyImported
             })
         }
@@ -730,6 +816,11 @@ function registerIpcHandlers() {
                     if (dataPath) {
                         dataSizeMB = Math.round((await getDirSizeAsync(dataPath, APPDATA_SKIP_DIRS)) / (1024 * 1024))
                     }
+                    const type = inferAppType(checkPath)
+                    const importedDataCapability = resolveImportedAppDataCapability({
+                        appType: type,
+                        appName: name
+                    })
 
                     const alreadyImported = existsSync(join(appsDir, name)) ||
                         existsSync(join(appsDir, `${name}.tar.zst`)) ||
@@ -748,9 +839,12 @@ function registerIpcHandlers() {
                         candidateExecutables: selection.candidates,
                         sourcePath: checkPath,
                         sizeMB,
-                        type: inferAppType(checkPath),
+                        type,
                         dataPath: dataPath || null,
                         dataSizeMB,
+                        importedDataSupported: importedDataCapability.importedDataSupported,
+                        importedDataSupportLevel: importedDataCapability.importedDataSupportLevel,
+                        importedDataSupportReason: importedDataCapability.importedDataSupportReason,
                         alreadyImported
                     })
                 }
@@ -807,7 +901,24 @@ function registerIpcHandlers() {
                 reasons: selection.selected.reasons || []
             }
             const exePathInApp = selectedExecutable.relativePath
-            const appType = inferAppType(sourcePath)
+            let appType = inferAppType(sourcePath)
+            if (String(name || '').toLowerCase().includes('microsoft edge') ||
+                selectedExecutable.relativePath.toLowerCase().replace(/\\/g, '/').endsWith('/msedge.exe') ||
+                selectedExecutable.relativePath.toLowerCase() === 'msedge.exe') {
+                appType = 'chromium'
+            }
+            const importedDataCapability = resolveImportedAppDataCapability({
+                appType,
+                appName: name
+            })
+            const requestedImportData = !!importData
+            if (requestedImportData && (!dataPath || !existsSync(dataPath))) {
+                throw new Error(`${name} was selected with AppData, but the detected AppData path is no longer available.`)
+            }
+            if (requestedImportData && !importedDataCapability.importedDataSupported) {
+                throw new Error(`${name} was selected with AppData, but QuickPass cannot safely import AppData for this app profile. ${importedDataCapability.importedDataSupportReason}`)
+            }
+            const effectiveImportData = requestedImportData && importedDataCapability.importedDataSupported
             const requiredFiles = detectRequiredFilesFromRoot(sourcePath)
 
             // ─── Phase 17: Archive-Based Import ───────────────────────────
@@ -880,7 +991,7 @@ function registerIpcHandlers() {
 
             // Phase 3: Copy user data (if requested) — still uses robocopy
             // because AppData needs incremental sync (robocopy /MIR) later
-            if (importData && dataPath && existsSync(dataPath)) {
+            if (effectiveImportData && dataPath && existsSync(dataPath)) {
                 await copyDirWithProgress(dataPath, dataDest, APPDATA_SKIP_DIRS, (progress) => {
                     if (win && !win.isDestroyed()) {
                         win.webContents.send('import-progress', { name, phase: 'data', ...progress })
@@ -897,7 +1008,7 @@ function registerIpcHandlers() {
                 selectedExecutable,
                 candidateExecutables: selection.candidates,
                 appType,
-                importData,
+                importData: effectiveImportData,
                 archiveHash,
                 archiveSizeBytes: compressedSize,
                 legacyPath: `[USB]\\Apps\\${name}\\${exePathInApp}`,
@@ -912,11 +1023,14 @@ function registerIpcHandlers() {
                     // Store the ORIGINAL relative exe path — launch flow will handle extraction
                     path: `[USB]\\Apps\\${name}\\${exePathInApp}`,
                     args: '',
-                    portableData: !!importData,
+                    portableData: !!effectiveImportData,
                     manifestId: manifest.manifestId,
                     launchProfile: manifest.launchProfile,
                     dataProfile: manifest.dataProfile,
                     readinessProfile: manifest.readinessProfile,
+                    importedDataSupported: importedDataCapability.importedDataSupported,
+                    importedDataSupportLevel: importedDataCapability.importedDataSupportLevel,
+                    importedDataSupportReason: importedDataCapability.importedDataSupportReason,
                     binaryArchivePolicyVersion: BINARY_ARCHIVE_POLICY_VERSION,
                     id: Date.now(),
                     enabled: true
@@ -1024,6 +1138,7 @@ function registerIpcHandlers() {
 
     ipcMain.handle('start-session-setup', async (event) => {
         try {
+            beginDiagnosticsCycle('setup')
             await closeBrowser()
             await closeDesktopApps()
 
@@ -1043,7 +1158,7 @@ function registerIpcHandlers() {
                 if (win && !win.isDestroyed()) {
                     win.webContents.send('launch-status', statusMsg)
                 }
-            }, vaultDir)
+            }, vaultDir, [], { skipDiagnosticsCycle: true })
 
             return result
         } catch (err) {
@@ -1094,7 +1209,13 @@ function registerIpcHandlers() {
             writeFileSync(vaultPath, JSON.stringify(encryptedVault, null, 2), 'utf-8')
             try { execSync(`attrib +H "${vaultPath}"`) } catch (_) { }
 
-            return { success: true, tabCount: result.tabCount, urls: result.urls }
+            return {
+                success: true,
+                tabCount: result.tabCount,
+                urls: result.urls,
+                skippedUrls: result.skippedUrls || [],
+                skippedCount: result.skippedCount || 0
+            }
         } catch (err) {
             console.error('Failed to capture session:', err)
             return { success: false, error: err.message }
@@ -1104,6 +1225,7 @@ function registerIpcHandlers() {
     // ─── Session Edit (opens browser with saved tabs) ────────────────────
     ipcMain.handle('start-session-edit', async (event) => {
         try {
+            beginDiagnosticsCycle('edit')
             await closeBrowser()
             await closeDesktopApps()
 
@@ -1137,7 +1259,7 @@ function registerIpcHandlers() {
                 if (win && !win.isDestroyed()) {
                     win.webContents.send('launch-status', statusMsg)
                 }
-            }, vaultDir, urls)
+            }, vaultDir, urls, { skipDiagnosticsCycle: true })
 
             return result
         } catch (err) {
@@ -1176,7 +1298,13 @@ function registerIpcHandlers() {
             writeFileSync(vaultPath, JSON.stringify(encryptedVault, null, 2), 'utf-8')
             try { execSync(`attrib +H "${vaultPath}"`) } catch (_) { }
 
-            return { success: true, tabCount: result.tabCount, urls: result.urls }
+            return {
+                success: true,
+                tabCount: result.tabCount,
+                urls: result.urls,
+                skippedUrls: result.skippedUrls || [],
+                skippedCount: result.skippedCount || 0
+            }
         } catch (err) {
             return { success: false, error: err.message }
         }
@@ -1221,6 +1349,7 @@ function registerIpcHandlers() {
             // Phase 16: Fire-and-forget — the ENTIRE sequence (close previous + launch new)
             // runs asynchronously so the IPC response is instant and the UI stays responsive.
             const doLaunch = async () => {
+                beginDiagnosticsCycle('launch')
                 await closeBrowser()
                 await closeDesktopApps()
                 const launchWorkspaceConfig = {
@@ -1243,7 +1372,7 @@ function registerIpcHandlers() {
                     if (win && !win.isDestroyed()) {
                         win.webContents.send('launch-status', statusMsg)
                     }
-                }, vaultDir)
+                }, vaultDir, { skipDiagnosticsCycle: true })
             }
 
             doLaunch().then((results) => {
@@ -1357,6 +1486,7 @@ function setupKillCord() {
             try { wipeLocalTraces(getVaultDir()) } catch (_) { }
             // Kill cord = security emergency: ALWAYS wipe everything
             try { wipeAllLocalAppData() } catch (_) { }
+            try { wipeAllRuntimeAppProfiles({ staleOnly: true }) } catch (_) { }
             try { wipeLocalAppCache() } catch (_) { }
             try { require('fs').rmSync(tmpPath, { recursive: true, force: true }) } catch (_) { }
             process.exit(1)
@@ -1413,6 +1543,7 @@ app.on('before-quit', async (e) => {
         // Cryptographic memory wipe
         setActiveMasterPassword(null)
         await closeDesktopApps()
+        try { wipeAllRuntimeAppProfiles({ staleOnly: true }) } catch (_) { }
         try {
             const vd = getVaultDir()
             if (existsSync(vd)) {
@@ -1435,6 +1566,7 @@ process.on('exit', () => {
     wipeAllLocalProfiles()
     // ALWAYS wipe auth tokens/profiles — these must never persist on host PCs
     wipeAllLocalAppData()
+    wipeAllRuntimeAppProfiles({ staleOnly: true })
     // Only wipe app BINARY cache if clearCacheOnExit toggle is ON (default: true)
     try {
         const meta = loadVaultMeta()

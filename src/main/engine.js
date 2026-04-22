@@ -19,15 +19,17 @@
  * - abandonSync Flag: Prevents ghost writes during Node.js shutdown
  */
 import { chromium } from 'playwright-core'
-import { spawn, execSync } from 'child_process'
+import { spawn, execSync, execFileSync } from 'child_process'
 import { join, parse as pathParse, resolve as pathResolve, sep as pathSep } from 'path'
 import { mkdirSync, existsSync, rmSync, readdirSync, renameSync, statSync } from 'fs'
 import os from 'os'
 import crypto from 'crypto'
 import {
     isDangerousExecutablePath,
+    normalizeManifestProfiles,
     parseVaultAppPath,
     readAppManifest,
+    resolveImportedAppDataCapability,
     safeAppName,
     validateExtractedAppCache
 } from './appManifest.js'
@@ -46,6 +48,10 @@ export const runDiagnostics = {
     machineId: null,  // hashed hostname:user (privacy-safe)
     osVersion: null,
     startTime: null,
+    cycleId: null,
+    cycleType: null,
+    cycleStartTime: null,
+    cycles: [],
     phases: [],  // { name, startMs, endMs, durationMs, status, detail }
     appResults: [],  // { name, pid, realPid, exePath, isLauncher, closeMethod, status, launchStage, error, ... }
     browserSync: { copyInMs: null, copyOutMs: null, migrated: false },
@@ -61,13 +67,354 @@ export const runDiagnostics = {
     errors: []
 }
 
+let diagnosticsCycleCounter = 0
+
+function createBrowserSyncDiagnostics() {
+    return { copyInMs: null, copyOutMs: null, migrated: false }
+}
+
+function createRuntimeChecksDiagnostics() {
+    return {
+        extractor: {
+            checked: false,
+            tarAvailable: null,
+            zstdSupported: null,
+            detail: ''
+        }
+    }
+}
+
+function hasDiagnosticsCycleData() {
+    return runDiagnostics.phases.length > 0 ||
+        runDiagnostics.appResults.length > 0 ||
+        runDiagnostics.webResults.length > 0 ||
+        runDiagnostics.errors.length > 0
+}
+
+function snapshotDiagnosticsCycle() {
+    const snapshot = {
+        cycleId: runDiagnostics.cycleId,
+        cycleType: runDiagnostics.cycleType,
+        cycleStartTime: runDiagnostics.cycleStartTime,
+        phases: runDiagnostics.phases,
+        appResults: runDiagnostics.appResults,
+        browserSync: runDiagnostics.browserSync,
+        runtimeChecks: runDiagnostics.runtimeChecks,
+        webResults: runDiagnostics.webResults,
+        errors: runDiagnostics.errors
+    }
+
+    try {
+        return JSON.parse(JSON.stringify(snapshot))
+    } catch (_) {
+        return snapshot
+    }
+}
+
+export function beginDiagnosticsCycle(cycleType) {
+    if (hasDiagnosticsCycleData()) {
+        runDiagnostics.cycles.push(snapshotDiagnosticsCycle())
+        if (runDiagnostics.cycles.length > 20) {
+            runDiagnostics.cycles = runDiagnostics.cycles.slice(-20)
+        }
+    }
+
+    diagnosticsCycleCounter += 1
+    runDiagnostics.cycleId = `${Date.now()}-${diagnosticsCycleCounter}`
+    runDiagnostics.cycleType = cycleType
+    runDiagnostics.cycleStartTime = Date.now()
+    runDiagnostics.phases = []
+    runDiagnostics.appResults = []
+    runDiagnostics.browserSync = createBrowserSyncDiagnostics()
+    runDiagnostics.runtimeChecks = createRuntimeChecksDiagnostics()
+    runDiagnostics.webResults = []
+    runDiagnostics.errors = []
+}
+
 const TAB_LOAD_ATTEMPTS = 3
 const TAB_LOAD_TIMEOUT_MS = 30000
 const TAB_LOAD_BACKOFFS_MS = [500, 1500]
 const TAB_LOAD_CONCURRENCY = 3
+const DESKTOP_APP_LAUNCH_CONCURRENCY = 3
+const BROWSER_LAUNCH_PROFILES = new Set(['chromium-browser', 'edge-browser', 'chromium-singleton-browser'])
+const BROWSER_PROCESS_NAMES_REQUIRING_STRONG_OWNERSHIP = new Set(['msedge.exe', 'chrome.exe', 'brave.exe', 'vivaldi.exe'])
+const CAPTURABLE_BROWSER_SCHEMES = new Set(['http', 'https'])
+const SKIPPED_BROWSER_URL_REASONS = {
+    'about': 'browser-internal-page',
+    'chrome': 'browser-internal-page',
+    'chrome-error': 'browser-error-page',
+    'edge': 'browser-internal-page',
+    'devtools': 'browser-internal-page',
+    'view-source': 'browser-internal-page',
+    'file': 'local-file-url',
+    'data': 'embedded-data-url',
+    'blob': 'temporary-blob-url',
+    'javascript': 'script-url',
+    'mailto': 'external-protocol-url',
+    'tel': 'external-protocol-url'
+}
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function isBrowserLaunchProfile(profile) {
+    return BROWSER_LAUNCH_PROFILES.has(String(profile || '').toLowerCase())
+}
+
+function isBrowserProcessName(exePath) {
+    const exeName = pathParse(String(exePath || '')).base.toLowerCase()
+    return BROWSER_PROCESS_NAMES_REQUIRING_STRONG_OWNERSHIP.has(exeName)
+}
+
+function looksLikeMicrosoftEdge(appConfig, manifest, appPath) {
+    const values = [
+        appConfig?.name,
+        appConfig?.manifestId,
+        manifest?.displayName,
+        manifest?.safeName,
+        manifest?.selectedExecutable?.relativePath,
+        appPath,
+        appConfig?.path
+    ].map(value => String(value || '').toLowerCase())
+
+    return values.some(value => value.includes('microsoft edge')) ||
+        values.some(value => pathParse(value.replace(/\\/g, '/')).base === 'msedge.exe')
+}
+
+function resolveEffectiveLaunchProfile(appConfig, manifest, appPath) {
+    if (looksLikeMicrosoftEdge(appConfig, manifest, appPath)) return 'chromium-browser'
+    return manifest?.launchProfile || appConfig?.launchProfile || 'native-windowed'
+}
+
+function resolveEffectiveDataProfile(appConfig, manifest, launchProfile) {
+    if (isBrowserLaunchProfile(launchProfile)) return { mode: 'chromium-user-data' }
+    return manifest?.dataProfile || appConfig?.dataProfile || { mode: 'none' }
+}
+
+const RUNTIME_DATA_SUPPORT_LEVELS = Object.freeze({
+    VERIFIED: 'verified',
+    BEST_EFFORT: 'best-effort',
+    UNSUPPORTED: 'unsupported'
+})
+
+// Runtime-data support is intentionally split into:
+// - runtime-only isolation support
+// - imported AppData redirection support
+// - adapter identity / argument style
+// This lets QuickPass keep best-effort launch-only adapters without falsely
+// advertising imported-data portability.
+function resolveRuntimeDataPlan(appConfig, launchProfile, dataProfile) {
+    const normalizedLaunchProfile = String(launchProfile || '').toLowerCase()
+    const dataMode = String(dataProfile?.mode || '').toLowerCase()
+
+    const basePlan = {
+        launchProfile: normalizedLaunchProfile || 'native-windowed',
+        dataMode,
+        importedDataRequested: !!appConfig?.portableData,
+        adapterId: 'none',
+        runtimeProfileSupportLevel: RUNTIME_DATA_SUPPORT_LEVELS.UNSUPPORTED,
+        importedDataSupportLevel: RUNTIME_DATA_SUPPORT_LEVELS.UNSUPPORTED,
+        runtimeProfileSupported: false,
+        importedDataSupported: false,
+        argPrefix: null,
+        addBrowserHardeningArgs: false,
+        runtimeSupportReason: null,
+        runtimeSupportWarning: null,
+        unsupportedImportedDataReason: null
+    }
+
+    if (isBrowserLaunchProfile(normalizedLaunchProfile) || dataMode === 'chromium-user-data') {
+        return {
+            ...basePlan,
+            adapterId: 'chromium-user-data-dir',
+            runtimeProfileSupportLevel: RUNTIME_DATA_SUPPORT_LEVELS.VERIFIED,
+            importedDataSupportLevel: RUNTIME_DATA_SUPPORT_LEVELS.VERIFIED,
+            runtimeProfileSupported: true,
+            importedDataSupported: true,
+            argPrefix: '--user-data-dir=',
+            addBrowserHardeningArgs: isBrowserLaunchProfile(normalizedLaunchProfile),
+            runtimeSupportReason: 'Verified Chromium-style runtime profile adapter.'
+        }
+    }
+
+    if (normalizedLaunchProfile === 'vscode-family' || dataMode === 'vscode-user-data') {
+        return {
+            ...basePlan,
+            adapterId: 'vscode-user-data-dir',
+            runtimeProfileSupportLevel: RUNTIME_DATA_SUPPORT_LEVELS.VERIFIED,
+            importedDataSupportLevel: RUNTIME_DATA_SUPPORT_LEVELS.VERIFIED,
+            runtimeProfileSupported: true,
+            importedDataSupported: true,
+            argPrefix: '--user-data-dir=',
+            runtimeSupportReason: 'Verified VS Code-family runtime profile adapter.'
+        }
+    }
+
+    if (normalizedLaunchProfile === 'electron-standard' || dataMode === 'electron-user-data') {
+        return {
+            ...basePlan,
+            adapterId: 'electron-user-data-dir',
+            runtimeProfileSupportLevel: RUNTIME_DATA_SUPPORT_LEVELS.BEST_EFFORT,
+            importedDataSupportLevel: RUNTIME_DATA_SUPPORT_LEVELS.UNSUPPORTED,
+            runtimeProfileSupported: true,
+            importedDataSupported: false,
+            argPrefix: '--user-data-dir=',
+            runtimeSupportReason: 'Generic Electron runtime isolation is best-effort until QuickPass has app-specific validation.',
+            runtimeSupportWarning: 'Using best-effort Electron runtime isolation. Verify this app stays off host AppData on this PC before relying on zero-footprint guarantees.',
+            unsupportedImportedDataReason: 'QuickPass does not yet have a verified imported AppData adapter for generic Electron apps.'
+        }
+    }
+
+    return basePlan
+}
+
+function supportsUserDataDirArg(launchProfile, dataProfile) {
+    return resolveRuntimeDataPlan(null, launchProfile, dataProfile).runtimeProfileSupported
+}
+
+function needsRuntimeUserDataDir(appConfig, launchProfile, dataProfile) {
+    return resolveRuntimeDataPlan(appConfig, launchProfile, dataProfile).runtimeProfileSupported
+}
+
+function supportsImportedAppDataRedirection(appConfig, launchProfile, dataProfile) {
+    return resolveImportedAppDataCapability({
+        appType: appConfig?.appType,
+        appName: appConfig?.name,
+        launchProfile,
+        dataProfile
+    }).importedDataSupported
+}
+
+function replaceArgWithPrefix(args, prefix, value) {
+    return [value, ...(args || []).filter(arg => !String(arg || '').startsWith(prefix))]
+}
+
+function addArgIfMissing(args, arg) {
+    return (args || []).some(existing => existing === arg) ? args : [arg, ...(args || [])]
+}
+
+function ensureOwnedPidSet(appObj) {
+    if (!appObj) return new Set()
+    if (!(appObj.ownedPids instanceof Set)) {
+        appObj.ownedPids = new Set()
+    }
+    return appObj.ownedPids
+}
+
+function trackOwnedPid(appObj, pid, {
+    signal = null,
+    setRealPid = false,
+    readyWindow = false
+} = {}) {
+    const numericPid = Number(pid)
+    if (!appObj || !Number.isFinite(numericPid) || numericPid <= 0 || numericPid === process.pid) return false
+
+    ensureOwnedPidSet(appObj).add(numericPid)
+
+    if (readyWindow) {
+        appObj.readyObserved = true
+        appObj.readyWindowPid = numericPid
+        updateAppDiagnostic(appObj, {
+            readyObserved: true,
+            readyWindowPid: numericPid
+        })
+    }
+
+    if (setRealPid && numericPid !== appObj.pid) {
+        appObj.realPid = numericPid
+        if (signal) appObj.realPidSignal = signal
+        updateAppDiagnostic(appObj, {
+            realPid: numericPid
+        })
+    }
+
+    return true
+}
+
+function trackOwnedPids(appObj, pids, options = {}) {
+    for (const pid of pids || []) {
+        trackOwnedPid(appObj, pid, options)
+    }
+}
+
+function getTrackedOwnedPids(appObj, {
+    includeRoot = true,
+    excludeCurrentProcess = true
+} = {}) {
+    const tracked = new Set(ensureOwnedPidSet(appObj))
+    if (includeRoot && appObj?.pid) tracked.add(appObj.pid)
+    if (appObj?.realPid) tracked.add(appObj.realPid)
+    if (appObj?.readyWindowPid) tracked.add(appObj.readyWindowPid)
+    if (excludeCurrentProcess) tracked.delete(process.pid)
+    return [...tracked].filter(pid => Number.isFinite(pid) && pid > 0)
+}
+
+function getLiveTrackedOwnedPids(appObj, options = {}) {
+    return getTrackedOwnedPids(appObj, options).filter(pid => isPidAlive(pid))
+}
+
+function buildTaskkillCommand(pid, {
+    tree = true,
+    force = false
+} = {}) {
+    return `taskkill /pid ${pid}${tree ? ' /T' : ''}${force ? ' /F' : ''}`
+}
+
+function killPidSync(pid, options = {}) {
+    try {
+        execSync(buildTaskkillCommand(pid, options), { stdio: 'ignore' })
+        return true
+    } catch (_) {
+        return false
+    }
+}
+
+const READINESS_ERROR_WINDOW_PATTERNS = [
+    { pattern: /\bcrash detected\b/i, reason: 'Crash dialog detected' },
+    { pattern: /\bfatal(?: error)?\b/i, reason: 'Fatal error dialog detected' },
+    { pattern: /\buncaught exception\b/i, reason: 'Uncaught exception dialog detected' },
+    { pattern: /\bexception\b/i, reason: 'Exception dialog detected' },
+    { pattern: /\berror\b/i, reason: 'Error dialog detected' }
+]
+
+const READINESS_ERROR_OUTPUT_PATTERNS = [
+    { pattern: /\bmutex already exists\b/i, reason: 'Process reported a mutex-already-exists error' },
+    { pattern: /\bcrash detected\b/i, reason: 'Process reported a crash-detected error' },
+    { pattern: /\bfatal(?: error)?\b/i, reason: 'Process reported a fatal error' },
+    { pattern: /\buncaught exception\b/i, reason: 'Process reported an uncaught exception' }
+]
+
+function detectReadinessErrorState(appObj, window) {
+    const titleText = [window?.windowTitle, window?.className]
+        .map(value => String(value || '').trim())
+        .filter(Boolean)
+        .join(' | ')
+
+    for (const entry of READINESS_ERROR_WINDOW_PATTERNS) {
+        if (entry.pattern.test(titleText)) {
+            return {
+                source: 'window',
+                message: `${entry.reason}: ${titleText}`
+            }
+        }
+    }
+
+    const outputText = [
+        appObj?.latestStdout,
+        appObj?.latestStderr
+    ].map(value => String(value || '').trim()).filter(Boolean).join('\n')
+
+    for (const entry of READINESS_ERROR_OUTPUT_PATTERNS) {
+        if (entry.pattern.test(outputText)) {
+            return {
+                source: 'process-output',
+                message: entry.reason
+            }
+        }
+    }
+
+    return null
 }
 
 function scheduleBackgroundTask(fn) {
@@ -122,10 +469,105 @@ function scheduleStaleAppCacheCleanup(minAgeMs = 30000) {
     })
 }
 
-function normalizeBrowserUrl(url) {
+export function classifyBrowserUrl(url) {
     const raw = String(url || '').trim()
-    if (/^https?:\/\//i.test(raw)) return raw
-    return `https://${raw}`
+    if (!raw) {
+        return {
+            raw,
+            normalizedUrl: null,
+            scheme: null,
+            launchable: false,
+            capturable: false,
+            reason: 'empty-url'
+        }
+    }
+
+    if (/^[a-zA-Z]:[\\/]/.test(raw) || /^\\\\/.test(raw)) {
+        return {
+            raw,
+            normalizedUrl: null,
+            scheme: 'file',
+            launchable: false,
+            capturable: false,
+            reason: 'local-file-url'
+        }
+    }
+
+    const hostPortPattern = /^(?:localhost|(?:\d{1,3}\.){3}\d{1,3}|\[[0-9a-f:.]+\]|(?:[a-z0-9-]+\.)+[a-z0-9-]+):\d{1,5}(?:[/?#].*)?$/i
+    if (hostPortPattern.test(raw)) {
+        return {
+            raw,
+            normalizedUrl: `https://${raw}`,
+            scheme: 'https',
+            launchable: true,
+            capturable: true,
+            reason: null
+        }
+    }
+
+    const explicitHttpMatch = raw.match(/^(https?):\/\//i)
+    if (explicitHttpMatch) {
+        const scheme = explicitHttpMatch[1].toLowerCase()
+        if (CAPTURABLE_BROWSER_SCHEMES.has(scheme)) {
+            return {
+                raw,
+                normalizedUrl: raw,
+                scheme,
+                launchable: true,
+                capturable: true,
+                reason: null
+            }
+        }
+    }
+
+    const schemeMatch = raw.match(/^([a-z][a-z0-9+.-]*):/i)
+    if (schemeMatch) {
+        const scheme = schemeMatch[1].toLowerCase()
+
+        return {
+            raw,
+            normalizedUrl: null,
+            scheme,
+            launchable: false,
+            capturable: false,
+            reason: SKIPPED_BROWSER_URL_REASONS[scheme] || 'unsupported-browser-scheme'
+        }
+    }
+
+    return {
+        raw,
+        normalizedUrl: `https://${raw}`,
+        scheme: 'https',
+        launchable: true,
+        capturable: true,
+        reason: null
+    }
+}
+
+function normalizeBrowserUrl(url) {
+    return classifyBrowserUrl(url).normalizedUrl
+}
+
+function createSkippedBrowserResult(originalUrl, tabIndex, classification = classifyBrowserUrl(originalUrl)) {
+    const reason = classification.reason || 'unsupported-browser-url'
+    const message = reason === 'browser-error-page'
+        ? 'Skipped browser error page'
+        : `Skipped unsupported browser URL (${reason})`
+
+    return {
+        type: 'web',
+        tabIndex,
+        url: originalUrl,
+        normalizedUrl: classification.normalizedUrl,
+        success: false,
+        skipped: true,
+        reason,
+        attempts: 0,
+        finalUrl: originalUrl || null,
+        title: null,
+        error: message,
+        errors: []
+    }
 }
 
 function getPageSnapshot(page) {
@@ -144,7 +586,14 @@ async function loadTabWithRetry(page, originalUrl, tabIndex, onStatus, {
     timeoutMs = TAB_LOAD_TIMEOUT_MS,
     backoffsMs = TAB_LOAD_BACKOFFS_MS
 } = {}) {
-    const normalizedUrl = normalizeBrowserUrl(originalUrl)
+    const classification = classifyBrowserUrl(originalUrl)
+    if (!classification.launchable) {
+        const result = createSkippedBrowserResult(originalUrl, tabIndex, classification)
+        onStatus(`[Tab ${tabIndex}] [WARN] ${originalUrl} - ${result.error}`)
+        return result
+    }
+
+    const normalizedUrl = classification.normalizedUrl
     const errors = []
     let lastSnapshot = { finalUrl: null, title: null }
 
@@ -214,6 +663,13 @@ async function mapWithConcurrency(items, limit, worker) {
 }
 
 async function openBrowserTabWithResult(context, url, tabIndex, onStatus, options = {}) {
+    const classification = classifyBrowserUrl(url)
+    if (!classification.launchable) {
+        const result = createSkippedBrowserResult(url, tabIndex, classification)
+        onStatus(`[Tab ${tabIndex}] [WARN] ${url} - ${result.error}`)
+        return result
+    }
+
     try {
         const page = await context.newPage()
         return await loadTabWithRetry(page, url, tabIndex, onStatus, options)
@@ -272,11 +728,29 @@ function updateAppDiagnostic(appObj, patch) {
     Object.assign(diagRef, nextPatch)
 }
 
+function ensureAppDiagnosticInActiveCycle(appObj) {
+    if (!appObj?.diagRef) return
+    if (runDiagnostics.appResults.includes(appObj.diagRef)) return
+
+    let cleanupRef = null
+    try {
+        cleanupRef = JSON.parse(JSON.stringify(appObj.diagRef))
+    } catch (_) {
+        cleanupRef = { ...appObj.diagRef }
+    }
+
+    cleanupRef.diagnosticRole = 'cleanup'
+    appObj.diagRef = cleanupRef
+    runDiagnostics.appResults.push(cleanupRef)
+}
+
 function createAppDiagnostic(appConfig, attemptedPath) {
     return {
         name: appConfig.name,
         pid: null,
         realPid: null,
+        readyObserved: false,
+        readyWindowPid: null,
         exePath: null,
         isLauncher: false,
         closeMethod: null,
@@ -300,7 +774,33 @@ function createAppDiagnostic(appConfig, attemptedPath) {
         manifestId: appConfig.manifestId || null,
         launchProfile: appConfig.launchProfile || null,
         dataProfile: appConfig.dataProfile || null,
+        runtimeProfilePath: null,
+        runtimeProfileIsolated: false,
+        runtimeProfileSynced: false,
+        runtimeProfileAdapterId: 'none',
+        runtimeProfileArgStyle: 'none',
+        runtimeProfileSupportLevel: RUNTIME_DATA_SUPPORT_LEVELS.UNSUPPORTED,
+        runtimeProfileSupportReason: null,
+        runtimeProfileSupportWarning: null,
+        importedDataSupportLevel: RUNTIME_DATA_SUPPORT_LEVELS.UNSUPPORTED,
+        importedDataSupported: false,
+        runtimeProfileWiped: false,
+        runtimeProfileWipeSkippedForSafety: false,
+        runtimeProfileWipeSafetyReason: null,
+        runtimeProfileWipeError: null,
+        runtimeProfileInUsePids: [],
+        cleanupRequiresStrongOwnership: false,
+        cleanupSkippedForSafety: false,
+        cleanupSafetyReason: null,
+        spawnCwd: null,
+        launchArgs: [],
+        exitCode: null,
+        exitSignal: null,
+        lifetimeMs: null,
+        boundedStdout: null,
+        boundedStderr: null,
         readinessProfile: appConfig.readinessProfile || null,
+        readiness: createReadinessDiagnostic(appConfig.readinessProfile),
         binaryArchivePolicyVersion: appConfig.binaryArchivePolicyVersion ?? null,
         archivePolicyStatus: null,
         repairStatus: null,
@@ -313,6 +813,47 @@ function createAppDiagnostic(appConfig, attemptedPath) {
 const DEFAULT_LAUNCHER_HANDOFF_TIMEOUT_MS = 8000
 const LAUNCHER_HANDOFF_TIMEOUT_OVERRIDES_MS = {
     slack: 10000
+}
+const DEFAULT_READINESS_TIMEOUT_MS = 15000
+const READINESS_POLL_INTERVAL_MS = 750
+const READINESS_PROCESS_TREE_DEPTH = 3
+const READINESS_EMPTY_TREE_GRACE_MS = 3000
+const RUNTIME_APP_PROFILE_PREFIX = 'QuickPass-AppRuntime-'
+const EARLY_EXIT_OUTPUT_LIMIT = 8192
+
+function createReadinessDiagnostic(readinessProfile) {
+    return {
+        mode: readinessProfile?.mode || null,
+        timeoutMs: readinessProfile?.timeoutMs || null,
+        status: 'pending',
+        durationMs: 0,
+        checkedAt: null,
+        rootPids: [],
+        processTree: [],
+        windowObserved: false,
+        windowPid: null,
+        windowHandle: null,
+        windowTitle: null,
+        windowClassName: null,
+        windowBounds: null,
+        windowDetectionSource: null,
+        observedProcessName: null,
+        observedVia: null,
+        probeCount: 0,
+        probeFailureCount: 0,
+        probeTotalMs: 0,
+        queryErrors: [],
+        failureReason: null
+    }
+}
+
+function updateReadinessDiagnostic(appObj, patch) {
+    if (!appObj?.diagRef || !patch) return
+    appObj.diagRef.readiness = {
+        ...createReadinessDiagnostic(appObj.diagRef.readinessProfile),
+        ...(appObj.diagRef.readiness || {}),
+        ...patch
+    }
 }
 
 function getLauncherHandoffTimeoutMs(appName) {
@@ -423,10 +964,13 @@ function ensureExtractorPreflight() {
 
 /**
  * Escape for WQL LIKE clauses (e.g., CommandLine like '%...%').
- * Bracket-escapes %, _, [, ] so they match literally.
+ * WQL uses backslash as its escape character, so Windows paths must double
+ * backslashes before being embedded in string literals. We also bracket-escape
+ * LIKE wildcards that should be treated literally.
  */
 function escapeWqlLike(str) {
     return str
+        .replace(/\\/g, '\\\\')
         .replace(/\[/g, '[[]')  // must be first to avoid double-escape
         .replace(/%/g, '[%]')
         .replace(/_/g, '[_]')
@@ -444,27 +988,44 @@ function escapeWqlLiteral(str) {
 // --- Process Query Abstraction ---
 // PowerShell Get-CimInstance preferred; falls back to wmic on failure.
 
-/**
- * Query Win32_Process via PowerShell Get-CimInstance.
- * Falls back to wmic if PowerShell fails (access denied, timeout, missing cmdlet).
- * Returns raw stdout string.
- */
-function queryProcesses(wqlFilter, selectFields = 'ProcessId') {
-    // Try PowerShell first (modern, not deprecated)
-    try {
-        return execSync(
-            `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"${wqlFilter}\\" | Select-Object -ExpandProperty ${selectFields}"`,
-            { encoding: 'utf8', timeout: 8000, stdio: ['pipe', 'pipe', 'ignore'] }
-        )
-    } catch (psErr) {
-        // Fallback to wmic (deprecated but may be available on older Windows)
-        try {
-            return execSync(
-                `wmic process where "${wqlFilter}" get ${selectFields} /value`,
-                { encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'ignore'] }
-            )
-        } catch (_) { return '' }
+function combineProcessQueryErrors(...errors) {
+    const parts = []
+    for (const error of errors) {
+        const message = String(error || '').trim()
+        if (!message) continue
+        if (!parts.includes(message)) parts.push(message)
     }
+    return parts.join(' | ') || 'process query failed'
+}
+
+function queryProcessIds(wqlFilter, timeoutMs = 8000) {
+    try {
+        const output = execFileSync(
+            'powershell',
+            ['-NoProfile', '-Command', `Get-CimInstance Win32_Process -Filter "${wqlFilter}" | Select-Object -ExpandProperty ProcessId`],
+            { encoding: 'utf8', timeout: timeoutMs, stdio: ['pipe', 'pipe', 'pipe'] }
+        )
+        return { ok: true, pids: parsePidsFromOutput(output), error: null }
+    } catch (psErr) {
+        try {
+            const output = execFileSync(
+                'wmic',
+            ['process', 'where', wqlFilter, 'get', 'ProcessId', '/value'],
+            { encoding: 'utf8', timeout: Math.min(timeoutMs, 5000), stdio: ['pipe', 'pipe', 'pipe'] }
+        )
+        return { ok: true, pids: parsePidsFromOutput(output), error: null }
+    } catch (wmicErr) {
+        return {
+            ok: false,
+            pids: [],
+            error: combineProcessQueryErrors(psErr?.message, wmicErr?.message),
+            backendErrors: {
+                powershell: psErr?.message || null,
+                wmic: wmicErr?.message || null
+            }
+        }
+    }
+}
 }
 
 /**
@@ -479,6 +1040,155 @@ function parsePidsFromOutput(output) {
         if (!isNaN(num) && num > 0) pids.push(num)
     }
     return pids
+}
+
+function parseJsonArrayOutput(output) {
+    const trimmed = String(output || '').trim()
+    if (!trimmed) return []
+
+    try {
+        const parsed = JSON.parse(trimmed)
+        if (!parsed) return []
+        return Array.isArray(parsed) ? parsed.filter(Boolean) : [parsed]
+    } catch (_) {
+        return []
+    }
+}
+
+function escapePowerShellSingleQuoted(value) {
+    return String(value || '').replace(/'/g, "''")
+}
+
+function runPowerShellJson(script, timeoutMs = 8000) {
+    return new Promise((resolve) => {
+        let settled = false
+        let output = ''
+        let errorOutput = ''
+        let proc = null
+
+        const finish = (payload) => {
+            if (settled) return
+            settled = true
+            resolve(payload)
+        }
+
+        try {
+            proc = spawn('powershell', ['-NoProfile', '-Command', script], {
+                stdio: ['ignore', 'pipe', 'pipe']
+            })
+        } catch (err) {
+            finish({ ok: false, entries: [], error: err.message })
+            return
+        }
+
+        const timer = setTimeout(() => {
+            try { proc.kill() } catch (_) { }
+            finish({ ok: false, entries: [], error: `PowerShell probe timed out after ${timeoutMs}ms` })
+        }, timeoutMs)
+        if (typeof timer.unref === 'function') timer.unref()
+
+        proc.stdout.on('data', chunk => { output += chunk.toString() })
+        proc.stderr.on('data', chunk => { errorOutput += chunk.toString() })
+        proc.on('error', (err) => {
+            clearTimeout(timer)
+            finish({ ok: false, entries: [], error: err.message })
+        })
+        proc.on('close', (code) => {
+            clearTimeout(timer)
+            if (settled) return
+            if (code !== 0) {
+                finish({ ok: false, entries: [], error: errorOutput.trim() || `PowerShell exited ${code}` })
+                return
+            }
+            finish({ ok: true, entries: parseJsonArrayOutput(output), error: null })
+        })
+    })
+}
+
+function normalizeProcessEntry(entry) {
+    const processId = Number(entry?.ProcessId)
+    if (!Number.isFinite(processId) || processId <= 0) return null
+
+    const parentProcessId = Number(entry?.ParentProcessId)
+    const createdMs = Number(entry?.CreatedMs)
+    return {
+        pid: processId,
+        parentPid: Number.isFinite(parentProcessId) && parentProcessId > 0 ? parentProcessId : null,
+        name: entry?.Name || null,
+        createdMs: Number.isFinite(createdMs) && createdMs > 0 ? createdMs : null
+    }
+}
+
+function appendBoundedOutput(current, chunk, limit = EARLY_EXIT_OUTPUT_LIMIT) {
+    const next = `${current || ''}${chunk?.toString?.() || ''}`
+    if (next.length <= limit) return next
+    return next.slice(0, limit)
+}
+
+async function getProcessesByFilterDetailed(wqlFilter) {
+    const script = [
+        `Get-CimInstance Win32_Process -Filter "${wqlFilter}"`,
+        'ForEach-Object { [pscustomobject]@{ ProcessId = $_.ProcessId; ParentProcessId = $_.ParentProcessId; Name = $_.Name; CreatedMs = ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() } }',
+        'ConvertTo-Json -Compress'
+    ].join(' | ')
+
+    const result = await runPowerShellJson(script)
+    if (!result.ok) return { ok: false, entries: [], error: result.error }
+
+    const detailedEntries = result.entries
+        .map(normalizeProcessEntry)
+        .filter(Boolean)
+    return { ok: true, entries: detailedEntries, error: null }
+}
+
+async function getProcessesByIdsDetailed(pids) {
+    const uniquePids = [...new Set((pids || []).map(pid => Number(pid)).filter(pid => Number.isFinite(pid) && pid > 0))]
+    if (uniquePids.length === 0) return { ok: true, entries: [], error: null }
+
+    const filter = uniquePids.map(pid => `ProcessId=${pid}`).join(' OR ')
+    return getProcessesByFilterDetailed(filter)
+}
+
+async function getChildProcessesDetailed(parentPid) {
+    const pid = Number(parentPid)
+    if (!Number.isFinite(pid) || pid <= 0) return { ok: true, entries: [], error: null }
+    return getProcessesByFilterDetailed(`ParentProcessId=${pid}`)
+}
+
+async function getProcessesByNameDetailed(exePath, spawnTime) {
+    if (!exePath) return { ok: true, entries: [], error: null }
+    const exeName = pathParse(exePath).base
+    if (!exeName) return { ok: true, entries: [], error: null }
+
+    const escaped = escapeWqlLiteral(exeName)
+    const result = await getProcessesByFilterDetailed(`Name='${escaped}'`)
+    if (!result.ok) return result
+
+    const entries = result.entries.filter((entry) => {
+        if (!spawnTime || !entry.createdMs) return true
+        return entry.createdMs >= spawnTime && entry.createdMs <= spawnTime + 60000
+    })
+    return { ok: true, entries, error: null }
+}
+
+async function getWindowDetailsForPids(pids) {
+    const uniquePids = [...new Set((pids || []).map(pid => Number(pid)).filter(pid => Number.isFinite(pid) && pid > 0))]
+    if (uniquePids.length === 0) return []
+
+    const script = `$ids = @(${uniquePids.join(',')}); Get-Process -Id $ids -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ ProcessId = $_.Id; ProcessName = $_.ProcessName; MainWindowHandle = [int64]$_.MainWindowHandle; MainWindowTitle = $_.MainWindowTitle } } | ConvertTo-Json -Compress`
+
+    const result = await runPowerShellJson(script)
+    if (!result.ok) return []
+
+    return result.entries
+        .map((entry) => ({
+            pid: Number(entry?.ProcessId),
+            processName: entry?.ProcessName || null,
+            windowHandle: Number(entry?.MainWindowHandle) || 0,
+            windowTitle: entry?.MainWindowTitle || '',
+            detectionSource: 'main-window-handle'
+        }))
+        .filter(entry => Number.isFinite(entry.pid) && entry.pid > 0)
 }
 
 // --- Desktop App Tracking & Sync Queue ---
@@ -515,6 +1225,194 @@ function enqueueSync(usbPath, localPath) {
     }).catch(err => console.error('[QuickPass] Sync Queue error:', err))
 
     return globalSyncQueue
+}
+
+function isPathWithinDirectory(parentDir, candidatePath) {
+    if (!parentDir || !candidatePath) return false
+
+    const parent = pathResolve(parentDir)
+    const candidate = pathResolve(candidatePath)
+    const parentCmp = process.platform === 'win32' ? parent.toLowerCase() : parent
+    const candidateCmp = process.platform === 'win32' ? candidate.toLowerCase() : candidate
+    const parentWithSep = parentCmp.endsWith(pathSep) ? parentCmp : `${parentCmp}${pathSep}`
+
+    return candidateCmp.startsWith(parentWithSep)
+}
+
+function isOwnedRuntimeProfilePath(profilePath) {
+    if (!profilePath) return false
+
+    try {
+        const resolved = pathResolve(profilePath)
+        const tempDir = pathResolve(os.tmpdir())
+        const baseName = pathParse(resolved).base
+        return baseName.startsWith(RUNTIME_APP_PROFILE_PREFIX) &&
+            pathParse(resolved).dir === tempDir &&
+            isPathWithinDirectory(tempDir, resolved)
+    } catch (_) {
+        return false
+    }
+}
+
+function findRuntimeProfileUsersSync(profilePath) {
+    if (!isOwnedRuntimeProfilePath(profilePath)) {
+        return { ok: false, pids: [], error: 'runtime profile path is not QuickPass-owned' }
+    }
+
+    const escaped = escapeWqlLike(profilePath)
+    const filter = [
+        `CommandLine like '%${escaped}%'`,
+        "Name <> 'powershell.exe'",
+        "Name <> 'pwsh.exe'",
+        "Name <> 'wmic.exe'"
+    ].join(' AND ')
+    const result = queryProcessIds(filter)
+
+    return {
+        ok: result.ok,
+        pids: [...new Set(result.pids.filter(pid => pid > 0 && pid !== process.pid))],
+        error: result.error
+    }
+}
+
+function markRuntimeProfileWipeSkipped(appObj, reason, inUsePids = []) {
+    updateAppDiagnostic(appObj, {
+        runtimeProfileWiped: false,
+        runtimeProfileWipeSkippedForSafety: true,
+        runtimeProfileWipeSafetyReason: reason,
+        runtimeProfileInUsePids: inUsePids
+    })
+}
+
+function wipeRuntimeProfilePath(appObj, profilePath) {
+    try {
+        rmSync(profilePath, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
+        updateAppDiagnostic(appObj, {
+            runtimeProfileWiped: true,
+            runtimeProfileWipeSkippedForSafety: false,
+            runtimeProfileWipeSafetyReason: null,
+            runtimeProfileWipeError: null,
+            runtimeProfileInUsePids: []
+        })
+        return true
+    } catch (err) {
+        updateAppDiagnostic(appObj, {
+            runtimeProfileWiped: false,
+            runtimeProfileWipeError: err.message
+        })
+        diagError('app-runtime-profile-cleanup', `${appObj.diagRef?.name || appObj.pid}: ${err.message}`)
+        return false
+    }
+}
+
+function wipeRuntimeOnlyProfile(appObj) {
+    if (!appObj?.localPath || appObj.usbPath) return false
+
+    if (!isOwnedRuntimeProfilePath(appObj.localPath)) {
+        updateAppDiagnostic(appObj, {
+            runtimeProfileWiped: false,
+            runtimeProfileWipeError: 'Refused to wipe non-owned runtime profile path'
+        })
+        diagError('app-runtime-profile-cleanup', `${appObj.diagRef?.name || appObj.pid}: refused non-owned runtime profile path`)
+        return false
+    }
+
+    if (appObj.abandonSync) {
+        markRuntimeProfileWipeSkipped(appObj, appObj.abandonSyncReason || 'App was abandoned during emergency shutdown; deferred to stale runtime profile cleanup.')
+        return false
+    }
+
+    if (appObj.cleanupSkippedForSafety || appObj.diagRef?.cleanupSkippedForSafety) {
+        markRuntimeProfileWipeSkipped(appObj, 'Process cleanup was skipped for safety; runtime profile deletion deferred.')
+        return false
+    }
+
+    if (appObj.currentSessionRuntimeProfileSafeToDelete) {
+        const liveOwnedPids = getLiveTrackedOwnedPids(appObj)
+        if (liveOwnedPids.length === 0) {
+            return wipeRuntimeProfilePath(appObj, appObj.localPath)
+        }
+        markRuntimeProfileWipeSkipped(appObj, 'Known owned processes are still alive after shutdown.', liveOwnedPids)
+        return false
+    }
+
+    const users = findRuntimeProfileUsersSync(appObj.localPath)
+    if (!users.ok) {
+        markRuntimeProfileWipeSkipped(appObj, `Could not prove runtime profile was unused: ${users.error || 'process query failed'}`)
+        return false
+    }
+
+    if (users.pids.length > 0) {
+        markRuntimeProfileWipeSkipped(appObj, 'Runtime profile is still referenced by a live process.', users.pids)
+        return false
+    }
+
+    return wipeRuntimeProfilePath(appObj, appObj.localPath)
+}
+
+export function wipeAllRuntimeAppProfiles({ staleOnly = true } = {}) {
+    const summary = {
+        checked: 0,
+        wiped: 0,
+        skipped: 0,
+        errors: []
+    }
+
+    try {
+        const tempDir = os.tmpdir()
+        for (const dir of readdirSync(tempDir)) {
+            if (!dir.startsWith(RUNTIME_APP_PROFILE_PREFIX)) continue
+
+            const profilePath = join(tempDir, dir)
+            if (!isOwnedRuntimeProfilePath(profilePath)) {
+                summary.skipped += 1
+                summary.errors.push(`${dir}: refused non-owned path`)
+                continue
+            }
+
+            try {
+                if (!statSync(profilePath).isDirectory()) continue
+            } catch (_) {
+                continue
+            }
+
+            summary.checked += 1
+
+            if (staleOnly) {
+                const users = findRuntimeProfileUsersSync(profilePath)
+                if (!users.ok) {
+                    summary.skipped += 1
+                    summary.errors.push(`${dir}: ${users.error || 'process query failed'}`)
+                    continue
+                }
+                if (users.pids.length > 0) {
+                    summary.skipped += 1
+                    summary.errors.push(`${dir}: still in use by ${users.pids.join(', ')}`)
+                    continue
+                }
+            }
+
+            try {
+                rmSync(profilePath, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
+                summary.wiped += 1
+            } catch (err) {
+                summary.errors.push(`${dir}: ${err.message}`)
+            }
+        }
+    } catch (err) {
+        summary.errors.push(err.message)
+    }
+
+    if (summary.errors.length > 0) {
+        const preview = summary.errors.slice(0, 5).join(' | ')
+        const suffix = summary.errors.length > 5 ? ` | ... (${summary.errors.length - 5} more)` : ''
+        diagError(
+            'app-runtime-profile-cleanup',
+            `checked=${summary.checked} wiped=${summary.wiped} skipped=${summary.skipped}: ${preview}${suffix}`
+        )
+    }
+
+    return summary
 }
 
 // --- Local-First Profile Management ---
@@ -932,23 +1830,33 @@ async function launchChrome(vaultDir, onStatus = () => { }) {
  * We only extract URLs for workspace tracking.
  */
 async function extractAllPages() {
-    if (!activeContext) return { urls: [] }
+    if (!activeContext) return { urls: [], skippedUrls: [] }
 
     const allUrls = []
+    const skippedUrls = []
 
     // With launchPersistentContext there is only one context,
     // but we still iterate for robustness (Ctrl+N windows share the same context)
     const pages = activeContext.pages()
-    for (const p of pages) {
+    for (const [index, p] of pages.entries()) {
         try {
             const url = p.url()
-            if (url && url !== 'about:blank' && !url.startsWith('chrome://')) {
+            const classification = classifyBrowserUrl(url)
+
+            if (classification.capturable) {
                 allUrls.push(url)
+            } else if (url && url !== 'about:blank') {
+                skippedUrls.push({
+                    url,
+                    tabIndex: index + 1,
+                    scheme: classification.scheme,
+                    reason: classification.reason
+                })
             }
         } catch (_) { }
     }
 
-    return { urls: allUrls }
+    return { urls: allUrls, skippedUrls }
 }
 
 // --- Session Setup / Edit ---
@@ -961,8 +1869,10 @@ async function extractAllPages() {
  * @param {string} vaultDir - USB vault directory (for profile storage)
  * @param {string[]} urls - URLs to open (empty = open google.com)
  */
-export async function launchSessionSetup(onStatus, vaultDir, urls = []) {
-    runDiagnostics.webResults = []
+export async function launchSessionSetup(onStatus, vaultDir, urls = [], options = {}) {
+    if (!options.skipDiagnosticsCycle) {
+        beginDiagnosticsCycle(urls.length > 0 ? 'edit' : 'setup')
+    }
     onStatus('Opening browser...')
 
     const { context, browser } = await launchChrome(vaultDir, onStatus)
@@ -999,10 +1909,13 @@ export async function launchSessionSetup(onStatus, vaultDir, urls = []) {
         for (const bp of blankPages) {
             await bp.close().catch(() => { })
         }
-        const failedCount = setupResults.filter(result => !result.success).length
-        tabsSuccessful = failedCount === 0
+        const skippedCount = setupResults.filter(result => result.skipped).length
+        const failedCount = setupResults.filter(result => !result.success && !result.skipped).length
+        tabsSuccessful = failedCount === 0 && skippedCount === 0
         if (failedCount > 0) {
             onStatus(`${failedCount} tab${failedCount === 1 ? '' : 's'} failed to load. Reload manually if needed, then save.`)
+        } else if (skippedCount > 0) {
+            onStatus(`${skippedCount} browser-owned tab${skippedCount === 1 ? '' : 's'} skipped. Save to remove them from this workspace.`)
         } else {
             onStatus('All tabs loaded. Edit your workspace, then save.')
         }
@@ -1052,14 +1965,28 @@ export async function captureCurrentSession() {
     }
 
     try {
-        const { urls } = await extractAllPages()
+        const { urls, skippedUrls } = await extractAllPages()
 
         if (urls.length === 0) {
+            if (skippedUrls.length > 0) {
+                return {
+                    success: false,
+                    error: 'No website tabs are open. Browser internal/error pages were skipped.',
+                    skippedUrls,
+                    skippedCount: skippedUrls.length
+                }
+            }
             return { success: false, error: 'No tabs are open' }
         }
 
         // No longer returning 'state' (cookies)  profile handles auth persistence
-        return { success: true, urls, tabCount: urls.length }
+        return {
+            success: true,
+            urls,
+            tabCount: urls.length,
+            skippedUrls,
+            skippedCount: skippedUrls.length
+        }
     } catch (err) {
         return { success: false, error: err.message }
     }
@@ -1107,16 +2034,28 @@ export async function closeBrowser() {
 
 /**
  * Find processes whose command line contains a specific path (SYNCHRONOUS).
- * Uses PowerShell Get-CimInstance with WMIC fallback via queryProcesses().
+ * Uses PowerShell Get-CimInstance with WMIC fallback via queryProcessIds().
  * Used in closeDesktopApps() and emergencyKillDesktopAppsSync() where we
  * need synchronous results during teardown.
  */
 function findRealPidsByCommandLine(searchString) {
     try {
         const escaped = escapeWqlLike(searchString)
-        const output = queryProcesses(`CommandLine like '%${escaped}%'`)
-        return parsePidsFromOutput(output)
-    } catch (_) { return [] }
+        const filter = [
+            `CommandLine like '%${escaped}%'`,
+            "Name <> 'powershell.exe'",
+            "Name <> 'pwsh.exe'",
+            "Name <> 'wmic.exe'"
+        ].join(' AND ')
+        const result = queryProcessIds(filter)
+        return {
+            ok: result.ok,
+            pids: result.ok ? result.pids : [],
+            error: result.error
+        }
+    } catch (err) {
+        return { ok: false, pids: [], error: err.message }
+    }
 }
 
 /**
@@ -1134,63 +2073,73 @@ function findRealPidAsync(searchString) {
             const escaped = escapeWqlLike(searchString)
             const proc = spawn('powershell', [
                 '-NoProfile', '-Command',
-                `Get-CimInstance Win32_Process -Filter "CommandLine like '%${escaped}%'" | Select-Object -ExpandProperty ProcessId`
+                `Get-CimInstance Win32_Process -Filter "CommandLine like '%${escaped}%' AND Name <> 'powershell.exe' AND Name <> 'pwsh.exe' AND Name <> 'wmic.exe'" | Select-Object -ExpandProperty ProcessId`
             ], { stdio: ['ignore', 'pipe', 'ignore'] })
 
             let output = ''
+            let settled = false
+            const finish = (pids) => {
+                if (settled) return
+                settled = true
+                resolve(pids)
+            }
+            const timer = setTimeout(() => {
+                try { proc.kill() } catch (_) { }
+                finish([])
+            }, 8000)
+            if (typeof timer.unref === 'function') timer.unref()
+
             proc.stdout.on('data', d => { output += d.toString() })
-            proc.on('close', () => resolve(parsePidsFromOutput(output)))
-            proc.on('error', () => resolve([]))
+            proc.on('close', () => {
+                clearTimeout(timer)
+                finish(parsePidsFromOutput(output))
+            })
+            proc.on('error', () => {
+                clearTimeout(timer)
+                finish([])
+            })
         } catch (_) { resolve([]) }
     })
 }
 
-/**
- * Find processes by name + creation-time window (SYNCHRONOUS).
- * Fallback for manually-added apps without localPath (e.g., CapCut).
- * Uses process Name (not full ExecutablePath) because ExecutablePath may
- * require SeDebugPrivilege. Creation-time window reduces false positives.
- * Has PowerShellWMIC fallback (WMIC path loses creation-time precision).
- */
-function findPidsByProcessName(exePath, spawnTime) {
+async function findPidsByProcessName(exePath, spawnTime) {
     try {
-        const exeName = require('path').basename(exePath)
-        const escaped = escapeWqlLiteral(exeName)
-        // Try PowerShell: emit CreatedMs as explicit Unix timestamp
-        let output = ''
-        try {
-            output = execSync(
-                `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name='${escaped}'\\" | ForEach-Object { [pscustomobject]@{ ProcessId = $_.ProcessId; CreatedMs = ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() } } | ConvertTo-Json -Compress"`,
-                { encoding: 'utf8', timeout: 8000, stdio: ['pipe', 'pipe', 'ignore'] }
-            )
-        } catch (psErr) {
-            // WMIC fallback: less precise (no creation-time filter), but functional
-            const wmicOutput = queryProcesses(`Name='${escaped}'`)
-            return parsePidsFromOutput(wmicOutput)
-        }
+        const result = await getProcessesByNameDetailed(exePath, spawnTime)
+        if (result.ok) return result.entries.map(entry => entry.pid)
 
-        let entries = JSON.parse(output || '[]')
-        if (!Array.isArray(entries)) entries = [entries]
-
-        const validPids = []
-        for (const entry of entries) {
-            if (!entry || !entry.ProcessId) continue
-            // Filter by creation time: only include processes started
-            // within 60 seconds after our spawn (reduces false positives)
-            if (spawnTime && entry.CreatedMs) {
-                if (entry.CreatedMs < spawnTime || entry.CreatedMs > spawnTime + 60000) continue
-            }
-            validPids.push(entry.ProcessId)
-        }
-        return validPids
+        return []
     } catch (_) { return [] }
 }
 
-function getKnownSuccessorDetails(appObj) {
+function requiresStrongOwnershipForCleanup(appObj) {
+    return !!appObj?.requiresStrongOwnership ||
+        isBrowserLaunchProfile(appObj?.launchProfile || appObj?.diagRef?.launchProfile) ||
+        isBrowserProcessName(appObj?.exePath)
+}
+
+function isStrongSuccessorSignal(signal) {
+    return ['command-line', 'known-real-pid', 'visible-window', 'child-process', 'tracked-owned-pid'].includes(signal)
+}
+
+function getKnownSuccessorDetails(appObj, { requireStrongOwnership = false } = {}) {
+    const trackedSuccessorPids = getTrackedOwnedPids(appObj)
+        .filter(pid => pid !== appObj?.pid)
+
+    if (trackedSuccessorPids.length > 0) {
+        const signal = appObj?.realPidSignal || appObj?.diagRef?.handoffSignal || 'tracked-owned-pid'
+        if (requireStrongOwnership && !isStrongSuccessorSignal(signal)) return null
+        return {
+            pids: trackedSuccessorPids,
+            signal
+        }
+    }
+
     if (appObj?.realPid && appObj.realPid !== appObj.pid) {
+        const signal = appObj.realPidSignal || appObj.diagRef?.handoffSignal || 'known-real-pid'
+        if (requireStrongOwnership && !isStrongSuccessorSignal(signal)) return null
         return {
             pids: [appObj.realPid],
-            signal: appObj.diagRef?.handoffSignal || 'known-real-pid'
+            signal
         }
     }
 
@@ -1214,8 +2163,8 @@ async function findSuccessorDetails(appObj) {
         }
     }
 
-    if (appObj.exePath) {
-        const processNamePids = findPidsByProcessName(appObj.exePath, appObj.spawnTime)
+    if (!requiresStrongOwnershipForCleanup(appObj) && appObj.exePath) {
+        const processNamePids = (await findPidsByProcessName(appObj.exePath, appObj.spawnTime))
             .filter((pid) => pid !== appObj.pid)
 
         if (processNamePids.length > 0) {
@@ -1226,33 +2175,537 @@ async function findSuccessorDetails(appObj) {
     return { pids: [], signal: null }
 }
 
-function findSuccessorDetailsSync(appObj) {
+function findSuccessorDetailsSync(appObj, { allowProcessNameFallback = !requiresStrongOwnershipForCleanup(appObj) } = {}) {
     if (!appObj) {
-        return { pids: [], signal: null }
+        return { pids: [], signal: null, error: null }
     }
 
-    const knownDetails = getKnownSuccessorDetails(appObj)
+    const knownDetails = getKnownSuccessorDetails(appObj, { requireStrongOwnership: !allowProcessNameFallback })
     if (knownDetails) return knownDetails
 
+    let queryError = null
     if (appObj.localPath) {
-        const commandLinePids = findRealPidsByCommandLine(appObj.localPath)
+        const commandLineResult = findRealPidsByCommandLine(appObj.localPath)
+        const commandLinePids = commandLineResult.pids
             .filter((pid) => pid !== appObj.pid)
 
         if (commandLinePids.length > 0) {
-            return { pids: commandLinePids, signal: 'command-line' }
+            return { pids: commandLinePids, signal: 'command-line', error: null }
+        }
+
+        if (!commandLineResult.ok) {
+            queryError = commandLineResult.error || queryError
         }
     }
 
-    if (appObj.exePath) {
-        const processNamePids = findPidsByProcessName(appObj.exePath, appObj.spawnTime)
-            .filter((pid) => pid !== appObj.pid)
+    // Do not fall back to bare same-process-name matching in synchronous
+    // teardown. It can over-own unrelated apps. If tracked PID and
+    // command-line/runtime-profile proof fail, close must fail closed.
+    if (allowProcessNameFallback && appObj.exePath && !appObj.localPath) {
+        queryError = combineProcessQueryErrors(
+            queryError,
+            'No command-line ownership fingerprint is available; refused same-name teardown fallback.'
+        )
+    }
 
-        if (processNamePids.length > 0) {
-            return { pids: processNamePids, signal: 'process-name' }
+    return { pids: [], signal: null, error: queryError }
+}
+
+function isPidAlive(pid) {
+    try {
+        process.kill(pid, 0)
+        return true
+    } catch (_) {
+        return false
+    }
+}
+
+async function collectReadinessSnapshotFromPowerShell(appObj, {
+    includeProcessNameFallback = true,
+    maxDepth = READINESS_PROCESS_TREE_DEPTH
+} = {}) {
+    const startedAt = Date.now()
+    const roots = new Set()
+    if (appObj?.pid) roots.add(appObj.pid)
+    if (appObj?.realPid) roots.add(appObj.realPid)
+
+    const rootPids = [...roots].filter(Boolean)
+    const exeName = includeProcessNameFallback && appObj?.exePath ? pathParse(appObj.exePath).base : ''
+    const spawnStart = Number(appObj?.spawnTime) || 0
+    const spawnEnd = spawnStart ? spawnStart + 60000 : 0
+    const escapedExeName = escapePowerShellSingleQuoted(exeName)
+    const ownershipFingerprint = appObj?.ownershipFingerprint || appObj?.localPath || ''
+    const escapedOwnershipFingerprint = escapePowerShellSingleQuoted(escapeWqlLike(ownershipFingerprint))
+    const rootArray = rootPids.length ? rootPids.join(',') : ''
+
+    const script = `
+$ErrorActionPreference = 'Stop'
+$roots = @(${rootArray})
+$exeName = '${escapedExeName}'
+$ownershipFingerprint = '${escapedOwnershipFingerprint}'
+$spawnStart = ${spawnStart}
+$spawnEnd = ${spawnEnd}
+$maxDepth = ${Number(maxDepth) || 0}
+try {
+    function Convert-QPProcess($process) {
+        [pscustomobject]@{
+            ProcessId = $process.ProcessId
+            ParentProcessId = $process.ParentProcessId
+            Name = $process.Name
+            CreatedMs = ([DateTimeOffset]$process.CreationDate).ToUnixTimeMilliseconds()
         }
     }
 
-    return { pids: [], signal: null }
+    $selected = @{}
+
+    if ($roots.Count -gt 0) {
+        $rootFilter = ($roots | ForEach-Object { "ProcessId=$_" }) -join " OR "
+        foreach ($raw in @(Get-CimInstance Win32_Process -Filter $rootFilter)) {
+            $p = Convert-QPProcess $raw
+            $selected[[string]$p.ProcessId] = $p
+        }
+    }
+
+    if ($exeName -ne '') {
+        $wqlExeName = $exeName -replace "'", "''"
+        foreach ($raw in @(Get-CimInstance Win32_Process -Filter "Name='$wqlExeName'")) {
+            $p = Convert-QPProcess $raw
+            if ($spawnStart -eq 0 -or ($p.CreatedMs -ge $spawnStart -and $p.CreatedMs -le $spawnEnd)) {
+                $selected[[string]$p.ProcessId] = $p
+            }
+        }
+    }
+
+    if ($ownershipFingerprint -ne '') {
+        foreach ($raw in @(Get-CimInstance Win32_Process -Filter "CommandLine like '%$ownershipFingerprint%' AND Name <> 'powershell.exe' AND Name <> 'pwsh.exe' AND Name <> 'wmic.exe'")) {
+            $p = Convert-QPProcess $raw
+            $selected[[string]$p.ProcessId] = $p
+        }
+    }
+
+    $frontier = @($selected.Values | ForEach-Object { $_.ProcessId })
+    for ($depth = 0; $depth -lt $maxDepth -and $frontier.Count -gt 0; $depth++) {
+        $next = @()
+        $childFilter = ($frontier | ForEach-Object { "ParentProcessId=$_" }) -join " OR "
+        foreach ($raw in @(Get-CimInstance Win32_Process -Filter $childFilter)) {
+            $child = Convert-QPProcess $raw
+            $key = [string]$child.ProcessId
+            if (-not $selected.ContainsKey($key)) {
+                $selected[$key] = $child
+                $next += $child.ProcessId
+            }
+        }
+        $frontier = @($next)
+    }
+    $processes = @($selected.Values | Sort-Object ProcessId)
+    $ids = @($processes | ForEach-Object { $_.ProcessId })
+    $windows = @()
+    if ($ids.Count -gt 0) {
+        $processNames = @{}
+        foreach ($p in $processes) { $processNames[[int]$p.ProcessId] = $p.Name }
+        $pidSet = @{}
+        foreach ($id in $ids) { $pidSet[[int]$id] = $true }
+
+        $windowSource = @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+
+public static class QPWindowProbe {
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetClassName(IntPtr hWnd, StringBuilder text, int count);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+}
+"@
+
+        try {
+            Add-Type -TypeDefinition $windowSource -ErrorAction Stop
+            $foundWindows = New-Object System.Collections.Generic.List[object]
+            $callback = [QPWindowProbe+EnumWindowsProc]{
+            param([IntPtr]$hWnd, [IntPtr]$lParam)
+
+            [uint32]$windowPid = 0
+            [void][QPWindowProbe]::GetWindowThreadProcessId($hWnd, [ref]$windowPid)
+            $pidInt = [int]$windowPid
+            if ($pidSet.ContainsKey($pidInt)) {
+                $title = New-Object System.Text.StringBuilder 512
+                $className = New-Object System.Text.StringBuilder 256
+                [void][QPWindowProbe]::GetWindowText($hWnd, $title, $title.Capacity)
+                [void][QPWindowProbe]::GetClassName($hWnd, $className, $className.Capacity)
+                $rect = New-Object QPWindowProbe+RECT
+                $hasRect = [QPWindowProbe]::GetWindowRect($hWnd, [ref]$rect)
+                $foundWindows.Add([pscustomobject]@{
+                    ProcessId = $pidInt
+                    ProcessName = $processNames[$pidInt]
+                    WindowHandle = $hWnd.ToInt64()
+                    WindowTitle = $title.ToString()
+                    ClassName = $className.ToString()
+                    Visible = [QPWindowProbe]::IsWindowVisible($hWnd)
+                    Left = $(if ($hasRect) { $rect.Left } else { $null })
+                    Top = $(if ($hasRect) { $rect.Top } else { $null })
+                    Right = $(if ($hasRect) { $rect.Right } else { $null })
+                    Bottom = $(if ($hasRect) { $rect.Bottom } else { $null })
+                    DetectionSource = 'enum-windows'
+                })
+            }
+            return $true
+        }
+            [void][QPWindowProbe]::EnumWindows($callback, [IntPtr]::Zero)
+            $windows = @($foundWindows)
+        } catch {
+            $windows = @(Get-Process -Id $ids -ErrorAction SilentlyContinue | ForEach-Object {
+                [pscustomobject]@{
+                    ProcessId = $_.Id
+                    ProcessName = $_.ProcessName
+                    MainWindowHandle = [int64]$_.MainWindowHandle
+                    MainWindowTitle = $_.MainWindowTitle
+                    DetectionSource = 'main-window-handle'
+                }
+            })
+        }
+    }
+    [pscustomobject]@{
+        QueryOk = $true
+        Processes = $processes
+        Windows = $windows
+        ProbeDurationMs = 0
+        Error = $null
+    } | ConvertTo-Json -Depth 6 -Compress
+} catch {
+    [pscustomobject]@{
+        QueryOk = $false
+        Processes = @()
+        Windows = @()
+        ProbeDurationMs = 0
+        Error = $_.Exception.Message
+    } | ConvertTo-Json -Depth 6 -Compress
+}
+`
+
+    const result = await runPowerShellJson(script, 8000)
+    if (!result.ok || result.entries.length === 0) {
+        return {
+            ok: false,
+            processes: [],
+            windows: [],
+            durationMs: Date.now() - startedAt,
+            error: result.error || 'readiness snapshot failed'
+        }
+    }
+
+    const payload = result.entries[0]
+    const rawProcesses = Array.isArray(payload?.Processes)
+        ? payload.Processes
+        : (payload?.Processes ? [payload.Processes] : [])
+    const rawWindows = Array.isArray(payload?.Windows)
+        ? payload.Windows
+        : (payload?.Windows ? [payload.Windows] : [])
+
+    return {
+        ok: !!payload?.QueryOk,
+        processes: rawProcesses.map(normalizeProcessEntry).filter(Boolean),
+        windows: rawWindows.map((entry) => ({
+            pid: Number(entry?.ProcessId),
+            processName: entry?.ProcessName || null,
+            windowHandle: Number(entry?.WindowHandle ?? entry?.MainWindowHandle) || 0,
+            windowTitle: entry?.WindowTitle ?? entry?.MainWindowTitle ?? '',
+            className: entry?.ClassName || null,
+            visible: typeof entry?.Visible === 'boolean' ? entry.Visible : undefined,
+            bounds: {
+                left: Number(entry?.Left),
+                top: Number(entry?.Top),
+                right: Number(entry?.Right),
+                bottom: Number(entry?.Bottom)
+            },
+            detectionSource: entry?.DetectionSource || (entry?.MainWindowHandle != null ? 'main-window-handle' : null)
+        })).filter(entry => Number.isFinite(entry.pid) && entry.pid > 0),
+        durationMs: Date.now() - startedAt,
+        error: payload?.Error || null
+    }
+}
+
+async function collectRelatedProcessSnapshot(appObj, {
+    includeProcessNameFallback = true,
+    maxDepth = READINESS_PROCESS_TREE_DEPTH
+} = {}) {
+    const roots = new Set()
+    const collected = new Map()
+    const queryErrors = []
+
+    const addEntry = (entry) => {
+        if (!entry?.pid || collected.has(entry.pid)) return false
+        collected.set(entry.pid, entry)
+        return true
+    }
+
+    if (appObj?.pid) roots.add(appObj.pid)
+    if (appObj?.realPid) roots.add(appObj.realPid)
+
+    const snapshot = await collectReadinessSnapshotFromPowerShell(appObj, { includeProcessNameFallback, maxDepth })
+    if (snapshot.ok) {
+        for (const entry of snapshot.processes) {
+            addEntry(entry)
+        }
+    } else if (snapshot.error) {
+        queryErrors.push(snapshot.error)
+    }
+
+    for (const pid of roots) {
+        if (!collected.has(pid) && isPidAlive(pid)) {
+            addEntry({ pid, parentPid: null, name: null, createdMs: null })
+        }
+    }
+
+    const processTree = [...collected.values()]
+        .sort((a, b) => a.pid - b.pid)
+        .map(entry => ({
+            pid: entry.pid,
+            parentPid: entry.parentPid,
+            name: entry.name,
+            createdMs: entry.createdMs
+        }))
+    let windows = snapshot.windows || []
+    if (!snapshot.ok) {
+        windows = await getWindowDetailsForPids(processTree.map(entry => entry.pid))
+    }
+
+    return {
+        rootPids: [...roots].filter(Boolean).sort((a, b) => a - b),
+        processTree,
+        windows,
+        queryOk: snapshot.ok,
+        probeDurationMs: snapshot.durationMs || 0,
+        queryErrors
+    }
+}
+
+function pickVisibleWindow(windows) {
+    const visible = (windows || []).filter(window =>
+        Number(window.windowHandle) !== 0 &&
+        window.visible !== false
+    )
+    if (visible.length === 0) return null
+
+    return visible.sort((a, b) => {
+        const aHasTitle = String(a.windowTitle || '').trim() ? 1 : 0
+        const bHasTitle = String(b.windowTitle || '').trim() ? 1 : 0
+        return bHasTitle - aHasTitle
+    })[0]
+}
+
+function getReadinessProfileForApp(appObj) {
+    const profile = appObj?.diagRef?.readinessProfile || {}
+    return {
+        mode: profile.mode || 'visible-window',
+        timeoutMs: Number(profile.timeoutMs) || DEFAULT_READINESS_TIMEOUT_MS
+    }
+}
+
+function applyReadinessSnapshot(appObj, snapshot, patch = {}) {
+    const { window: providedWindow, ...readinessPatch } = patch
+    const window = providedWindow || pickVisibleWindow(snapshot.windows)
+    updateReadinessDiagnostic(appObj, {
+        rootPids: snapshot.rootPids,
+        processTree: snapshot.processTree,
+        windowObserved: !!window,
+        windowPid: window?.pid || null,
+        windowHandle: window?.windowHandle || null,
+        windowTitle: window?.windowTitle || null,
+        windowClassName: window?.className || null,
+        windowBounds: window?.bounds || null,
+        windowDetectionSource: window?.detectionSource || null,
+        observedProcessName: window?.processName || null,
+        ...readinessPatch
+    })
+}
+
+async function ensureAppReadiness(appObj, {
+    onStatus,
+    includeProcessNameFallback = true
+} = {}) {
+    const { mode, timeoutMs } = getReadinessProfileForApp(appObj)
+    const startedAt = Date.now()
+
+    updateReadinessDiagnostic(appObj, {
+        mode,
+        timeoutMs,
+        status: 'checking',
+        checkedAt: startedAt,
+        durationMs: 0,
+        failureReason: null
+    })
+
+    if (mode === 'visible-window') {
+        onStatus?.(`[INFO] ${appObj.diagRef.name} waiting for a visible window...`)
+    }
+
+    let lastSnapshot = null
+    let emptyTreeSince = null
+    let readinessProbeCount = 0
+    let readinessProbeFailureCount = 0
+    let readinessProbeTotalMs = 0
+
+    while (Date.now() - startedAt <= timeoutMs) {
+        const snapshot = await collectRelatedProcessSnapshot(appObj, {
+            includeProcessNameFallback: includeProcessNameFallback && !requiresStrongOwnershipForCleanup(appObj)
+        })
+        const window = pickVisibleWindow(snapshot.windows)
+        if (requiresStrongOwnershipForCleanup(appObj) && snapshot.queryOk) {
+            trackOwnedPids(appObj, snapshot.processTree.map(entry => entry.pid))
+        }
+        const durationMs = Date.now() - startedAt
+        lastSnapshot = snapshot
+        readinessProbeCount += 1
+        readinessProbeTotalMs += snapshot.probeDurationMs || 0
+        if (!snapshot.queryOk) readinessProbeFailureCount += 1
+
+        if (mode === 'process') {
+            if (snapshot.processTree.length > 0) {
+                applyReadinessSnapshot(appObj, snapshot, {
+                    status: 'background-ready',
+                    durationMs,
+                    checkedAt: Date.now(),
+                    observedVia: 'process-tree',
+                    probeCount: readinessProbeCount,
+                    probeFailureCount: readinessProbeFailureCount,
+                    probeTotalMs: readinessProbeTotalMs,
+                    failureReason: null
+                })
+                return {
+                    success: true,
+                    status: 'background-ready',
+                    launchVerifiedBy: 'process-ready',
+                    finalizedBy: 'process-ready',
+                    observedPid: snapshot.processTree[0]?.pid || null
+                }
+            }
+        } else if (window) {
+            const errorState = detectReadinessErrorState(appObj, window)
+            const observedVia = window?.detectionSource || 'main-window'
+
+            trackOwnedPid(appObj, window.pid, {
+                signal: 'visible-window',
+                setRealPid: window.pid && window.pid !== appObj.pid && !appObj.realPid,
+                readyWindow: true
+            })
+
+            if (errorState) {
+                applyReadinessSnapshot(appObj, snapshot, {
+                    window,
+                    status: 'error-window',
+                    durationMs,
+                    checkedAt: Date.now(),
+                    observedVia,
+                    probeCount: readinessProbeCount,
+                    probeFailureCount: readinessProbeFailureCount,
+                    probeTotalMs: readinessProbeTotalMs,
+                    failureReason: errorState.message
+                })
+                return {
+                    success: false,
+                    status: 'error-window',
+                    stage: 'readiness-checking',
+                    message: errorState.message
+                }
+            }
+
+            applyReadinessSnapshot(appObj, snapshot, {
+                window,
+                status: appObj.isLauncherPattern || appObj.realPid ? 'handoff-ready' : 'ready',
+                durationMs,
+                checkedAt: Date.now(),
+                observedVia,
+                probeCount: readinessProbeCount,
+                probeFailureCount: readinessProbeFailureCount,
+                probeTotalMs: readinessProbeTotalMs,
+                failureReason: null
+            })
+            return {
+                success: true,
+                status: appObj.isLauncherPattern || appObj.realPid ? 'handoff-ready' : 'ready',
+                launchVerifiedBy: 'visible-window',
+                finalizedBy: 'visible-window',
+                observedPid: window.pid || null
+            }
+        }
+
+        if (snapshot.queryErrors?.length) {
+            updateReadinessDiagnostic(appObj, {
+                queryErrors: snapshot.queryErrors,
+                probeFailureCount: readinessProbeFailureCount
+            })
+        }
+
+        applyReadinessSnapshot(appObj, snapshot, {
+            status: snapshot.processTree.length > 0 ? 'running-no-window' : 'exited-early',
+            durationMs,
+            probeCount: readinessProbeCount,
+            probeFailureCount: readinessProbeFailureCount,
+            probeTotalMs: readinessProbeTotalMs,
+            checkedAt: Date.now()
+        })
+
+        if (snapshot.processTree.length === 0) {
+            if (emptyTreeSince == null) emptyTreeSince = Date.now()
+            if (Date.now() - emptyTreeSince >= READINESS_EMPTY_TREE_GRACE_MS) break
+        } else {
+            emptyTreeSince = null
+        }
+        if (Date.now() - startedAt + READINESS_POLL_INTERVAL_MS > timeoutMs) break
+        await sleep(READINESS_POLL_INTERVAL_MS)
+    }
+
+    const durationMs = Date.now() - startedAt
+    const allReadinessProbesFailed = readinessProbeCount > 0 && readinessProbeFailureCount === readinessProbeCount
+    const status = allReadinessProbesFailed
+        ? 'readiness-probe-failed'
+        : (lastSnapshot?.processTree?.length ? 'running-no-window' : 'exited-early')
+    const failureReason = allReadinessProbesFailed
+        ? `Readiness probe failed: ${lastSnapshot?.queryErrors?.[0] || 'unable to query process/window state'}`
+        : status === 'running-no-window'
+            ? `No visible window was observed within ${Math.round(timeoutMs / 1000)}s`
+            : 'Process exited before a visible window appeared'
+
+    applyReadinessSnapshot(appObj, lastSnapshot || { rootPids: [], processTree: [], windows: [] }, {
+        status,
+        durationMs,
+        checkedAt: Date.now(),
+        probeCount: readinessProbeCount,
+        probeFailureCount: readinessProbeFailureCount,
+        probeTotalMs: readinessProbeTotalMs,
+        failureReason
+    })
+
+    return {
+        success: false,
+        status,
+        stage: 'readiness-checking',
+        message: failureReason
+    }
 }
 
 function ensureLauncherHandoff(appObj, {
@@ -1287,7 +2740,7 @@ function ensureLauncherHandoff(appObj, {
             const details = await findSuccessorDetails(appObj)
             if (details.pids.length > 0) {
                 const realPid = details.pids[0]
-                startLauncherMonitor(appObj, realPid)
+                startLauncherMonitor(appObj, realPid, details.signal)
 
                 return {
                     success: true,
@@ -1329,14 +2782,15 @@ function ensureLauncherHandoff(appObj, {
     return appObj.launcherHandoffPromise
 }
 
-function startLauncherMonitor(appObj, realPid) {
+function startLauncherMonitor(appObj, realPid, signal = 'known-real-pid') {
     if (!realPid || appObj.launcherMonitorStarted) return
 
     appObj.launcherMonitorStarted = true
-    appObj.realPid = realPid
+    trackOwnedPid(appObj, realPid, { signal, setRealPid: true })
     updateAppDiagnostic(appObj, {
         isLauncher: true,
         realPid,
+        handoffSignal: signal,
         launchVerifiedBy: 'launcher-handoff'
     })
 
@@ -1352,6 +2806,8 @@ function startLauncherMonitor(appObj, realPid) {
             console.log(`[QuickPass] ${appObj.diagRef.name} manual close detected. Syncing to USB...`)
             if (appObj.usbPath && appObj.localPath && !appObj.syncPromise && !appObj.abandonSync) {
                 appObj.syncPromise = enqueueSync(appObj.usbPath, appObj.localPath)
+            } else {
+                wipeRuntimeOnlyProfile(appObj)
             }
         }
     }, 5000)
@@ -1377,14 +2833,16 @@ export async function closeDesktopApps() {
     if (closeInProgress) return closeInProgress
 
     closeInProgress = (async () => {
+        for (const app of launchedApps) {
+            ensureAppDiagnosticInActiveCycle(app)
+        }
+
         // Phase 1: Send ALL graceful kill signals in parallel
         for (const app of launchedApps) {
             if (!app.exited && app.child.exitCode === null) {
                 app.closeMethod = app.closeMethod || 'graceful'
                 updateAppDiagnostic(app, { closeMethod: app.closeMethod })
-                try {
-                    execSync(`taskkill /pid ${app.pid} /T`, { stdio: 'ignore' })
-                } catch (_) { }
+                killPidSync(app.pid, { tree: true, force: false })
             }
         }
 
@@ -1410,9 +2868,7 @@ export async function closeDesktopApps() {
                     if (!settled) {
                         app.closeMethod = 'force'
                         updateAppDiagnostic(app, { closeMethod: app.closeMethod })
-                        try {
-                            execSync(`taskkill /pid ${app.pid} /F`, { stdio: 'ignore' })
-                        } catch (_) { }
+                        killPidSync(app.pid, { tree: true, force: true })
                     }
                 }, 4000)
 
@@ -1429,38 +2885,149 @@ export async function closeDesktopApps() {
             })
         }))
 
-        // Phase 3: Handle launcher-pattern apps  the launcher exited early
-        // but the real app is still running under a different PID.
-        // Multi-signal approach: command-line fingerprint (primary), process-name (fallback)
+        // Phase 3: Handle successor-owned and strong-ownership apps.
+        // Chromium/launcher-style apps can outlive the original root PID, so we
+        // first kill any owned successor PIDs we already tracked in-session and
+        // only then fall back to command-line rediscovery.
         for (const app of launchedApps) {
-            if (app.isLauncherPattern) {
-                const successorDetails = findSuccessorDetailsSync(app)
-                const realPids = successorDetails.pids
-                if (realPids.length > 0) {
-                    app.closeMethod = 'launcher-kill'
-                    updateAppDiagnostic(app, {
-                        closeMethod: app.closeMethod,
-                        isLauncher: true,
-                        ...(successorDetails.signal ? { handoffSignal: app.diagRef?.handoffSignal || successorDetails.signal } : {}),
-                        realPid: app.realPid || realPids[0] || null
-                    })
+            const strongOwnershipRequired = requiresStrongOwnershipForCleanup(app)
+            const shouldEvaluateSuccessors =
+                app.isLauncherPattern ||
+                strongOwnershipRequired ||
+                getTrackedOwnedPids(app, { includeRoot: false }).length > 0
+
+            let killedOwnedProcesses = false
+            const killOwnedSuccessorPids = (pids, signal = null) => {
+                const uniquePids = [...new Set((pids || [])
+                    .map(pid => Number(pid))
+                    .filter(pid => Number.isFinite(pid) && pid > 0 && pid !== app.pid))]
+
+                if (uniquePids.length === 0) return false
+
+                trackOwnedPids(app, uniquePids, { signal })
+                if (!app.realPid && uniquePids[0]) {
+                    trackOwnedPid(app, uniquePids[0], { signal, setRealPid: true })
                 }
-                for (const pid of realPids) {
-                    try { execSync(`taskkill /pid ${pid} /F`, { stdio: 'ignore' }) } catch (_) { }
+
+                app.closeMethod = app.isLauncherPattern ? 'launcher-kill' : 'owned-tree-kill'
+                updateAppDiagnostic(app, {
+                    closeMethod: app.closeMethod,
+                    isLauncher: !!app.isLauncherPattern,
+                    ...(signal ? { handoffSignal: app.diagRef?.handoffSignal || signal } : {}),
+                    realPid: app.realPid || uniquePids[0] || null
+                })
+
+                for (const pid of uniquePids) {
+                    killPidSync(pid, { tree: true, force: true })
                 }
-                // Brief wait for the killed processes to fully exit
-                if (realPids.length > 0) {
-                    await new Promise(r => setTimeout(r, 500))
+                return true
+            }
+
+            const trackedSuccessorPids = getLiveTrackedOwnedPids(app, { includeRoot: false })
+            if (killOwnedSuccessorPids(trackedSuccessorPids, app.realPidSignal || app.diagRef?.handoffSignal || 'tracked-owned-pid')) {
+                killedOwnedProcesses = true
+            }
+
+            let successorDetails = { pids: [], signal: null, error: null }
+            if (shouldEvaluateSuccessors) {
+                successorDetails = findSuccessorDetailsSync(app, {
+                    allowProcessNameFallback: !strongOwnershipRequired
+                })
+                if (killOwnedSuccessorPids(successorDetails.pids, successorDetails.signal)) {
+                    killedOwnedProcesses = true
                 }
-                // Enqueue the deferred sync that was skipped during launcher exit
-                if (app.usbPath && app.localPath && !app.syncPromise && !app.abandonSync) {
+            }
+
+            if (killedOwnedProcesses) {
+                await new Promise(r => setTimeout(r, 500))
+            }
+
+            const rootAlive = isPidAlive(app.pid)
+            const liveOwnedSuccessorPids = getLiveTrackedOwnedPids(app, { includeRoot: false })
+            const readyBasedOwnershipConfirmed = !!app.readyObserved || !!app.realPid || !!app.diagRef?.handoffObserved
+            const successorDiscoveryFailed = shouldEvaluateSuccessors &&
+                !!successorDetails.error &&
+                successorDetails.pids.length === 0 &&
+                liveOwnedSuccessorPids.length === 0
+            const successorDiscoveryUncertain = shouldEvaluateSuccessors &&
+                !successorDiscoveryFailed &&
+                !rootAlive &&
+                successorDetails.pids.length === 0 &&
+                liveOwnedSuccessorPids.length === 0 &&
+                (app.isLauncherPattern || strongOwnershipRequired) &&
+                !readyBasedOwnershipConfirmed
+            const successorDiscoveryUncertaintyReason = app.isLauncherPattern
+                ? 'No successor ownership proof was available after launcher exit; skipped sync and cleanup for safety.'
+                : 'No strong ownership proof was available after teardown; skipped sync and cleanup for safety.'
+            const successorSafetyBlocked = successorDiscoveryFailed || successorDiscoveryUncertain
+            const sessionProcessesClosed = !rootAlive &&
+                liveOwnedSuccessorPids.length === 0 &&
+                !successorSafetyBlocked
+
+            app.currentSessionRuntimeProfileSafeToDelete = sessionProcessesClosed &&
+                (!strongOwnershipRequired || readyBasedOwnershipConfirmed)
+
+            if (successorDiscoveryFailed) {
+                app.cleanupSkippedForSafety = true
+                updateAppDiagnostic(app, {
+                    cleanupSkippedForSafety: true,
+                    successorDiscoveryFailed: true,
+                    cleanupSafetyReason: `Could not confirm successor shutdown: ${successorDetails.error}`
+                })
+            } else if (successorDiscoveryUncertain) {
+                app.cleanupSkippedForSafety = true
+                updateAppDiagnostic(app, {
+                    cleanupSkippedForSafety: true,
+                    successorDiscoveryUncertain: true,
+                    cleanupSafetyReason: successorDiscoveryUncertaintyReason
+                })
+            } else if (strongOwnershipRequired && (rootAlive || liveOwnedSuccessorPids.length > 0)) {
+                app.cleanupSkippedForSafety = true
+                const reason = rootAlive
+                    ? 'Owned root process remained alive after teardown; skipped cleanup for safety.'
+                    : `Owned successor process remained alive after teardown: ${liveOwnedSuccessorPids.join(', ')}`
+                updateAppDiagnostic(app, {
+                    cleanupSkippedForSafety: true,
+                    cleanupSafetyReason: reason
+                })
+            } else if (strongOwnershipRequired && app.isLauncherPattern && successorDetails.pids.length === 0 && !app.currentSessionRuntimeProfileSafeToDelete) {
+                app.cleanupSkippedForSafety = true
+                updateAppDiagnostic(app, {
+                    cleanupSkippedForSafety: true,
+                    cleanupSafetyReason: successorDetails.error
+                        ? `Could not confirm owned successor process after launcher exit: ${successorDetails.error}`
+                        : 'No strongly owned successor process was found after launcher exit; deferred cleanup for safety.'
+                })
+            }
+
+            if (app.usbPath && app.localPath && !app.syncPromise && !app.abandonSync) {
+                if (sessionProcessesClosed) {
                     app.syncPromise = enqueueSync(app.usbPath, app.localPath)
+                } else {
+                    app.abandonSync = true
+                    app.abandonSyncReason = rootAlive
+                        ? 'Process remained alive after teardown; skipped sync for safety.'
+                        : successorDiscoveryFailed
+                            ? `Could not confirm successor shutdown before sync: ${successorDetails.error}`
+                            : successorDiscoveryUncertain
+                                ? successorDiscoveryUncertaintyReason
+                                : 'Owned successor process remained alive after teardown; skipped sync for safety.'
+                    updateAppDiagnostic(app, {
+                        cleanupSkippedForSafety: true,
+                        cleanupSafetyReason: app.abandonSyncReason
+                    })
                 }
             }
         }
 
         // Phase 4: Drain all syncs (populated by exit events + deferred launcher syncs)
         await globalSyncQueue
+
+        // Phase 5: Wipe runtime-only isolated profiles that were never synced
+        // because they were created only to prevent host profile attachment.
+        for (const app of launchedApps) {
+            wipeRuntimeOnlyProfile(app)
+        }
 
         launchedApps = []
     })()
@@ -1476,289 +3043,61 @@ export async function closeDesktopApps() {
 export function emergencyKillDesktopAppsSync() {
     for (const app of launchedApps) {
         app.abandonSync = true
+        app.abandonSyncReason = 'App was abandoned during emergency shutdown; deferred to stale runtime profile cleanup.'
         if (!app.exited && app.child.exitCode === null) {
-            try {
-                execSync(`taskkill /pid ${app.pid} /F`, { stdio: 'ignore' })
-            } catch (_) { }
+            killPidSync(app.pid, { tree: true, force: true })
         }
         // Also kill launcher-pattern orphans using multi-signal approach
-        if (app.isLauncherPattern) {
-            const successorDetails = findSuccessorDetailsSync(app)
+        if (app.isLauncherPattern || requiresStrongOwnershipForCleanup(app)) {
+            const strongOwnershipRequired = requiresStrongOwnershipForCleanup(app)
+            const successorDetails = findSuccessorDetailsSync(app, {
+                allowProcessNameFallback: !strongOwnershipRequired
+            })
             const realPids = successorDetails.pids
             for (const pid of realPids) {
-                try { execSync(`taskkill /pid ${pid} /F`, { stdio: 'ignore' }) } catch (_) { }
+                killPidSync(pid, { tree: true, force: true })
             }
         }
     }
+    wipeAllRuntimeAppProfiles({ staleOnly: true })
     launchedApps = []
+}
+
+function resolveImportedDataUsbPath(appConfig, vaultDir) {
+    const safeName = safeAppName(appConfig?.name || '')
+    const sanitizedPath = join(vaultDir, 'AppData', safeName)
+    const rawPath = join(vaultDir, 'AppData', appConfig?.name || safeName)
+    let usbPath = sanitizedPath
+
+    if (safeName !== appConfig?.name && existsSync(rawPath)) {
+        usbPath = rawPath
+        if (existsSync(sanitizedPath)) {
+            const bakPath = `${sanitizedPath}.bak-${Date.now()}`
+            try {
+                renameSync(sanitizedPath, bakPath)
+                console.log(`[QuickPass] Legacy conflict: backed up ${sanitizedPath} -> ${bakPath}`)
+            } catch (err) {
+                console.warn(`[QuickPass] Failed to backup sanitized folder: ${err.message}`)
+            }
+        }
+    }
+
+    return { safeName, usbPath }
+}
+
+function getUnsupportedImportedDataMessage(appConfig, effectiveLaunchProfile, runtimeDataPlan = null) {
+    const reason = runtimeDataPlan?.unsupportedImportedDataReason ||
+        'QuickPass currently supports imported AppData only for Chromium/Edge and VS Code-family launch profiles.'
+    const runtimeLevel = runtimeDataPlan?.runtimeProfileSupportLevel || RUNTIME_DATA_SUPPORT_LEVELS.UNSUPPORTED
+    const levelDetail = runtimeLevel === RUNTIME_DATA_SUPPORT_LEVELS.BEST_EFFORT
+        ? ' QuickPass may still attempt best-effort runtime isolation for launch-only use, but imported AppData requires a verified adapter.'
+        : ''
+    return `${appConfig.name} was imported with AppData, but launch profile '${effectiveLaunchProfile}' does not have a verified imported AppData redirection strategy in QuickPass. ${reason}${levelDetail} Reimport without AppData or add an app-specific runtime data adapter before launching it in QuickPass.`
 }
 
 // --- Desktop App Launcher ---
 async function launchDesktopAppLegacy(appConfig, onStatus, vaultDir) {
-    try {
-        onStatus(`Launching ${appConfig.name}...`)
-        let args = appConfig.args ? appConfig.args.split(' ').filter(Boolean) : []
-        let appPath = appConfig.path
-
-        // --- Phase 17: Archive Extraction ---
-        // If the app was imported as a .tar.zst archive, extract it to local
-        // temp on first launch. Subsequent launches skip extraction.
-        // This makes apps run from fast SSD instead of slow USB.
-        if (vaultDir && appPath.startsWith(vaultDir)) {
-            const relPath = appPath.substring(vaultDir.length) // e.g. \Apps\Name\app.exe
-            const parts = relPath.split(/[\\/]/).filter(Boolean) // ['Apps', 'Name', 'app.exe']
-            if (parts[0] === 'Apps' && parts.length >= 3) {
-                const appName = parts[1] // e.g. 'Antigravity'
-                const exeRelative = parts.slice(2).join('\\') // e.g. 'app.exe' or 'bin\64bit\obs64.exe'
-                const archivePath = join(vaultDir, 'Apps', `${appName}.tar.zst`)
-                const dirPath = join(vaultDir, 'Apps', appName)
-
-                if (existsSync(archivePath) && !existsSync(dirPath)) {
-                    // Archive exists but not extracted  extract to local temp
-                    const safeName = appName.replace(/[^a-zA-Z0-9_-]/g, '_')
-                    const localAppDir = join(os.tmpdir(), `QuickPass-App-${safeName}`)
-                    // Extract INTO a directory named after the app (not the source dir)
-                    // --strip-components=1 removes the original source dir name (e.g. 'obs-studio')
-                    // so contents go directly into localAppDir/appName/
-                    const localAppRoot = join(localAppDir, appName)
-                    const localExePath = join(localAppRoot, exeRelative)
-
-                    if (!existsSync(localExePath)) {
-                        onStatus(`Extracting ${appConfig.name}...`)
-                        mkdirSync(localAppRoot, { recursive: true })
-                        try {
-                            // Fix 4: Use spawn array instead of execAsync template string
-                            // to prevent command injection from paths with & | ; chars
-                            await new Promise((resolve, reject) => {
-                                const proc = spawn('tar', ['--zstd', '--strip-components=1', '-xf', archivePath, '-C', localAppRoot], { stdio: 'ignore' })
-                                proc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`tar exit ${code}`)))
-                                proc.on('error', reject)
-                            })
-                        } catch (err) {
-                            console.error(`[QuickPass] Failed to extract ${appName}:`, err)
-                            // Fix 3: Wipe partial extraction to prevent corrupted state
-                            // Without this, a half-extracted app (exe exists but DLLs don't)
-                            // would permanently crash on every subsequent launch attempt
-                            try { rmSync(localAppRoot, { recursive: true, force: true }) } catch (_) { }
-                        }
-                    }
-
-                    // If extraction succeeded, redirect to local path
-                    if (existsSync(localExePath)) {
-                        appPath = localExePath
-                        onStatus(`Launching ${appConfig.name} from local...`)
-                    }
-                } else if (existsSync(archivePath) && existsSync(dirPath)) {
-                    // Legacy: both archive and directory exist  use directory (backward compat)
-                } else if (!existsSync(dirPath) && !existsSync(archivePath)) {
-                    // Check if already extracted to local temp
-                    const safeName = appName.replace(/[^a-zA-Z0-9_-]/g, '_')
-                    const localExePath = join(os.tmpdir(), `QuickPass-App-${safeName}`, appName, exeRelative)
-                    if (existsSync(localExePath)) {
-                        appPath = localExePath
-                    }
-                }
-            }
-        }
-
-        // --- Phase 16.2: Local-First AppData ---
-        // For portable Electron/Chromium apps, copy AppData from USB -> local temp
-        // before launch, then run from local SSD speed instead of USB random I/O.
-        let usbPath = null
-        let localPath = null
-
-        if (appConfig.portableData && vaultDir) {
-            const safeName = appConfig.name.replace(/[^a-zA-Z0-9_-]/g, '_')
-            const sanitizedPath = join(vaultDir, 'AppData', safeName)
-            const rawPath = join(vaultDir, 'AppData', appConfig.name)
-
-            // Phase 17.2: Backward compat for pre-17.2 imports that used raw names.
-            // If raw folder exists, it has the originally imported data  prefer it.
-            // If a buggy sanitized folder also exists, back it up (don't destroy it).
-            if (safeName !== appConfig.name && existsSync(rawPath)) {
-                usbPath = rawPath
-                // Preserve any data the buggy launch-and-sync cycle put in the sanitized folder
-                if (existsSync(sanitizedPath)) {
-                    const bakPath = `${sanitizedPath}.bak-${Date.now()}`
-                    try {
-                        renameSync(sanitizedPath, bakPath)
-                        console.log(`[QuickPass] Legacy conflict: backed up ${sanitizedPath} -> ${bakPath}`)
-                    } catch (e) {
-                        console.warn(`[QuickPass] Failed to backup sanitized folder: ${e.message}`)
-                    }
-                }
-            } else {
-                usbPath = sanitizedPath
-            }
-
-            localPath = join(os.tmpdir(), `QuickPass-AppData-${safeName}`)
-
-            mkdirSync(usbPath, { recursive: true })
-            mkdirSync(localPath, { recursive: true })
-
-            // Mirror USB AppData  local temp (fast sequential read)
-            if (existsSync(usbPath)) {
-                try {
-                    onStatus(`Syncing ${appConfig.name} data to local...`)
-                    await robocopyAsync(usbPath, localPath)
-                } catch (err) {
-                    console.error(`[QuickPass] Failed to sync AppData for ${appConfig.name}:`, err)
-                }
-            }
-
-            // Point --user-data-dir to fast local temp, NOT slow USB
-            args = [`--user-data-dir=${localPath}`, ...args]
-        }
-
-        warnOnEmbeddedHostPaths(localPath, appConfig, onStatus)
-
-        let child
-
-        // Phase 12: File Explorer Context Support
-        const isExe = appPath.toLowerCase().endsWith('.exe') || appPath.toLowerCase().endsWith('.bat') || appPath.toLowerCase().endsWith('.cmd')
-
-        // Phase 15: Set cwd to the directory containing the .exe
-        let cwd = undefined
-        if (isExe && appPath && existsSync(appPath)) {
-            cwd = require('path').dirname(appPath)
-        }
-
-        if (isExe) {
-            child = spawn(appPath, args, {
-                detached: true,
-                stdio: 'ignore',
-                ...(cwd ? { cwd } : {})
-            })
-        } else {
-            child = spawn('explorer.exe', [appPath, ...args], {
-                detached: true,
-                stdio: 'ignore',
-                ...(cwd ? { cwd } : {})
-            })
-        }
-
-        // Attach error listener BEFORE checking pid to prevent uncaught ENOENT crash
-        const spawnError = new Promise((resolve) => {
-            child.on('error', (err) => {
-                onStatus(`[WARN] ${appConfig.name}  ${err.message}`)
-                resolve({ success: false, name: appConfig.name, error: err.message })
-            })
-        })
-
-        // Immediately fail if child process wasn't spawned
-        if (!child.pid) {
-            onStatus(`[WARN] ${appConfig.name}  Failed to spawn process`)
-            return await spawnError
-        }
-
-        // --- Track app with full metadata for sync-on-exit ---
-        const spawnTime = Date.now()
-        const appObj = {
-            pid: child.pid,
-            child,
-            usbPath,
-            localPath,
-            exited: false,
-            syncPromise: null,
-            abandonSync: false,
-            isLauncherPattern: false,
-            exePath: appConfig.path,
-            spawnTime,
-            closeMethod: null,
-            diagRef: {
-                name: appConfig.name,
-                pid: child.pid,
-                realPid: null,
-                exePath: appPath,
-                isLauncher: false,
-                closeMethod: null
-            }
-        }
-        runDiagnostics.appResults.push(appObj.diagRef)
-        launchedApps.push(appObj)
-        child.unref()
-
-        // --- Sync-On-Exit with Launcher Detection ---
-        // Some apps (Slack, Discord) use a launcher architecture: the spawned
-        // process exits immediately after starting the real app under a new PID.
-        // If exit fires within 15s of spawn, it's likely a launcher. DON'T sync
-        // yet (the real app is still running and using the data directory).
-        // The deferred sync happens in closeDesktopApps() via command-line fingerprint.
-        child.once('exit', () => {
-            appObj.exited = true
-            if (appObj.abandonSync) return
-
-            // Launcher detection: process exited very quickly after spawn
-            const lifetime = Date.now() - spawnTime
-            if (lifetime < 15000) {
-                appObj.isLauncherPattern = true
-                updateAppDiagnostic(appObj, { isLauncher: true })
-                console.log(`[QuickPass] ${appConfig.name} exited in ${lifetime}ms  likely a launcher, deferring sync`)
-
-                // Top-tier polling: find the real PID once (async, non-blocking),
-                // then use process.kill(pid, 0) for zero-cost heartbeat checks.
-                // Use localPath (most precise) or exePath (fallback) as search fingerprint
-                const fingerprint = appObj.localPath
-                const findFn = fingerprint
-                    ? findRealPidAsync(fingerprint)
-                    : Promise.resolve(findPidsByProcessName(appObj.exePath, appObj.spawnTime))
-
-                findFn.then(pids => {
-                    // Exclude our own original PID to avoid false self-match
-                    pids = pids.filter(p => p !== appObj.pid)
-                    if (pids.length === 0 || appObj.abandonSync || closeInProgress) return
-
-                    const realPid = pids[0]
-                    appObj.realPid = realPid  // Track for diagnostics
-                    updateAppDiagnostic(appObj, { realPid })
-                    const checkInterval = setInterval(() => {
-                        if (appObj.abandonSync || closeInProgress) {
-                            clearInterval(checkInterval)
-                            return
-                        }
-                        try {
-                            process.kill(realPid, 0) // Signal 0 = existence check only, no kill
-                        } catch (e) {
-                            // Process is dead  user manually closed it
-                            clearInterval(checkInterval)
-                            console.log(`[QuickPass] ${appConfig.name} manual close detected. Syncing to USB...`)
-                            if (appObj.usbPath && appObj.localPath && !appObj.syncPromise && !appObj.abandonSync) {
-                                appObj.syncPromise = enqueueSync(appObj.usbPath, appObj.localPath)
-                            }
-                        }
-                    }, 5000)
-                })
-
-                return // Don't sync  real app is still running
-            }
-
-            if (appObj.usbPath && appObj.localPath && !appObj.syncPromise) {
-                appObj.syncPromise = enqueueSync(appObj.usbPath, appObj.localPath)
-            }
-        })
-
-        // Brief wait to detect immediate spawn failures
-        const result = await new Promise((resolve) => {
-            const errListener = (err) => {
-                onStatus(`[WARN] ${appConfig.name}  ${err.message}`)
-                resolve({ success: false, name: appConfig.name, error: err.message })
-            }
-
-            child.once('error', errListener)
-
-            setTimeout(() => {
-                child.removeListener('error', errListener)
-                onStatus(`[OK] ${appConfig.name} - launched`)
-                resolve({ success: true, name: appConfig.name })
-            }, 100)
-        })
-
-        return result
-
-    } catch (err) {
-        onStatus(`[WARN] ${appConfig.name}  ${err.message}`)
-        return { success: false, name: appConfig.name, error: err.message }
-    }
+    return launchDesktopApp(appConfig, onStatus, vaultDir)
 }
 
 // --- Daily Workspace Launch ---
@@ -1801,7 +3140,10 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
         let launchSource = 'raw-path'
         let usbPath = null
         let localPath = null
-        const manifest = appConfig.manifest || (vaultDir ? readAppManifest(vaultDir, appConfig.manifestId || appConfig.name) : null)
+        let manifest = appConfig.manifest || (vaultDir ? readAppManifest(vaultDir, appConfig.manifestId || appConfig.name) : null)
+        if (manifest) {
+            manifest = normalizeManifestProfiles(manifest).manifest
+        }
 
         if (manifest) {
             Object.assign(diagRef, {
@@ -1809,6 +3151,7 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
                 launchProfile: manifest.launchProfile || appConfig.launchProfile || null,
                 dataProfile: manifest.dataProfile || appConfig.dataProfile || null,
                 readinessProfile: manifest.readinessProfile || appConfig.readinessProfile || null,
+                readiness: createReadinessDiagnostic(manifest.readinessProfile || appConfig.readinessProfile),
                 binaryArchivePolicyVersion: manifest.binaryArchivePolicyVersion ?? appConfig.binaryArchivePolicyVersion ?? null,
                 repairStatus: manifest.repairStatus || null,
                 selectedExecutable: manifest.selectedExecutable?.relativePath || null
@@ -2071,41 +3414,87 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
             return failLaunch('dangerous-launch-target', `Refusing to launch unsafe executable target: ${appPath}`, 'resolving')
         }
 
-        if (appConfig.portableData && vaultDir) {
-            const safeName = safeAppName(appConfig.name)
-            const sanitizedPath = join(vaultDir, 'AppData', safeName)
-            const rawPath = join(vaultDir, 'AppData', appConfig.name)
+        const effectiveLaunchProfile = resolveEffectiveLaunchProfile(appConfig, manifest, appPath)
+        const effectiveDataProfile = resolveEffectiveDataProfile(appConfig, manifest, effectiveLaunchProfile)
+        const importedDataRequested = !!appConfig.portableData
+        const runtimeDataPlan = resolveRuntimeDataPlan(appConfig, effectiveLaunchProfile, effectiveDataProfile)
+        const supportsRuntimeUserDataDir = runtimeDataPlan.runtimeProfileSupported
+        const supportsImportedDataRedirection = supportsImportedAppDataRedirection(appConfig, effectiveLaunchProfile, effectiveDataProfile)
+        const useRuntimeProfile = supportsRuntimeUserDataDir
+        const syncImportedData = importedDataRequested && !!vaultDir && supportsImportedDataRedirection
+        const cleanupRequiresStrongOwnership = isBrowserLaunchProfile(effectiveLaunchProfile) || isBrowserProcessName(appPath)
 
-            if (safeName !== appConfig.name && existsSync(rawPath)) {
-                usbPath = rawPath
-                if (existsSync(sanitizedPath)) {
-                    const bakPath = `${sanitizedPath}.bak-${Date.now()}`
-                    try {
-                        renameSync(sanitizedPath, bakPath)
-                        console.log(`[QuickPass] Legacy conflict: backed up ${sanitizedPath} -> ${bakPath}`)
-                    } catch (e) {
-                        console.warn(`[QuickPass] Failed to backup sanitized folder: ${e.message}`)
-                    }
+        Object.assign(diagRef, {
+            launchProfile: effectiveLaunchProfile,
+            dataProfile: effectiveDataProfile,
+            runtimeProfileIsolated: useRuntimeProfile,
+            runtimeProfileSynced: syncImportedData,
+            runtimeProfileAdapterId: runtimeDataPlan.adapterId,
+            runtimeProfileArgStyle: runtimeDataPlan.argPrefix ? 'user-data-dir' : 'none',
+            runtimeProfileSupportLevel: runtimeDataPlan.runtimeProfileSupportLevel,
+            runtimeProfileSupportReason: runtimeDataPlan.runtimeSupportReason,
+            runtimeProfileSupportWarning: runtimeDataPlan.runtimeSupportWarning,
+            importedDataSupportLevel: runtimeDataPlan.importedDataSupportLevel,
+            importedDataSupported: supportsImportedDataRedirection,
+            cleanupRequiresStrongOwnership
+        })
+
+        if (importedDataRequested && !vaultDir) {
+            return failLaunch(
+                'imported-data-misconfigured',
+                `${appConfig.name} is configured with imported AppData, but no active vault is available to load it.`,
+                'resolving'
+            )
+        }
+
+        if (importedDataRequested && !supportsImportedDataRedirection) {
+            return failLaunch(
+                'imported-data-unsupported',
+                getUnsupportedImportedDataMessage(appConfig, effectiveLaunchProfile, runtimeDataPlan),
+                'resolving'
+            )
+        }
+
+        if (useRuntimeProfile) {
+            const safeName = safeAppName(appConfig.name)
+
+            if (runtimeDataPlan.runtimeSupportWarning) {
+                onStatus(`[WARN] ${appConfig.name} - ${runtimeDataPlan.runtimeSupportWarning}`)
+            }
+
+            if (syncImportedData) {
+                const importedDataPaths = resolveImportedDataUsbPath(appConfig, vaultDir)
+                usbPath = importedDataPaths.usbPath
+                localPath = join(os.tmpdir(), `QuickPass-AppData-${importedDataPaths.safeName}`)
+                mkdirSync(usbPath, { recursive: true })
+                mkdirSync(localPath, { recursive: true })
+
+                try {
+                    diagRef.launchStage = 'syncing-data'
+                    onStatus(`Syncing ${appConfig.name} data to local...`)
+                    await robocopyAsync(usbPath, localPath)
+                } catch (err) {
+                    console.error(`[QuickPass] Failed to sync AppData for ${appConfig.name}:`, err)
+                    diagError('app-data-sync', `${appConfig.name}: ${err.message}`)
                 }
             } else {
-                usbPath = sanitizedPath
+                localPath = join(os.tmpdir(), `QuickPass-AppRuntime-${safeName}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`)
+                mkdirSync(localPath, { recursive: true })
             }
 
-            localPath = join(os.tmpdir(), `QuickPass-AppData-${safeName}`)
-
-            mkdirSync(usbPath, { recursive: true })
-            mkdirSync(localPath, { recursive: true })
-
-            try {
-                diagRef.launchStage = 'syncing-data'
-                onStatus(`Syncing ${appConfig.name} data to local...`)
-                await robocopyAsync(usbPath, localPath)
-            } catch (err) {
-                console.error(`[QuickPass] Failed to sync AppData for ${appConfig.name}:`, err)
-                diagError('app-data-sync', `${appConfig.name}: ${err.message}`)
+            if (runtimeDataPlan.argPrefix) {
+                args = replaceArgWithPrefix(args, runtimeDataPlan.argPrefix, `${runtimeDataPlan.argPrefix}${localPath}`)
+            }
+            if (runtimeDataPlan.addBrowserHardeningArgs) {
+                args = addArgIfMissing(args, '--no-default-browser-check')
+                args = addArgIfMissing(args, '--no-first-run')
             }
 
-            args = [`--user-data-dir=${localPath}`, ...args]
+            Object.assign(diagRef, {
+                runtimeProfilePath: localPath,
+                runtimeProfileIsolated: true,
+                runtimeProfileSynced: syncImportedData
+            })
         }
 
         warnOnEmbeddedHostPaths(localPath, appConfig, onStatus)
@@ -2130,16 +3519,19 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
         }
 
         let child
+        let stdoutCapture = ''
+        let stderrCapture = ''
+        const launchArgsSnapshot = [...args]
         try {
             child = isExe
                 ? spawn(appPath, args, {
                     detached: true,
-                    stdio: 'ignore',
+                    stdio: ['ignore', 'pipe', 'pipe'],
                     ...(cwd ? { cwd } : {})
                 })
                 : spawn('explorer.exe', [appPath, ...args], {
                     detached: true,
-                    stdio: 'ignore',
+                    stdio: ['ignore', 'pipe', 'pipe'],
                     ...(cwd ? { cwd } : {})
                 })
         } catch (err) {
@@ -2159,29 +3551,64 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
             exited: false,
             syncPromise: null,
             abandonSync: false,
+            abandonSyncReason: null,
             isLauncherPattern: false,
             launcherMonitorStarted: false,
             launcherHandoffPromise: null,
             exePath: appPath,
             spawnTime,
             closeMethod: null,
+            launchProfile: effectiveLaunchProfile,
+            dataProfile: effectiveDataProfile,
+            requiresStrongOwnership: cleanupRequiresStrongOwnership,
+            ownershipFingerprint: localPath || null,
+            realPidSignal: null,
+            readyObserved: false,
+            readyWindowPid: null,
+            ownedPids: new Set([child.pid]),
+            currentSessionRuntimeProfileSafeToDelete: false,
+            latestStdout: '',
+            latestStderr: '',
             diagRef
         }
 
         Object.assign(diagRef, {
             pid: child.pid,
-            status: 'spawning'
+            status: 'spawning',
+            spawnCwd: cwd || null,
+            launchArgs: launchArgsSnapshot
         })
 
         launchedApps.push(appObj)
+        child.stdout?.on?.('data', chunk => {
+            stdoutCapture = appendBoundedOutput(stdoutCapture, chunk)
+            appObj.latestStdout = stdoutCapture
+        })
+        child.stderr?.on?.('data', chunk => {
+            stderrCapture = appendBoundedOutput(stderrCapture, chunk)
+            appObj.latestStderr = stderrCapture
+        })
+        child.stdout?.unref?.()
+        child.stderr?.unref?.()
         child.unref()
 
-        child.once('exit', () => {
+        child.once('exit', (code, signal) => {
             appObj.exited = true
-            if (appObj.abandonSync) return
 
             const lifetime = Date.now() - spawnTime
-            if (lifetime < 15000) {
+            updateAppDiagnostic(appObj, {
+                exitCode: code,
+                exitSignal: signal,
+                lifetimeMs: lifetime,
+                spawnCwd: cwd || null,
+                launchArgs: launchArgsSnapshot,
+                ...(stdoutCapture ? { boundedStdout: stdoutCapture } : {}),
+                ...(stderrCapture ? { boundedStderr: stderrCapture } : {})
+            })
+
+            if (appObj.abandonSync) return
+
+            if (lifetime < 15000 && !appObj.readyObserved && !closeInProgress && !appObj.closeMethod) {
                 appObj.isLauncherPattern = true
                 updateAppDiagnostic(appObj, {
                     isLauncher: true,
@@ -2194,8 +3621,12 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
                 return
             }
 
+            if (closeInProgress) return
+
             if (appObj.usbPath && appObj.localPath && !appObj.syncPromise) {
                 appObj.syncPromise = enqueueSync(appObj.usbPath, appObj.localPath)
+            } else if (appObj.localPath && !appObj.usbPath) {
+                wipeRuntimeOnlyProfile(appObj)
             }
         })
 
@@ -2214,6 +3645,48 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
             setTimeout(async () => {
                 if (settled) return
 
+                const finishWithReadiness = async ({
+                    handoff = null,
+                    fallbackFromMissedHandoff = false
+                } = {}) => {
+                    const readiness = await ensureAppReadiness(appObj, { onStatus })
+                    const handoffExtra = handoff ? {
+                        handoffObserved: !!handoff.success,
+                        handoffSignal: handoff.signal,
+                        handoffTimeoutMs: handoff.timeoutMs,
+                        launcherDetectionAttempts: handoff.attempts,
+                        launcherDetectionMs: handoff.durationMs
+                    } : {}
+
+                    if (readiness.success) {
+                        if (readiness.observedPid) {
+                            trackOwnedPid(appObj, readiness.observedPid, {
+                                signal: readiness.launchVerifiedBy === 'visible-window' ? 'visible-window' : 'process-tree',
+                                setRealPid: readiness.observedPid !== appObj.pid && !appObj.realPid,
+                                readyWindow: readiness.launchVerifiedBy === 'visible-window'
+                            })
+                        }
+                        finalizeLaunchSuccess(appObj, {
+                            launchVerifiedBy: readiness.launchVerifiedBy,
+                            finalizedBy: readiness.finalizedBy,
+                            extra: {
+                                ...handoffExtra,
+                                ...(readiness.observedPid && readiness.observedPid !== appObj.pid ? { realPid: readiness.observedPid } : {}),
+                                ...(fallbackFromMissedHandoff ? { handoffFallbackReady: true } : {})
+                            }
+                        })
+                        onStatus(`[OK] ${appConfig.name} - ready`)
+                        finish({ success: true, name: appConfig.name })
+                        return true
+                    }
+
+                    const message = fallbackFromMissedHandoff
+                        ? `Launcher exited before handoff was observed. ${readiness.message}`
+                        : readiness.message
+                    finish(failLaunch('app-readiness', message, readiness.stage || 'readiness-checking'))
+                    return false
+                }
+
                 if (appObj.exited) {
                     updateAppDiagnostic(appObj, {
                         status: 'launcher-detecting',
@@ -2224,25 +3697,21 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
                     const handoff = await ensureLauncherHandoff(appObj)
 
                     if (!handoff.success) {
-                        finish(failLaunch('app-spawn', 'Launcher process exited before handoff was observed', 'launcher-detecting'))
+                        await finishWithReadiness({ handoff, fallbackFromMissedHandoff: true })
                         return
                     }
 
                     appObj.isLauncherPattern = true
-                    finalizeLaunchSuccess(appObj, {
-                        launchVerifiedBy: 'launcher-handoff',
-                        finalizedBy: 'launcher-handoff',
-                        extra: {
-                            handoffObserved: true,
-                            handoffSignal: handoff.signal,
-                            handoffTimeoutMs: handoff.timeoutMs,
-                            launcherDetectionAttempts: handoff.attempts,
-                            launcherDetectionMs: handoff.durationMs,
-                            ...(handoff.realPid ? { realPid: handoff.realPid } : {})
-                        }
+                    updateAppDiagnostic(appObj, {
+                        isLauncher: true,
+                        handoffObserved: true,
+                        handoffSignal: handoff.signal,
+                        handoffTimeoutMs: handoff.timeoutMs,
+                        launcherDetectionAttempts: handoff.attempts,
+                        launcherDetectionMs: handoff.durationMs,
+                        ...(handoff.realPid ? { realPid: handoff.realPid } : {})
                     })
-                    onStatus(`[OK] ${appConfig.name} - launched`)
-                    finish({ success: true, name: appConfig.name })
+                    await finishWithReadiness({ handoff })
                     return
                 } else {
                     try {
@@ -2252,12 +3721,7 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
                         return
                     }
 
-                    finalizeLaunchSuccess(appObj, {
-                        launchVerifiedBy: 'initial-pid',
-                        finalizedBy: 'initial-pid'
-                    })
-                    onStatus(`[OK] ${appConfig.name} - launched`)
-                    finish({ success: true, name: appConfig.name })
+                    await finishWithReadiness()
                     return
                 }
             }, 1000)
@@ -2269,12 +3733,14 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
     }
 }
 
-export async function launchWorkspace(workspace, onStatus, vaultDir) {
+export async function launchWorkspace(workspace, onStatus, vaultDir, options = {}) {
+    if (!options.skipDiagnosticsCycle) {
+        beginDiagnosticsCycle('launch')
+    }
     scheduleStaleAppCacheCleanup()
     const savedUrls = (workspace.webTabs || []).filter(t => t.enabled).map(t => t.url)
     const enabledApps = (workspace.desktopApps || []).filter(a => a.enabled)
     const total = savedUrls.length + enabledApps.length
-    runDiagnostics.webResults = []
 
     if (total === 0) {
         onStatus('No items configured')
@@ -2338,15 +3804,14 @@ export async function launchWorkspace(workspace, onStatus, vaultDir) {
     // natural spacing between app launches. The stagger was adding 6+ seconds
     // of pure waste to every workspace launch.
     const appsTrack = async () => {
-        const appResults = []
         if (enabledApps.length > 0) {
             ensureExtractorPreflight()
         }
-        for (let i = 0; i < enabledApps.length; i++) {
-            const appConfig = enabledApps[i]
+
+        const appResults = await mapWithConcurrency(enabledApps, DESKTOP_APP_LAUNCH_CONCURRENCY, async (appConfig, i) => {
             const result = await launchDesktopApp(appConfig, (msg) => onStatus(`[App ${i + 1}] ${msg}`), vaultDir)
-            appResults.push({ type: 'app', ...result })
-        }
+            return { type: 'app', ...result }
+        })
         return appResults
     }
 
