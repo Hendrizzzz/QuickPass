@@ -360,12 +360,22 @@ export function selectBestExecutableFromArchiveEntries(entries, appName, seedRel
 
 export function inferAppType(rootDir) {
     try {
+        const rootName = basename(rootDir || '').toLowerCase()
+        if (rootName.includes('edge') && fileExistsCaseInsensitive(rootDir, 'msedge.exe')) return 'chromium'
         if (existsSync(join(rootDir, 'resources', 'app', 'product.json'))) return 'vscode-family'
         if (existsSync(join(rootDir, 'resources', 'app.asar')) || existsSync(join(rootDir, 'resources', 'app'))) return 'electron'
         if (existsSync(join(rootDir, 'locales')) && existsSync(join(rootDir, 'resources'))) return 'electron'
         const subs = readdirSync(rootDir, { withFileTypes: true }).filter(d => d.isDirectory())
         for (const sub of subs) {
             if (/^\d+\./.test(sub.name) && existsSync(join(rootDir, sub.name, 'chrome.dll'))) return 'chromium'
+            if (/^\d+\./.test(sub.name) && (
+                existsSync(join(rootDir, sub.name, 'msedge.exe')) ||
+                existsSync(join(rootDir, sub.name, 'msedge.dll')) ||
+                existsSync(join(rootDir, sub.name, 'chrome_elf.dll')) ||
+                existsSync(join(rootDir, sub.name, 'resources.pak'))
+            )) return 'chromium'
+            if (existsSync(join(rootDir, sub.name, 'resources', 'app.asar')) ||
+                existsSync(join(rootDir, sub.name, 'resources', 'app'))) return 'electron'
         }
     } catch (_) { }
     return 'native'
@@ -376,7 +386,10 @@ export function inferProfiles(appType, appName) {
     let launchProfile = 'native-windowed'
     let dataMode = 'none'
 
-    if (appType === 'vscode-family' || lowerName.includes('cursor') || lowerName.includes('visual studio code')) {
+    if (lowerName.includes('microsoft edge') || lowerName === 'edge') {
+        launchProfile = 'chromium-browser'
+        dataMode = 'chromium-user-data'
+    } else if (appType === 'vscode-family' || lowerName.includes('cursor') || lowerName.includes('visual studio code')) {
         launchProfile = 'vscode-family'
         dataMode = 'vscode-user-data'
     } else if (appType === 'chromium') {
@@ -397,6 +410,72 @@ export function inferProfiles(appType, appName) {
             timeoutMs: launchProfile === 'vscode-family' ? 20000 : 15000
         }
     }
+}
+
+export const IMPORTED_APPDATA_SUPPORT_LEVELS = Object.freeze({
+    VERIFIED: 'verified',
+    UNSUPPORTED: 'unsupported'
+})
+
+export function resolveImportedAppDataCapability({
+    appType,
+    appName,
+    launchProfile,
+    dataProfile
+} = {}) {
+    const inferred = inferProfiles(appType || 'native', appName || '')
+    const effectiveLaunchProfile = String(launchProfile || inferred.launchProfile || 'native-windowed').toLowerCase()
+    const dataMode = String(dataProfile?.mode || inferred.dataProfile?.mode || 'none').toLowerCase()
+
+    if (effectiveLaunchProfile === 'chromium-browser' || dataMode === 'chromium-user-data') {
+        return {
+            importedDataSupported: true,
+            importedDataSupportLevel: IMPORTED_APPDATA_SUPPORT_LEVELS.VERIFIED,
+            importedDataAdapterId: 'chromium-user-data-dir',
+            importedDataSupportReason: 'Verified Chromium/Edge imported AppData adapter.'
+        }
+    }
+
+    if (effectiveLaunchProfile === 'vscode-family' || dataMode === 'vscode-user-data') {
+        return {
+            importedDataSupported: true,
+            importedDataSupportLevel: IMPORTED_APPDATA_SUPPORT_LEVELS.VERIFIED,
+            importedDataAdapterId: 'vscode-user-data-dir',
+            importedDataSupportReason: 'Verified VS Code-family imported AppData adapter.'
+        }
+    }
+
+    if (effectiveLaunchProfile === 'electron-standard' || dataMode === 'electron-user-data' || appType === 'electron') {
+        return {
+            importedDataSupported: false,
+            importedDataSupportLevel: IMPORTED_APPDATA_SUPPORT_LEVELS.UNSUPPORTED,
+            importedDataAdapterId: 'electron-user-data-dir',
+            importedDataSupportReason: 'Imported AppData is not verified for generic Electron apps. Launch-only isolation is best-effort.'
+        }
+    }
+
+    return {
+        importedDataSupported: false,
+        importedDataSupportLevel: IMPORTED_APPDATA_SUPPORT_LEVELS.UNSUPPORTED,
+        importedDataAdapterId: 'none',
+        importedDataSupportReason: 'Imported AppData is supported only for Chromium/Edge and VS Code-family profiles.'
+    }
+}
+
+export function resolveManifestDataProfile(appType, appName, importData) {
+    const profiles = inferProfiles(appType, appName)
+    if (profiles.launchProfile === 'chromium-browser') return profiles.dataProfile
+
+    const capability = resolveImportedAppDataCapability({
+        appType,
+        appName,
+        launchProfile: profiles.launchProfile,
+        dataProfile: profiles.dataProfile
+    })
+
+    return importData && capability.importedDataSupported
+        ? profiles.dataProfile
+        : { mode: 'none' }
 }
 
 function hasRelativePath(relativePaths, relPath) {
@@ -473,6 +552,72 @@ export function getManifestPath(vaultDir, appNameOrSafeName) {
     return join(vaultDir, 'Apps', `${safeAppName(appNameOrSafeName)}.quickpass-app.json`)
 }
 
+function isMicrosoftEdgeManifest(manifest) {
+    const displayName = String(manifest?.displayName || manifest?.safeName || '').toLowerCase()
+    const selected = String(manifest?.selectedExecutable?.relativePath || manifest?.legacyPath || '').toLowerCase()
+    const candidates = Array.isArray(manifest?.candidateExecutables) ? manifest.candidateExecutables : []
+
+    return displayName.includes('microsoft edge') ||
+        displayName === 'edge' ||
+        basename(selected.replace(/\\/g, '/')).toLowerCase() === 'msedge.exe' ||
+        candidates.some(candidate => basename(String(candidate?.relativePath || candidate?.path || '').replace(/\\/g, '/')).toLowerCase() === 'msedge.exe')
+}
+
+export function normalizeManifestProfiles(manifest) {
+    if (!manifest || typeof manifest !== 'object') return { manifest, changed: false }
+
+    const nextManifest = { ...manifest }
+
+    if (isMicrosoftEdgeManifest(manifest)) {
+        const profiles = inferProfiles('chromium', manifest.displayName || 'Microsoft Edge')
+        Object.assign(nextManifest, {
+            appType: 'chromium',
+            launchProfile: profiles.launchProfile,
+            dataProfile: profiles.dataProfile,
+            readinessProfile: manifest.readinessProfile || profiles.readinessProfile
+        })
+
+        if (manifest.readinessProfile?.mode !== profiles.readinessProfile.mode ||
+            manifest.readinessProfile?.timeoutMs !== profiles.readinessProfile.timeoutMs) {
+            nextManifest.readinessProfile = profiles.readinessProfile
+        }
+    }
+
+    const importedDataCapability = resolveImportedAppDataCapability({
+        appType: nextManifest.appType,
+        appName: nextManifest.displayName || nextManifest.safeName,
+        launchProfile: nextManifest.launchProfile,
+        dataProfile: nextManifest.dataProfile
+    })
+
+    const currentDataMode = String(nextManifest.dataProfile?.mode || '').toLowerCase()
+    if (!importedDataCapability.importedDataSupported &&
+        currentDataMode &&
+        currentDataMode !== 'none') {
+        nextManifest.dataProfile = { mode: 'none' }
+        nextManifest.importedDataSupportLevel = importedDataCapability.importedDataSupportLevel
+        nextManifest.importedDataSupportReason = importedDataCapability.importedDataSupportReason
+    }
+
+    const changed = JSON.stringify({
+        appType: manifest.appType,
+        launchProfile: manifest.launchProfile,
+        dataProfile: manifest.dataProfile,
+        readinessProfile: manifest.readinessProfile,
+        importedDataSupportLevel: manifest.importedDataSupportLevel,
+        importedDataSupportReason: manifest.importedDataSupportReason
+    }) !== JSON.stringify({
+        appType: nextManifest.appType,
+        launchProfile: nextManifest.launchProfile,
+        dataProfile: nextManifest.dataProfile,
+        readinessProfile: nextManifest.readinessProfile,
+        importedDataSupportLevel: nextManifest.importedDataSupportLevel,
+        importedDataSupportReason: nextManifest.importedDataSupportReason
+    })
+
+    return { manifest: nextManifest, changed }
+}
+
 export function readAppManifest(vaultDir, appNameOrSafeName) {
     if (!vaultDir || !appNameOrSafeName) return null
     const manifestPath = getManifestPath(vaultDir, appNameOrSafeName)
@@ -488,6 +633,27 @@ export function writeAppManifest(vaultDir, manifest) {
     const manifestPath = getManifestPath(vaultDir, manifest.safeName || manifest.displayName)
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
     return manifestPath
+}
+
+function normalizeAppConfigImportedData(appConfig, manifest) {
+    if (!appConfig?.portableData) return appConfig
+
+    const capability = resolveImportedAppDataCapability({
+        appType: manifest?.appType,
+        appName: manifest?.displayName || manifest?.safeName || appConfig?.name,
+        launchProfile: manifest?.launchProfile || appConfig?.launchProfile,
+        dataProfile: manifest?.dataProfile || appConfig?.dataProfile
+    })
+
+    if (capability.importedDataSupported) return appConfig
+
+    return {
+        ...appConfig,
+        portableData: false,
+        dataProfile: { mode: 'none' },
+        importedDataSupportLevel: capability.importedDataSupportLevel,
+        importedDataSupportReason: capability.importedDataSupportReason
+    }
 }
 
 export function hashFile(filePath) {
@@ -525,7 +691,7 @@ export function createImportManifest({
     requiredFiles
 }) {
     const profiles = inferProfiles(appType, displayName)
-    return {
+    const manifest = {
         schemaVersion: APP_MANIFEST_SCHEMA_VERSION,
         manifestId: safeName || safeAppName(displayName),
         displayName,
@@ -545,12 +711,13 @@ export function createImportManifest({
         candidateExecutables: candidateExecutables || [],
         appType,
         launchProfile: profiles.launchProfile,
-        dataProfile: importData ? profiles.dataProfile : { mode: 'none' },
+        dataProfile: resolveManifestDataProfile(appType, displayName, !!importData),
         readinessProfile: profiles.readinessProfile,
         requiredFiles: requiredFiles || [],
         legacyPath: legacyPath || null,
         repairStatus: 'current'
     }
+    return normalizeManifestProfiles(manifest).manifest
 }
 
 function buildLegacyManifest({ appConfig, vaultDir, parsedPath, archiveEntries, directoryRoot }) {
@@ -595,7 +762,7 @@ function buildLegacyManifest({ appConfig, vaultDir, parsedPath, archiveEntries, 
     else if (currentDangerous || selectedChanged) repairStatus = 'auto-repaired'
 
     const profiles = inferProfiles(appType, displayName)
-    return {
+    const manifest = {
         schemaVersion: APP_MANIFEST_SCHEMA_VERSION,
         manifestId: safeName,
         displayName,
@@ -615,13 +782,14 @@ function buildLegacyManifest({ appConfig, vaultDir, parsedPath, archiveEntries, 
         candidateExecutables: selection.candidates || [],
         appType,
         launchProfile: profiles.launchProfile,
-        dataProfile: appConfig.portableData ? profiles.dataProfile : { mode: 'none' },
+        dataProfile: resolveManifestDataProfile(appType, displayName, !!appConfig.portableData),
         readinessProfile: profiles.readinessProfile,
         requiredFiles,
         missingRequiredFiles,
         legacyPath: appConfig.path || null,
         repairStatus
     }
+    return normalizeManifestProfiles(manifest).manifest
 }
 
 export function parseVaultAppPath(appPath, vaultDir) {
@@ -636,7 +804,8 @@ export function parseVaultAppPath(appPath, vaultDir) {
     }
 }
 
-export function repairLegacyAppConfig(appConfig, vaultDir) {
+export function repairLegacyAppConfig(appConfig, vaultDir, options = {}) {
+    const { persist = true } = options
     const parsedPath = parseVaultAppPath(appConfig?.path, vaultDir)
     if (!parsedPath) {
         return { appConfig, manifest: null, repaired: false, reason: 'not-vault-app' }
@@ -644,23 +813,30 @@ export function repairLegacyAppConfig(appConfig, vaultDir) {
 
     const manifest = readAppManifest(vaultDir, appConfig.name || parsedPath.appName)
     if (manifest) {
-        const selected = manifest.selectedExecutable?.relativePath
+        const normalized = normalizeManifestProfiles(manifest)
+        const activeManifest = normalized.manifest
+        if (persist && normalized.changed) {
+            try { writeAppManifest(vaultDir, activeManifest) } catch (_) { }
+        }
+        const profileNormalizedReason = persist ? 'manifest-profile-normalized' : 'manifest-profile-normalized-readonly'
+        const selected = activeManifest.selectedExecutable?.relativePath
         if (selected && !isDangerousExecutablePath(selected)) {
+            const normalizedConfig = normalizeAppConfigImportedData({
+                ...appConfig,
+                path: join(vaultDir, 'Apps', parsedPath.appName, selected),
+                manifestId: activeManifest.manifestId,
+                launchProfile: activeManifest.launchProfile,
+                dataProfile: activeManifest.dataProfile,
+                readinessProfile: activeManifest.readinessProfile
+            }, activeManifest)
             return {
-                appConfig: {
-                    ...appConfig,
-                    path: join(vaultDir, 'Apps', parsedPath.appName, selected),
-                    manifestId: manifest.manifestId,
-                    launchProfile: manifest.launchProfile,
-                    dataProfile: manifest.dataProfile,
-                    readinessProfile: manifest.readinessProfile
-                },
-                manifest,
+                appConfig: normalizedConfig,
+                manifest: activeManifest,
                 repaired: false,
-                reason: 'manifest-existing'
+                reason: normalized.changed ? profileNormalizedReason : 'manifest-existing'
             }
         }
-        return { appConfig: { ...appConfig, manifestId: manifest.manifestId }, manifest, repaired: false, reason: 'manifest-no-safe-selection' }
+        return { appConfig: { ...appConfig, manifestId: activeManifest.manifestId }, manifest: activeManifest, repaired: false, reason: 'manifest-no-safe-selection' }
     }
 
     const archivePath = join(vaultDir, 'Apps', `${parsedPath.appName}.tar.zst`)
@@ -682,11 +858,13 @@ export function repairLegacyAppConfig(appConfig, vaultDir) {
         archiveEntries,
         directoryRoot: directoryExists ? directoryRoot : null
     })
-    try { writeAppManifest(vaultDir, builtManifest) } catch (_) { }
+    if (persist) {
+        try { writeAppManifest(vaultDir, builtManifest) } catch (_) { }
+    }
 
     const selected = builtManifest.selectedExecutable?.relativePath
     const canAutoRepair = selected && !isDangerousExecutablePath(selected) && builtManifest.selectedExecutable.confidence !== 'low'
-    const repairedConfig = {
+    let repairedConfig = {
         ...appConfig,
         manifestId: builtManifest.manifestId,
         launchProfile: builtManifest.launchProfile,
@@ -696,11 +874,12 @@ export function repairLegacyAppConfig(appConfig, vaultDir) {
     if (canAutoRepair) {
         repairedConfig.path = join(vaultDir, 'Apps', parsedPath.appName, selected)
     }
+    repairedConfig = normalizeAppConfigImportedData(repairedConfig, builtManifest)
 
     return {
         appConfig: repairedConfig,
         manifest: builtManifest,
         repaired: canAutoRepair && toLowerSlash(selected) !== toLowerSlash(parsedPath.exeRelative),
-        reason: builtManifest.repairStatus
+        reason: persist ? builtManifest.repairStatus : 'legacy-manifest-inspected'
     }
 }

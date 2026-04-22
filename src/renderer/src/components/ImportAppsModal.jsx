@@ -61,12 +61,14 @@ export default function ImportAppsModal({ onClose, onImportComplete }) {
             const app = apps.find((item) => item.name === name)
             return {
                 ...prev,
-                [name]: { checked: true, importData: !!app?.dataPath }
+                [name]: { checked: true, importData: canImportAppData(app) }
             }
         })
     }
 
     const toggleData = (name) => {
+        const app = apps.find((item) => item.name === name)
+        if (!canImportAppData(app)) return
         setSelected((prev) => ({
             ...prev,
             [name]: { ...prev[name], importData: !prev[name]?.importData }
@@ -91,9 +93,17 @@ export default function ImportAppsModal({ onClose, onImportComplete }) {
         return `${mb} MB`
     }
 
+    const canImportAppData = (app) => !!app?.dataPath && app.importedDataSupported !== false
+
     const getCompatibilityNote = (app) => {
-        if (app.type === 'electron' || app.type === 'chromium') {
+        if (app.type === 'chromium') {
             return 'Login sessions may not transfer between PCs.'
+        }
+        if (app.type === 'vscode-family') {
+            return 'VS Code-family data import is supported; some accounts may still require sign-in on a new PC.'
+        }
+        if (app.type === 'electron') {
+            return 'Imported app data is not verified for generic Electron apps. Launch-only isolation is best-effort.'
         }
         return 'Launch only - app data is not portable.'
     }
@@ -120,7 +130,7 @@ export default function ImportAppsModal({ onClose, onImportComplete }) {
                     name: app.name,
                     exe: app.exe,
                     relativeExePath: app.relativeExePath || app.exe,
-                    importData: sel.importData && !!app.dataPath,
+                    importData: canImportAppData(app) && sel.importData && !!app.dataPath,
                     dataPath: app.dataPath,
                     sizeMB: app.sizeMB || 0,
                     dataSizeMB: app.dataSizeMB || 0
@@ -213,7 +223,7 @@ export default function ImportAppsModal({ onClose, onImportComplete }) {
                                                         </span>
                                                     )}
                                                     <span className="px-1.5 py-0.5 rounded text-[9px] bg-[#1a1a2e] text-muted border border-[#2a2a3a] flex-shrink-0">
-                                                        {app.type === 'electron' ? 'Electron' : app.type === 'chromium' ? 'Chromium' : 'Native'}
+                                                        {app.type === 'electron' ? 'Electron' : app.type === 'chromium' ? 'Chromium' : app.type === 'vscode-family' ? 'VS Code' : 'Native'}
                                                     </span>
                                                 </div>
                                             </div>
@@ -233,15 +243,21 @@ export default function ImportAppsModal({ onClose, onImportComplete }) {
                                                 <label className="flex items-center gap-2 cursor-pointer">
                                                     <input
                                                         type="checkbox"
-                                                        checked={sel?.importData || false}
+                                                        checked={canImportAppData(app) ? (sel?.importData || false) : false}
+                                                        disabled={!canImportAppData(app)}
                                                         onChange={() => toggleData(app.name)}
                                                         className="accent-[#5b7bd5]"
                                                     />
                                                     <span className="text-xs text-secondary">
-                                                        Include logins & data
+                                                        {canImportAppData(app) ? 'Include logins & data' : 'App data import unavailable'}
                                                     </span>
                                                     <span className="text-xs text-muted ml-auto">{formatSize(app.dataSizeMB)}</span>
                                                 </label>
+                                                {!canImportAppData(app) && (
+                                                    <p className="text-[10px] text-muted mt-1">
+                                                        {app.importedDataSupportReason || 'QuickPass does not have a verified imported AppData adapter for this app.'}
+                                                    </p>
+                                                )}
                                             </div>
                                         )}
                                     </div>
