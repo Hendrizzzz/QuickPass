@@ -14,3 +14,8 @@ AppData/
 temp-profile/
 .codex-tar-probe/
 diff.txt
+.gemini/
+
+# AI planning/review artifacts — never commit
+QUICKPASS*.md
+QUICKPASS_*.md
