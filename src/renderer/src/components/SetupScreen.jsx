@@ -23,6 +23,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
     // Session capture state
     const [sessionState, setSessionState] = useState('idle')
     const [capturedCount, setCapturedCount] = useState(0)
+    const [capturedSkippedCount, setCapturedSkippedCount] = useState(0)
     const [capturedUrls, setCapturedUrls] = useState([])
 
     const sessionDisconnected = sessionState === 'disconnected'
@@ -72,6 +73,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
             setSaving(false)
             setSessionState('idle')
             setCapturedCount(0)
+            setCapturedSkippedCount(0)
             setCapturedUrls([])
             setStep(3) // Advance to the browser session step
         } else {
@@ -106,10 +108,13 @@ export default function SetupScreen({ driveInfo, onComplete }) {
             }
 
             if (result.tabsSuccessful === false) {
-                const failedCount = (result.webResults || []).filter((tab) => !tab.success).length
+                const skippedCount = (result.webResults || []).filter((tab) => tab.skipped).length
+                const failedCount = (result.webResults || []).filter((tab) => !tab.success && !tab.skipped).length
                 setSessionWarning(
                     failedCount > 0
                         ? `${failedCount} tab${failedCount === 1 ? '' : 's'} failed to load. Reload manually before saving.`
+                        : skippedCount > 0
+                            ? `${skippedCount} browser-owned tab${skippedCount === 1 ? '' : 's'} will be skipped when you save.`
                         : 'Browser opened, but one or more tabs failed to load. Reload manually before saving.'
                 )
             }
@@ -148,6 +153,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
         const result = await window.omnilaunch.captureSession({ masterPassword: isRemovable ? hiddenMasterPassword : masterPassword })
         if (result.success) {
             setCapturedCount(result.tabCount)
+            setCapturedSkippedCount(result.skippedCount || 0)
             setCapturedUrls(result.urls || [])
             setSessionState('complete')
             // Show success briefly, then complete setup
@@ -524,6 +530,11 @@ export default function SetupScreen({ driveInfo, onComplete }) {
                             <p className="text-xs text-secondary mt-1">
                                 {capturedCount} tab{capturedCount !== 1 ? 's' : ''} saved and encrypted
                             </p>
+                            {capturedSkippedCount > 0 && (
+                                <p className="text-xs text-[#d4a44a] mt-1">
+                                    {capturedSkippedCount} browser-owned tab{capturedSkippedCount === 1 ? '' : 's'} skipped
+                                </p>
+                            )}
                             <div className="mt-3 space-y-1">
                                 {capturedUrls.slice(0, 5).map((url, i) => (
                                     <p key={i} className="text-xs text-muted truncate">{url}</p>

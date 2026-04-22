@@ -148,6 +148,10 @@ function mergeFailedItem(existing, nextFailure) {
     return updated
 }
 
+function mergeSkippedItem(existing, nextSkipped) {
+    return mergeFailedItem(existing, nextSkipped)
+}
+
 function mergeNoticeItem(existing, nextNotice) {
     if (!nextNotice?.noticeKey) return existing
 
@@ -164,6 +168,10 @@ function removeFailureByKey(existing, itemKey) {
     return existing.filter((item) => item.itemKey !== itemKey)
 }
 
+function removeSkippedByKey(existing, itemKey) {
+    return removeFailureByKey(existing, itemKey)
+}
+
 function removeLoadedByKey(existing, itemKey) {
     if (!itemKey) return existing
     return existing.filter((item) => item.itemKey !== itemKey)
@@ -174,10 +182,11 @@ function removeNoticesByItemKey(existing, itemKey) {
     return existing.filter((notice) => notice.itemKey !== itemKey)
 }
 
-function reconcileFinalNotices(existing, finalLoaded, finalFailed) {
+function reconcileFinalNotices(existing, finalLoaded, finalFailed, finalSkipped = []) {
     const resolvedKeys = new Set([
         ...finalLoaded.map((item) => item.itemKey).filter(Boolean),
-        ...finalFailed.map((item) => item.itemKey).filter(Boolean)
+        ...finalFailed.map((item) => item.itemKey).filter(Boolean),
+        ...finalSkipped.map((item) => item.itemKey).filter(Boolean)
     ])
 
     return existing.filter((notice) => !notice.itemKey || !resolvedKeys.has(notice.itemKey))
@@ -189,6 +198,7 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
     const [totalItems, setTotalItems] = useState(0)
     const [loadedItems, setLoadedItems] = useState([])
     const [failedItems, setFailedItems] = useState([])
+    const [skippedItems, setSkippedItems] = useState([])
     const [notices, setNotices] = useState([])
     const [liveStatus, setLiveStatus] = useState('Preparing workspace...')
     const [errorMsg, setErrorMsg] = useState(null)
@@ -199,6 +209,7 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
     useEffect(() => {
         setLoadedItems([])
         setFailedItems([])
+        setSkippedItems([])
         setNotices([])
         setLiveStatus('Preparing workspace...')
         setErrorMsg(null)
@@ -211,9 +222,9 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
             setProgress(100)
             return
         }
-        const processed = loadedItems.length + failedItems.length
+        const processed = loadedItems.length + failedItems.length + skippedItems.length
         setProgress(Math.min(100, Math.round((processed / totalItems) * 100)))
-    }, [loadedItems, failedItems, totalItems])
+    }, [loadedItems, failedItems, skippedItems, totalItems])
 
     useEffect(() => {
         if (!workspace) return
@@ -245,6 +256,7 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
             const successItem = parseSuccessItem(message)
             if (successItem) {
                 setFailedItems((prev) => removeFailureByKey(prev, successItem.itemKey))
+                setSkippedItems((prev) => removeSkippedByKey(prev, successItem.itemKey))
                 setNotices((prev) => removeNoticesByItemKey(prev, successItem.itemKey))
                 setLoadedItems((prev) => mergeLoadedItem(prev, successItem))
                 return
@@ -254,7 +266,13 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
             if (failureItem) {
                 setLoadedItems((prev) => removeLoadedByKey(prev, failureItem.itemKey))
                 setNotices((prev) => removeNoticesByItemKey(prev, failureItem.itemKey))
-                setFailedItems((prev) => mergeFailedItem(prev, failureItem))
+                if (/^Skipped\b/i.test(failureItem.reason || '')) {
+                    setFailedItems((prev) => removeFailureByKey(prev, failureItem.itemKey))
+                    setSkippedItems((prev) => mergeSkippedItem(prev, failureItem))
+                } else {
+                    setSkippedItems((prev) => removeSkippedByKey(prev, failureItem.itemKey))
+                    setFailedItems((prev) => mergeFailedItem(prev, failureItem))
+                }
                 return
             }
 
@@ -273,6 +291,7 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
 
             const finalLoaded = []
             const finalFailed = []
+            const finalSkipped = []
             const webResults = result.results?.webResults || []
             const appResults = result.results?.appResults || []
 
@@ -281,7 +300,12 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
                     const finalItem = buildResultLaunchItem(item, index, fallbackType)
                     if (!finalItem) continue
 
-                    if (item.success) {
+                    if (item.skipped) {
+                        finalSkipped.push({
+                            ...finalItem,
+                            reason: item.error || item.reason || 'Skipped'
+                        })
+                    } else if (item.success) {
                         finalLoaded.push(finalItem)
                     } else {
                         finalFailed.push({
@@ -297,10 +321,17 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
 
             setLoadedItems(finalLoaded)
             setFailedItems(finalFailed)
-            setNotices((prev) => reconcileFinalNotices(prev, finalLoaded, finalFailed))
+            setSkippedItems(finalSkipped)
+            setNotices((prev) => reconcileFinalNotices(prev, finalLoaded, finalFailed, finalSkipped))
             setPhase('ready')
             setProgress(100)
-            setLiveStatus(finalFailed.length > 0 ? 'Workspace finished with some failures.' : 'Workspace launch complete.')
+            setLiveStatus(
+                finalFailed.length > 0
+                    ? 'Workspace finished with some failures.'
+                    : finalSkipped.length > 0
+                        ? 'Workspace launch complete. Some browser-owned pages were skipped.'
+                        : 'Workspace launch complete.'
+            )
         })
 
         window.omnilaunch.launchWorkspace(workspace).catch((err) => {
@@ -336,17 +367,22 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
 
     const statusSummary = useMemo(() => {
         if (failedItems.length > 0) {
-            return `${loadedItems.length} loaded, ${failedItems.length} failed`
+            return `${loadedItems.length} loaded, ${failedItems.length} failed${skippedItems.length > 0 ? `, ${skippedItems.length} skipped` : ''}`
+        }
+        if (skippedItems.length > 0) {
+            return `${loadedItems.length} loaded, ${skippedItems.length} skipped`
         }
         return `${loadedItems.length} of ${totalItems} items loaded`
-    }, [loadedItems.length, failedItems.length, totalItems])
+    }, [loadedItems.length, failedItems.length, skippedItems.length, totalItems])
 
     const readyTitle = failedItems.length > 0 ? 'Workspace Partially Ready' : 'Workspace Ready'
     const readySubtitle = failedItems.length > 0
-        ? `${loadedItems.length} launched, ${failedItems.length} failed`
-        : loadedItems.length > 0
-            ? `${loadedItems.length} item${loadedItems.length !== 1 ? 's' : ''} launched`
-            : 'All set'
+        ? `${loadedItems.length} launched, ${failedItems.length} failed${skippedItems.length > 0 ? `, ${skippedItems.length} skipped` : ''}`
+        : skippedItems.length > 0
+            ? `${loadedItems.length} launched, ${skippedItems.length} skipped`
+            : loadedItems.length > 0
+                ? `${loadedItems.length} item${loadedItems.length !== 1 ? 's' : ''} launched`
+                : 'All set'
 
     return (
         <>
@@ -425,6 +461,25 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
                                 </div>
                             )}
 
+                            {skippedItems.length > 0 && (
+                                <div className="pt-2 border-t border-[#2a2432] space-y-2">
+                                    <p className="text-xs font-medium text-[#d4a44a]">Skipped items</p>
+                                    {skippedItems.map((item, i) => (
+                                        <div key={item.itemKey || `skip-${i}`} className="flex items-start gap-2 animate-fade-in">
+                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#d4a44a" strokeWidth="2.5" strokeLinecap="round">
+                                                <circle cx="12" cy="12" r="9" />
+                                                <line x1="12" y1="8" x2="12" y2="13" />
+                                                <circle cx="12" cy="16.5" r="0.8" fill="#d4a44a" stroke="none" />
+                                            </svg>
+                                            <div className="min-w-0">
+                                                <div className="text-xs text-white truncate">{cleanDisplayLabel(item.label)}</div>
+                                                <div className="text-[10px] text-[#d4a44a] break-words">{item.reason}</div>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+
                             {notices.length > 0 && (
                                 <div className="pt-2 border-t border-[#232335] space-y-1.5">
                                     <p className="text-xs font-medium text-[#9ab0ff]">Notes</p>
@@ -462,7 +517,7 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
                             <p className="text-secondary text-xs mt-1">{readySubtitle}</p>
                         </div>
 
-                        {(loadedItems.length > 0 || failedItems.length > 0) && (
+                        {(loadedItems.length > 0 || failedItems.length > 0 || skippedItems.length > 0) && (
                             <div className="mb-4 p-3 rounded-lg bg-[#14141c]" style={{ maxHeight: 180, overflowY: 'auto' }}>
                                 <div className="space-y-2">
                                     {loadedItems.map((item, i) => (
@@ -473,6 +528,22 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
                                                 </svg>
                                             </div>
                                             <span className="text-xs text-white truncate">{cleanDisplayLabel(item.label)}</span>
+                                        </div>
+                                    ))}
+
+                                    {skippedItems.map((item, i) => (
+                                        <div key={item.itemKey || `ready-skip-${i}`} className="flex items-start gap-2.5">
+                                            <div className="w-5 h-5 rounded flex items-center justify-center flex-shrink-0" style={{ background: '#2a2416' }}>
+                                                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#d4a44a" strokeWidth="2.5" strokeLinecap="round">
+                                                    <line x1="12" y1="7" x2="12" y2="13" />
+                                                    <circle cx="12" cy="17" r="0.8" fill="#d4a44a" stroke="none" />
+                                                    <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                                                </svg>
+                                            </div>
+                                            <div className="min-w-0">
+                                                <div className="text-xs text-white truncate">{cleanDisplayLabel(item.label)}</div>
+                                                <div className="text-[10px] text-[#d4a44a] break-words">{item.reason}</div>
+                                            </div>
                                         </div>
                                     ))}
 
