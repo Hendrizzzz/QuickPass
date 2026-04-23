@@ -27,6 +27,7 @@ import crypto from 'crypto'
 import {
     isDangerousExecutablePath,
     normalizeManifestProfiles,
+    pickSupportFields,
     parseVaultAppPath,
     readAppManifest,
     resolveImportedAppDataCapability,
@@ -745,6 +746,7 @@ function ensureAppDiagnosticInActiveCycle(appObj) {
 }
 
 function createAppDiagnostic(appConfig, attemptedPath) {
+    const supportFields = pickSupportFields(appConfig)
     return {
         name: appConfig.name,
         pid: null,
@@ -774,6 +776,25 @@ function createAppDiagnostic(appConfig, attemptedPath) {
         manifestId: appConfig.manifestId || null,
         launchProfile: appConfig.launchProfile || null,
         dataProfile: appConfig.dataProfile || null,
+        supportTier: supportFields.supportTier || null,
+        supportSummary: supportFields.supportSummary || null,
+        adapterEvidence: supportFields.adapterEvidence || null,
+        launchSourceType: supportFields.launchSourceType || null,
+        launchMethod: supportFields.launchMethod || null,
+        ownershipProofLevel: supportFields.ownershipProofLevel || null,
+        closePolicy: supportFields.closePolicy || null,
+        canQuitFromOmniLaunch: supportFields.canQuitFromOmniLaunch ?? null,
+        availabilityStatus: supportFields.availabilityStatus || null,
+        dataManagement: supportFields.dataManagement || null,
+        requiresElevation: supportFields.requiresElevation ?? null,
+        resolvedAt: supportFields.resolvedAt || null,
+        resolvedHostId: supportFields.resolvedHostId || null,
+        launchAdapter: supportFields.launchAdapter || null,
+        runtimeAdapter: supportFields.runtimeAdapter || null,
+        dataAdapters: supportFields.dataAdapters || [],
+        registryAdapters: supportFields.registryAdapters || [],
+        limitations: supportFields.limitations || [],
+        certification: supportFields.certification || null,
         runtimeProfilePath: null,
         runtimeProfileIsolated: false,
         runtimeProfileSynced: false,
@@ -3150,6 +3171,7 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
                 manifestId: manifest.manifestId || appConfig.manifestId || null,
                 launchProfile: manifest.launchProfile || appConfig.launchProfile || null,
                 dataProfile: manifest.dataProfile || appConfig.dataProfile || null,
+                ...pickSupportFields(manifest),
                 readinessProfile: manifest.readinessProfile || appConfig.readinessProfile || null,
                 readiness: createReadinessDiagnostic(manifest.readinessProfile || appConfig.readinessProfile),
                 binaryArchivePolicyVersion: manifest.binaryArchivePolicyVersion ?? appConfig.binaryArchivePolicyVersion ?? null,

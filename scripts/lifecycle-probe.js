@@ -10,13 +10,22 @@ import {
 } from 'fs'
 import { join } from 'path'
 import {
+    ADAPTER_EVIDENCE_LEVELS,
+    APP_MANIFEST_SCHEMA_VERSION,
     createImportManifest,
+    DATA_MANAGEMENT_LEVELS,
     getManifestPath,
+    LAUNCH_SOURCE_TYPES,
     repairLegacyAppConfig,
     resolveImportedAppDataCapability,
     safeAppName,
     writeAppManifest
 } from '../src/main/appManifest.js'
+import {
+    APP_ADAPTER_IDS,
+    SUPPORT_TIERS,
+    resolveAppCapability
+} from '../src/main/appAdapters.js'
 import {
     findStaleUnsupportedAppDataPayloads,
     isSafePayloadDirectory,
@@ -75,6 +84,110 @@ async function runProbe(name, fn) {
 
 try {
     console.log('Starting QuickPass lifecycle probes...\n')
+
+    await runProbe('app capability resolver keeps golden adapter classifications stable', async () => {
+        const edge = resolveAppCapability({
+            appType: 'chromium',
+            appName: 'Microsoft Edge',
+            launchProfile: 'chromium-browser',
+            dataProfile: { mode: 'chromium-user-data' }
+        })
+        assert.equal(edge.supportTier, SUPPORT_TIERS.VERIFIED)
+        assert.equal(edge.importedDataSupported, true)
+        assert.equal(edge.importedDataAdapterId, APP_ADAPTER_IDS.CHROMIUM_USER_DATA_DIR)
+        assert.equal(edge.runtimeAdapter, APP_ADAPTER_IDS.CHROMIUM_USER_DATA_DIR)
+
+        const cursor = resolveAppCapability({
+            appType: 'vscode-family',
+            appName: 'Cursor',
+            launchProfile: 'vscode-family',
+            dataProfile: { mode: 'vscode-user-data' }
+        })
+        assert.equal(cursor.supportTier, SUPPORT_TIERS.VERIFIED)
+        assert.equal(cursor.importedDataSupported, true)
+        assert.equal(cursor.importedDataAdapterId, APP_ADAPTER_IDS.VSCODE_USER_DATA_DIR)
+        assert.equal(cursor.runtimeAdapter, APP_ADAPTER_IDS.VSCODE_USER_DATA_DIR)
+
+        const discord = resolveAppCapability({
+            appType: 'electron',
+            appName: 'Discord',
+            launchProfile: 'electron-standard',
+            dataProfile: { mode: 'electron-user-data' }
+        })
+        assert.equal(discord.supportTier, SUPPORT_TIERS.BEST_EFFORT)
+        assert.equal(discord.importedDataSupported, false)
+        assert.equal(discord.importedDataAdapterId, APP_ADAPTER_IDS.ELECTRON_USER_DATA_DIR)
+        assert.equal(discord.runtimeAdapter, APP_ADAPTER_IDS.ELECTRON_USER_DATA_DIR)
+
+        const nativeApp = resolveAppCapability({
+            appType: 'native',
+            appName: 'Subtitle Edit',
+            launchProfile: 'native-windowed',
+            dataProfile: { mode: 'none' }
+        })
+        assert.equal(nativeApp.supportTier, SUPPORT_TIERS.LAUNCH_ONLY)
+        assert.equal(nativeApp.importedDataSupported, false)
+        assert.equal(nativeApp.importedDataAdapterId, APP_ADAPTER_IDS.NONE)
+        assert.equal(nativeApp.runtimeAdapter, APP_ADAPTER_IDS.NONE)
+
+        const obs = resolveAppCapability({
+            appType: 'native',
+            appName: 'OBS Studio',
+            launchProfile: 'native-windowed',
+            dataProfile: { mode: 'none' }
+        })
+        assert.equal(obs.supportTier, SUPPORT_TIERS.NEEDS_ADAPTER)
+        assert.equal(obs.importedDataSupported, false)
+        assert.equal(obs.importedDataAdapterId, APP_ADAPTER_IDS.NONE)
+        assert.equal(obs.launchAdapter, APP_ADAPTER_IDS.OBS_PORTABLE)
+    })
+
+    await runProbe('Manifest V2 emits support fields for golden app families', async () => {
+        const makeGoldenManifest = (displayName, appType, importData = true) => createImportManifest({
+            displayName,
+            safeName: safeAppName(displayName),
+            sourcePath: `C:\\Probe\\${safeAppName(displayName)}`,
+            archiveName: `${safeAppName(displayName)}.tar.zst`,
+            archiveRoot: displayName,
+            selectedExecutable: { relativePath: 'app.exe', confidence: 'high' },
+            candidateExecutables: [],
+            appType,
+            importData,
+            archiveHash: 'probe',
+            archiveSizeBytes: 1,
+            requiredFiles: []
+        })
+
+        const edge = makeGoldenManifest('Microsoft Edge', 'chromium')
+        assert.equal(edge.schemaVersion, APP_MANIFEST_SCHEMA_VERSION)
+        assert.equal(edge.supportTier, SUPPORT_TIERS.VERIFIED)
+        assert.equal(edge.adapterEvidence, ADAPTER_EVIDENCE_LEVELS.FAMILY_VERIFIED)
+        assert.equal(edge.launchSourceType, LAUNCH_SOURCE_TYPES.VAULT_ARCHIVE)
+        assert.equal(edge.dataManagement, DATA_MANAGEMENT_LEVELS.MANAGED)
+        assert.equal(edge.importedDataAdapterId, APP_ADAPTER_IDS.CHROMIUM_USER_DATA_DIR)
+
+        const cursor = makeGoldenManifest('Cursor', 'vscode-family')
+        assert.equal(cursor.supportTier, SUPPORT_TIERS.VERIFIED)
+        assert.equal(cursor.adapterEvidence, ADAPTER_EVIDENCE_LEVELS.FAMILY_VERIFIED)
+        assert.equal(cursor.importedDataAdapterId, APP_ADAPTER_IDS.VSCODE_USER_DATA_DIR)
+
+        const discord = makeGoldenManifest('Discord', 'electron')
+        assert.equal(discord.supportTier, SUPPORT_TIERS.BEST_EFFORT)
+        assert.equal(discord.dataProfile.mode, 'none')
+        assert.equal(discord.dataManagement, DATA_MANAGEMENT_LEVELS.UNMANAGED)
+        assert.equal(discord.importedDataSupported, false)
+
+        const nativeApp = makeGoldenManifest('Subtitle Edit', 'native', false)
+        assert.equal(nativeApp.supportTier, SUPPORT_TIERS.LAUNCH_ONLY)
+        assert.equal(nativeApp.dataManagement, DATA_MANAGEMENT_LEVELS.UNMANAGED)
+        assert.equal(nativeApp.importedDataSupported, false)
+
+        const obs = makeGoldenManifest('OBS Studio', 'native', false)
+        assert.equal(obs.supportTier, SUPPORT_TIERS.NEEDS_ADAPTER)
+        assert.equal(obs.launchAdapter, APP_ADAPTER_IDS.OBS_PORTABLE)
+        assert.equal(obs.dataManagement, DATA_MANAGEMENT_LEVELS.UNSUPPORTED)
+        assert.equal(obs.importedDataSupported, false)
+    })
 
     await runProbe('generic Electron import manifest normalizes imported AppData to none', async () => {
         const manifest = createImportManifest({

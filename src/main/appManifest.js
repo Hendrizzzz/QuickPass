@@ -2,9 +2,83 @@ import { createReadStream, existsSync, readdirSync, readFileSync, statSync, writ
 import { join, relative, resolve, basename, extname } from 'path'
 import { execFileSync } from 'child_process'
 import crypto from 'crypto'
+import { resolveAppCapability, SUPPORT_TIERS } from './appAdapters.js'
 
-export const APP_MANIFEST_SCHEMA_VERSION = 1
+export const APP_MANIFEST_SCHEMA_VERSION = 2
 export const BINARY_ARCHIVE_POLICY_VERSION = 2
+
+export const ADAPTER_EVIDENCE_LEVELS = Object.freeze({
+    FAMILY_VERIFIED: 'family-verified',
+    APP_CERTIFIED: 'app-certified',
+    EXPERIMENTAL: 'experimental',
+    NONE: 'none'
+})
+
+export const LAUNCH_SOURCE_TYPES = Object.freeze({
+    VAULT_ARCHIVE: 'vault-archive',
+    VAULT_DIRECTORY: 'vault-directory',
+    HOST_EXE: 'host-exe',
+    REGISTRY_UNINSTALL: 'registry-uninstall',
+    APP_PATHS: 'app-paths',
+    START_MENU_SHORTCUT: 'start-menu-shortcut',
+    SHELL_EXECUTE: 'shell-execute',
+    PROTOCOL_URI: 'protocol-uri',
+    PACKAGED_APP: 'packaged-app'
+})
+
+export const LAUNCH_METHODS = Object.freeze({
+    SPAWN: 'spawn',
+    SHELL_EXECUTE: 'shell-execute',
+    PROTOCOL: 'protocol',
+    PACKAGED_APP: 'packaged-app',
+    UNKNOWN: 'unknown'
+})
+
+export const OWNERSHIP_PROOF_LEVELS = Object.freeze({
+    STRONG: 'strong',
+    MEDIUM: 'medium',
+    WEAK: 'weak',
+    NONE: 'none'
+})
+
+export const CLOSE_POLICIES = Object.freeze({
+    NEVER: 'never',
+    OWNED_PROCESS_ONLY: 'owned-process-only',
+    OWNED_TREE: 'owned-tree',
+    ADAPTER_DEFINED: 'adapter-defined'
+})
+
+export const DATA_MANAGEMENT_LEVELS = Object.freeze({
+    MANAGED: 'managed',
+    UNMANAGED: 'unmanaged',
+    UNSUPPORTED: 'unsupported'
+})
+
+export const SUPPORT_FIELD_NAMES = Object.freeze([
+    'supportTier',
+    'supportSummary',
+    'adapterEvidence',
+    'launchSourceType',
+    'launchMethod',
+    'ownershipProofLevel',
+    'closePolicy',
+    'canQuitFromOmniLaunch',
+    'availabilityStatus',
+    'dataManagement',
+    'requiresElevation',
+    'resolvedAt',
+    'resolvedHostId',
+    'launchAdapter',
+    'runtimeAdapter',
+    'dataAdapters',
+    'registryAdapters',
+    'limitations',
+    'certification',
+    'importedDataSupported',
+    'importedDataSupportLevel',
+    'importedDataAdapterId',
+    'importedDataSupportReason'
+])
 
 export const APPDATA_SKIP_DIRS = new Set([
     'CachedData', 'Cache', 'Code Cache', 'GPUCache',
@@ -424,41 +498,18 @@ export function resolveImportedAppDataCapability({
     dataProfile
 } = {}) {
     const inferred = inferProfiles(appType || 'native', appName || '')
-    const effectiveLaunchProfile = String(launchProfile || inferred.launchProfile || 'native-windowed').toLowerCase()
-    const dataMode = String(dataProfile?.mode || inferred.dataProfile?.mode || 'none').toLowerCase()
-
-    if (effectiveLaunchProfile === 'chromium-browser' || dataMode === 'chromium-user-data') {
-        return {
-            importedDataSupported: true,
-            importedDataSupportLevel: IMPORTED_APPDATA_SUPPORT_LEVELS.VERIFIED,
-            importedDataAdapterId: 'chromium-user-data-dir',
-            importedDataSupportReason: 'Verified Chromium/Edge imported AppData adapter.'
-        }
-    }
-
-    if (effectiveLaunchProfile === 'vscode-family' || dataMode === 'vscode-user-data') {
-        return {
-            importedDataSupported: true,
-            importedDataSupportLevel: IMPORTED_APPDATA_SUPPORT_LEVELS.VERIFIED,
-            importedDataAdapterId: 'vscode-user-data-dir',
-            importedDataSupportReason: 'Verified VS Code-family imported AppData adapter.'
-        }
-    }
-
-    if (effectiveLaunchProfile === 'electron-standard' || dataMode === 'electron-user-data' || appType === 'electron') {
-        return {
-            importedDataSupported: false,
-            importedDataSupportLevel: IMPORTED_APPDATA_SUPPORT_LEVELS.UNSUPPORTED,
-            importedDataAdapterId: 'electron-user-data-dir',
-            importedDataSupportReason: 'Imported AppData is not verified for generic Electron apps. Launch-only isolation is best-effort.'
-        }
-    }
+    const capability = resolveAppCapability({
+        appType,
+        appName,
+        launchProfile: launchProfile || inferred.launchProfile,
+        dataProfile: dataProfile || inferred.dataProfile
+    })
 
     return {
-        importedDataSupported: false,
-        importedDataSupportLevel: IMPORTED_APPDATA_SUPPORT_LEVELS.UNSUPPORTED,
-        importedDataAdapterId: 'none',
-        importedDataSupportReason: 'Imported AppData is supported only for Chromium/Edge and VS Code-family profiles.'
+        importedDataSupported: capability.importedDataSupported,
+        importedDataSupportLevel: capability.importedDataSupportLevel,
+        importedDataAdapterId: capability.importedDataAdapterId,
+        importedDataSupportReason: capability.importedDataSupportReason
     }
 }
 
@@ -476,6 +527,166 @@ export function resolveManifestDataProfile(appType, appName, importData) {
     return importData && capability.importedDataSupported
         ? profiles.dataProfile
         : { mode: 'none' }
+}
+
+function defaultAdapterEvidence(supportTier) {
+    if (supportTier === SUPPORT_TIERS.VERIFIED) return ADAPTER_EVIDENCE_LEVELS.FAMILY_VERIFIED
+    if (supportTier === SUPPORT_TIERS.BEST_EFFORT) return ADAPTER_EVIDENCE_LEVELS.EXPERIMENTAL
+    return ADAPTER_EVIDENCE_LEVELS.NONE
+}
+
+function inferManifestLaunchSource(manifest) {
+    if (manifest?.launchSourceType) return manifest.launchSourceType
+    if (manifest?.archiveName) return LAUNCH_SOURCE_TYPES.VAULT_ARCHIVE
+    return LAUNCH_SOURCE_TYPES.VAULT_DIRECTORY
+}
+
+function defaultOwnershipProofLevel(launchSourceType, launchMethod) {
+    if (launchMethod === LAUNCH_METHODS.PROTOCOL ||
+        launchMethod === LAUNCH_METHODS.PACKAGED_APP ||
+        launchSourceType === LAUNCH_SOURCE_TYPES.PROTOCOL_URI ||
+        launchSourceType === LAUNCH_SOURCE_TYPES.PACKAGED_APP) {
+        return OWNERSHIP_PROOF_LEVELS.NONE
+    }
+
+    if (launchMethod === LAUNCH_METHODS.SHELL_EXECUTE ||
+        launchSourceType === LAUNCH_SOURCE_TYPES.SHELL_EXECUTE ||
+        launchSourceType === LAUNCH_SOURCE_TYPES.START_MENU_SHORTCUT) {
+        return OWNERSHIP_PROOF_LEVELS.WEAK
+    }
+
+    if (launchSourceType === LAUNCH_SOURCE_TYPES.VAULT_ARCHIVE ||
+        launchSourceType === LAUNCH_SOURCE_TYPES.VAULT_DIRECTORY) {
+        return OWNERSHIP_PROOF_LEVELS.STRONG
+    }
+
+    return OWNERSHIP_PROOF_LEVELS.MEDIUM
+}
+
+function closePolicyForOwnership(ownershipProofLevel) {
+    if (ownershipProofLevel === OWNERSHIP_PROOF_LEVELS.STRONG) return CLOSE_POLICIES.OWNED_TREE
+    if (ownershipProofLevel === OWNERSHIP_PROOF_LEVELS.MEDIUM) return CLOSE_POLICIES.OWNED_PROCESS_ONLY
+    return CLOSE_POLICIES.NEVER
+}
+
+function dataManagementForCapability(capability, dataProfile) {
+    const dataMode = String(dataProfile?.mode || capability?.dataMode || 'none').toLowerCase()
+    if (!dataMode || dataMode === 'none') {
+        return capability?.supportTier === SUPPORT_TIERS.NEEDS_ADAPTER
+            ? DATA_MANAGEMENT_LEVELS.UNSUPPORTED
+            : DATA_MANAGEMENT_LEVELS.UNMANAGED
+    }
+
+    return capability?.importedDataSupported
+        ? DATA_MANAGEMENT_LEVELS.MANAGED
+        : DATA_MANAGEMENT_LEVELS.UNSUPPORTED
+}
+
+function normalizeCertification(certification) {
+    const status = ['uncertified', 'verified', 'failed'].includes(certification?.status)
+        ? certification.status
+        : 'uncertified'
+
+    return {
+        status,
+        lastCheckedAt: certification?.lastCheckedAt || null,
+        checks: Array.isArray(certification?.checks) ? certification.checks.map(check => ({ ...check })) : []
+    }
+}
+
+export function resolveManifestSupportFields({
+    appType,
+    appName,
+    launchProfile,
+    dataProfile,
+    adapterEvidence,
+    launchSourceType = LAUNCH_SOURCE_TYPES.VAULT_ARCHIVE,
+    launchMethod = LAUNCH_METHODS.SPAWN,
+    ownershipProofLevel,
+    closePolicy,
+    canQuitFromOmniLaunch,
+    availabilityStatus,
+    dataManagement,
+    requiresElevation,
+    resolvedAt,
+    resolvedHostId,
+    launchAdapter,
+    runtimeAdapter,
+    dataAdapters,
+    registryAdapters,
+    limitations,
+    certification
+} = {}) {
+    const capability = resolveAppCapability({
+        appType,
+        appName,
+        launchProfile,
+        dataProfile
+    })
+    const resolvedLaunchSourceType = launchSourceType || LAUNCH_SOURCE_TYPES.VAULT_ARCHIVE
+    const resolvedLaunchMethod = launchMethod || LAUNCH_METHODS.SPAWN
+    const resolvedOwnership = ownershipProofLevel || defaultOwnershipProofLevel(resolvedLaunchSourceType, resolvedLaunchMethod)
+    const resolvedClosePolicy = closePolicy || closePolicyForOwnership(resolvedOwnership)
+    const resolvedAdapterEvidence = Object.values(ADAPTER_EVIDENCE_LEVELS).includes(adapterEvidence)
+        ? adapterEvidence
+        : defaultAdapterEvidence(capability.supportTier)
+    const resolvedCanQuit = typeof canQuitFromOmniLaunch === 'boolean'
+        ? canQuitFromOmniLaunch
+        : resolvedClosePolicy !== CLOSE_POLICIES.NEVER
+    const resolvedDataManagement = Object.values(DATA_MANAGEMENT_LEVELS).includes(dataManagement)
+        ? dataManagement
+        : dataManagementForCapability(capability, dataProfile || capability.dataProfile)
+    const resolvedLimitations = Array.isArray(limitations)
+        ? limitations
+        : (Array.isArray(capability.limitations) ? capability.limitations : [])
+
+    return {
+        supportTier: capability.supportTier,
+        supportSummary: capability.supportSummary,
+        adapterEvidence: resolvedAdapterEvidence,
+        launchSourceType: resolvedLaunchSourceType,
+        launchMethod: resolvedLaunchMethod,
+        ownershipProofLevel: resolvedOwnership,
+        closePolicy: resolvedClosePolicy,
+        canQuitFromOmniLaunch: resolvedCanQuit,
+        availabilityStatus: availabilityStatus || 'available',
+        dataManagement: resolvedDataManagement,
+        requiresElevation: typeof requiresElevation === 'boolean' ? requiresElevation : false,
+        resolvedAt: resolvedAt || null,
+        resolvedHostId: resolvedHostId || null,
+        launchAdapter: launchAdapter || capability.launchAdapter || 'none',
+        runtimeAdapter: runtimeAdapter || capability.runtimeAdapter || 'none',
+        dataAdapters: Array.isArray(dataAdapters) ? [...dataAdapters] : [],
+        registryAdapters: Array.isArray(registryAdapters) ? [...registryAdapters] : [],
+        limitations: [...resolvedLimitations],
+        certification: normalizeCertification(certification),
+        importedDataSupported: capability.importedDataSupported,
+        importedDataSupportLevel: capability.importedDataSupportLevel,
+        importedDataAdapterId: capability.importedDataAdapterId,
+        importedDataSupportReason: capability.importedDataSupportReason
+    }
+}
+
+export function pickSupportFields(source = {}) {
+    const picked = {}
+    for (const fieldName of SUPPORT_FIELD_NAMES) {
+        if (source[fieldName] === undefined) continue
+        if (Array.isArray(source[fieldName])) {
+            picked[fieldName] = [...source[fieldName]]
+        } else if (source[fieldName] && typeof source[fieldName] === 'object') {
+            picked[fieldName] = JSON.parse(JSON.stringify(source[fieldName]))
+        } else {
+            picked[fieldName] = source[fieldName]
+        }
+    }
+    return picked
+}
+
+function supportSnapshot(source = {}) {
+    return {
+        schemaVersion: source.schemaVersion,
+        ...pickSupportFields(source)
+    }
 }
 
 function hasRelativePath(relativePaths, relPath) {
@@ -566,7 +777,10 @@ function isMicrosoftEdgeManifest(manifest) {
 export function normalizeManifestProfiles(manifest) {
     if (!manifest || typeof manifest !== 'object') return { manifest, changed: false }
 
-    const nextManifest = { ...manifest }
+    const nextManifest = {
+        ...manifest,
+        schemaVersion: APP_MANIFEST_SCHEMA_VERSION
+    }
 
     if (isMicrosoftEdgeManifest(manifest)) {
         const profiles = inferProfiles('chromium', manifest.displayName || 'Microsoft Edge')
@@ -599,20 +813,49 @@ export function normalizeManifestProfiles(manifest) {
         nextManifest.importedDataSupportReason = importedDataCapability.importedDataSupportReason
     }
 
+    const supportFields = resolveManifestSupportFields({
+        appType: nextManifest.appType,
+        appName: nextManifest.displayName || nextManifest.safeName,
+        launchProfile: nextManifest.launchProfile,
+        dataProfile: nextManifest.dataProfile,
+        adapterEvidence: nextManifest.adapterEvidence,
+        launchSourceType: inferManifestLaunchSource(nextManifest),
+        launchMethod: nextManifest.launchMethod || LAUNCH_METHODS.SPAWN,
+        ownershipProofLevel: nextManifest.ownershipProofLevel,
+        closePolicy: nextManifest.closePolicy,
+        canQuitFromOmniLaunch: nextManifest.canQuitFromOmniLaunch,
+        availabilityStatus: nextManifest.availabilityStatus,
+        dataManagement: nextManifest.dataManagement,
+        requiresElevation: nextManifest.requiresElevation,
+        resolvedAt: nextManifest.resolvedAt,
+        resolvedHostId: nextManifest.resolvedHostId,
+        launchAdapter: nextManifest.launchAdapter,
+        runtimeAdapter: nextManifest.runtimeAdapter,
+        dataAdapters: nextManifest.dataAdapters,
+        registryAdapters: nextManifest.registryAdapters,
+        limitations: nextManifest.limitations,
+        certification: nextManifest.certification
+    })
+    Object.assign(nextManifest, supportFields)
+
     const changed = JSON.stringify({
+        schemaVersion: manifest.schemaVersion,
         appType: manifest.appType,
         launchProfile: manifest.launchProfile,
         dataProfile: manifest.dataProfile,
         readinessProfile: manifest.readinessProfile,
         importedDataSupportLevel: manifest.importedDataSupportLevel,
-        importedDataSupportReason: manifest.importedDataSupportReason
+        importedDataSupportReason: manifest.importedDataSupportReason,
+        support: supportSnapshot(manifest)
     }) !== JSON.stringify({
+        schemaVersion: nextManifest.schemaVersion,
         appType: nextManifest.appType,
         launchProfile: nextManifest.launchProfile,
         dataProfile: nextManifest.dataProfile,
         readinessProfile: nextManifest.readinessProfile,
         importedDataSupportLevel: nextManifest.importedDataSupportLevel,
-        importedDataSupportReason: nextManifest.importedDataSupportReason
+        importedDataSupportReason: nextManifest.importedDataSupportReason,
+        support: supportSnapshot(nextManifest)
     })
 
     return { manifest: nextManifest, changed }
@@ -827,7 +1070,8 @@ export function repairLegacyAppConfig(appConfig, vaultDir, options = {}) {
                 manifestId: activeManifest.manifestId,
                 launchProfile: activeManifest.launchProfile,
                 dataProfile: activeManifest.dataProfile,
-                readinessProfile: activeManifest.readinessProfile
+                readinessProfile: activeManifest.readinessProfile,
+                ...pickSupportFields(activeManifest)
             }, activeManifest)
             return {
                 appConfig: normalizedConfig,
@@ -836,7 +1080,16 @@ export function repairLegacyAppConfig(appConfig, vaultDir, options = {}) {
                 reason: normalized.changed ? profileNormalizedReason : 'manifest-existing'
             }
         }
-        return { appConfig: { ...appConfig, manifestId: activeManifest.manifestId }, manifest: activeManifest, repaired: false, reason: 'manifest-no-safe-selection' }
+        return {
+            appConfig: {
+                ...appConfig,
+                manifestId: activeManifest.manifestId,
+                ...pickSupportFields(activeManifest)
+            },
+            manifest: activeManifest,
+            repaired: false,
+            reason: 'manifest-no-safe-selection'
+        }
     }
 
     const archivePath = join(vaultDir, 'Apps', `${parsedPath.appName}.tar.zst`)
@@ -869,7 +1122,8 @@ export function repairLegacyAppConfig(appConfig, vaultDir, options = {}) {
         manifestId: builtManifest.manifestId,
         launchProfile: builtManifest.launchProfile,
         dataProfile: builtManifest.dataProfile,
-        readinessProfile: builtManifest.readinessProfile
+        readinessProfile: builtManifest.readinessProfile,
+        ...pickSupportFields(builtManifest)
     }
     if (canAutoRepair) {
         repairedConfig.path = join(vaultDir, 'Apps', parsedPath.appName, selected)

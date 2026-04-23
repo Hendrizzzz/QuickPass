@@ -95,7 +95,36 @@ export default function ImportAppsModal({ onClose, onImportComplete }) {
 
     const canImportAppData = (app) => !!app?.dataPath && app.importedDataSupported !== false
 
+    const getSupportBadge = (app) => {
+        const tier = app?.supportTier || 'launch-only'
+        const badges = {
+            verified: {
+                label: app?.adapterEvidence === 'app-certified' ? 'Certified app' : 'Verified adapter',
+                className: 'bg-emerald-900/35 text-emerald-300 border-emerald-700/40'
+            },
+            'best-effort': {
+                label: 'Best effort',
+                className: 'bg-amber-900/30 text-amber-300 border-amber-700/40'
+            },
+            'launch-only': {
+                label: 'Launch only',
+                className: 'bg-slate-800/70 text-slate-300 border-slate-600/50'
+            },
+            'needs-adapter': {
+                label: 'Needs adapter',
+                className: 'bg-orange-900/35 text-orange-300 border-orange-700/40'
+            },
+            unsupported: {
+                label: 'Unsupported',
+                className: 'bg-red-900/35 text-red-300 border-red-700/40'
+            }
+        }
+
+        return badges[tier] || badges['launch-only']
+    }
+
     const getCompatibilityNote = (app) => {
+        if (app?.supportSummary) return app.supportSummary
         if (app.type === 'chromium') {
             return 'Login sessions may not transfer between PCs.'
         }
@@ -106,6 +135,11 @@ export default function ImportAppsModal({ onClose, onImportComplete }) {
             return 'Imported app data is not verified for generic Electron apps. Launch-only isolation is best-effort.'
         }
         return 'Launch only - app data is not portable.'
+    }
+
+    const getSupportLimitation = (app) => {
+        if (!Array.isArray(app?.limitations) || app.limitations.length === 0) return ''
+        return app.limitations[0]
     }
 
     const handleImport = async () => {
@@ -203,6 +237,8 @@ export default function ImportAppsModal({ onClose, onImportComplete }) {
                             {apps.map((app) => {
                                 const sel = selected[app.name]
                                 const isChecked = sel?.checked || false
+                                const supportBadge = getSupportBadge(app)
+                                const limitation = getSupportLimitation(app)
 
                                 return (
                                     <div key={app.name} className={`p-2.5 rounded-lg mb-1.5 border transition-colors ${isChecked ? 'bg-[#1a1a2e] border-[#3a3a5a]' : 'bg-[#14141c] border-[#2a2a3a]'}`}>
@@ -225,6 +261,9 @@ export default function ImportAppsModal({ onClose, onImportComplete }) {
                                                     <span className="px-1.5 py-0.5 rounded text-[9px] bg-[#1a1a2e] text-muted border border-[#2a2a3a] flex-shrink-0">
                                                         {app.type === 'electron' ? 'Electron' : app.type === 'chromium' ? 'Chromium' : app.type === 'vscode-family' ? 'VS Code' : 'Native'}
                                                     </span>
+                                                    <span className={`px-1.5 py-0.5 rounded text-[9px] border flex-shrink-0 ${supportBadge.className}`}>
+                                                        {supportBadge.label}
+                                                    </span>
                                                 </div>
                                             </div>
                                             <span className="text-xs text-muted flex-shrink-0">{formatSize(app.sizeMB)}</span>
@@ -235,6 +274,11 @@ export default function ImportAppsModal({ onClose, onImportComplete }) {
                                                 <p className="text-[11px] text-[#d4a44a] mb-2">
                                                     {getCompatibilityNote(app)}
                                                 </p>
+                                                {limitation && (
+                                                    <p className="text-[10px] text-muted mb-2">
+                                                        {limitation}
+                                                    </p>
+                                                )}
                                             </div>
                                         )}
 

@@ -76,6 +76,33 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         setShowAppForm(false)
     }
 
+    const getSupportBadge = (item) => {
+        const badges = {
+            verified: {
+                label: item?.adapterEvidence === 'app-certified' ? 'Certified app' : 'Verified adapter',
+                className: 'bg-emerald-900/35 text-emerald-300 border-emerald-700/40'
+            },
+            'best-effort': {
+                label: 'Best effort',
+                className: 'bg-amber-900/30 text-amber-300 border-amber-700/40'
+            },
+            'launch-only': {
+                label: 'Launch only',
+                className: 'bg-slate-800/70 text-slate-300 border-slate-600/50'
+            },
+            'needs-adapter': {
+                label: 'Needs adapter',
+                className: 'bg-orange-900/35 text-orange-300 border-orange-700/40'
+            },
+            unsupported: {
+                label: 'Unsupported',
+                className: 'bg-red-900/35 text-red-300 border-red-700/40'
+            }
+        }
+
+        return item?.supportTier ? badges[item.supportTier] : null
+    }
+
     const toggleItem = (list, setList, index) => {
         const updated = [...list]
         updated[index] = { ...updated[index], enabled: !updated[index].enabled }
@@ -474,26 +501,38 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                         <p className="text-muted text-xs text-center py-3">No apps or folders configured</p>
                     )}
 
-                    {desktopApps.map((dApp, i) => (
-                        <div key={dApp.id} className="list-item flex items-center gap-3 mb-2">
-                            <div
-                                className={`toggle-track ${dApp.enabled ? 'active' : ''}`}
-                                onClick={() => toggleItem(desktopApps, setDesktopApps, i)}
-                            >
-                                <div className="toggle-thumb" />
-                            </div>
-                            <div className="flex-1 min-w-0">
-                                <div className="flex items-center gap-1.5">
-                                    <p className="text-sm text-white truncate">{dApp.name}</p>
-                                    {dApp.portableData && (
-                                        <span className="px-1.5 py-0.5 rounded text-[10px] bg-blue-900/40 text-blue-400 border border-blue-800/40 flex-shrink-0">Portable</span>
+                    {desktopApps.map((dApp, i) => {
+                        const supportBadge = getSupportBadge(dApp)
+
+                        return (
+                            <div key={dApp.id} className="list-item flex items-center gap-3 mb-2">
+                                <div
+                                    className={`toggle-track ${dApp.enabled ? 'active' : ''}`}
+                                    onClick={() => toggleItem(desktopApps, setDesktopApps, i)}
+                                >
+                                    <div className="toggle-thumb" />
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                    <div className="flex items-center gap-1.5">
+                                        <p className="text-sm text-white truncate">{dApp.name}</p>
+                                        {dApp.portableData && (
+                                            <span className="px-1.5 py-0.5 rounded text-[10px] bg-blue-900/40 text-blue-400 border border-blue-800/40 flex-shrink-0">Portable</span>
+                                        )}
+                                        {supportBadge && (
+                                            <span className={`px-1.5 py-0.5 rounded text-[10px] border flex-shrink-0 ${supportBadge.className}`}>
+                                                {supportBadge.label}
+                                            </span>
+                                        )}
+                                    </div>
+                                    <p className="text-xs text-muted truncate">{dApp.path}</p>
+                                    {dApp.supportSummary && (
+                                        <p className="text-[10px] text-[#d4a44a] truncate">{dApp.supportSummary}</p>
                                     )}
                                 </div>
-                                <p className="text-xs text-muted truncate">{dApp.path}</p>
+                                <button className="btn-danger-text" onClick={() => setDesktopApps(desktopApps.filter((_, j) => j !== i))}>Remove</button>
                             </div>
-                            <button className="btn-danger-text" onClick={() => setDesktopApps(desktopApps.filter((_, j) => j !== i))}>Remove</button>
-                        </div>
-                    ))}
+                        )
+                    })}
 
                     {hasUnsavedAppChanges && (
                         <div className="mt-3 p-3 rounded-md border border-[#4d5a7d]/70 bg-[#111827]">

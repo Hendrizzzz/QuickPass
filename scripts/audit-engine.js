@@ -7,6 +7,7 @@ console.log('Starting QuickPass orchestration audit...\n')
 const engineCode = fs.readFileSync(join(process.cwd(), 'src/main/engine.js'), 'utf-8')
 const indexCode = fs.readFileSync(join(process.cwd(), 'src/main/index.js'), 'utf-8')
 const manifestCode = fs.readFileSync(join(process.cwd(), 'src/main/appManifest.js'), 'utf-8')
+const appAdaptersCode = fs.readFileSync(join(process.cwd(), 'src/main/appAdapters.js'), 'utf-8')
 const staleAppDataCode = fs.readFileSync(join(process.cwd(), 'src/main/staleAppData.js'), 'utf-8')
 const importAppsModalCode = fs.readFileSync(join(process.cwd(), 'src/renderer/src/components/ImportAppsModal.jsx'), 'utf-8')
 const dashboardCode = fs.readFileSync(join(process.cwd(), 'src/renderer/src/components/DashboardScreen.jsx'), 'utf-8')
@@ -84,6 +85,47 @@ runCheck('Imported AppData uses an explicit support matrix', () => {
         engineCode.includes('imported-data-unsupported') &&
         engineCode.includes('getUnsupportedImportedDataMessage'),
         'Expected imported AppData support to be centralized and enforced across UI, import, manifest creation, and launch.'
+    )
+})
+
+runCheck('App adapter resolver foundation is explicit and regression-covered', () => {
+    assert(
+        appAdaptersCode.includes('export const SUPPORT_TIERS') &&
+        appAdaptersCode.includes('export const APP_ADAPTER_IDS') &&
+        appAdaptersCode.includes('export function resolveAppCapability') &&
+        appAdaptersCode.includes("CHROMIUM_USER_DATA_DIR: 'chromium-user-data-dir'") &&
+        appAdaptersCode.includes("VSCODE_USER_DATA_DIR: 'vscode-user-data-dir'") &&
+        appAdaptersCode.includes("ELECTRON_USER_DATA_DIR: 'electron-user-data-dir'") &&
+        appAdaptersCode.includes("NATIVE_LAUNCH_ONLY: 'native-launch-only'") &&
+        appAdaptersCode.includes("OBS_PORTABLE: 'obs-portable'") &&
+        manifestCode.includes('resolveAppCapability') &&
+        manifestCode.includes("from './appAdapters.js'") &&
+        manifestCode.includes('const capability = resolveAppCapability') &&
+        fs.readFileSync(join(process.cwd(), 'scripts/lifecycle-probe.js'), 'utf-8').includes('app capability resolver keeps golden adapter classifications stable'),
+        'Expected a pure app adapter resolver with support tiers, adapter IDs, appManifest delegation, and lifecycle golden coverage.'
+    )
+})
+
+runCheck('Manifest V2 support metadata is visible without new app powers', () => {
+    const lifecycleProbeCode = fs.readFileSync(join(process.cwd(), 'scripts/lifecycle-probe.js'), 'utf-8')
+    assert(
+        manifestCode.includes('export const APP_MANIFEST_SCHEMA_VERSION = 2') &&
+        manifestCode.includes('export function resolveManifestSupportFields') &&
+        manifestCode.includes('export function pickSupportFields') &&
+        manifestCode.includes("launchSourceType: resolvedLaunchSourceType") &&
+        manifestCode.includes("launchMethod: resolvedLaunchMethod") &&
+        manifestCode.includes("ownershipProofLevel: resolvedOwnership") &&
+        manifestCode.includes('const resolvedDataManagement') &&
+        manifestCode.includes("dataManagement: resolvedDataManagement") &&
+        indexCode.includes('resolveManifestSupportFields') &&
+        indexCode.includes('...pickSupportFields(manifest)') &&
+        engineCode.includes('...pickSupportFields(manifest)') &&
+        engineCode.includes('supportTier: supportFields.supportTier') &&
+        importAppsModalCode.includes('getSupportBadge') &&
+        importAppsModalCode.includes('Verified adapter') &&
+        dashboardCode.includes('getSupportBadge') &&
+        lifecycleProbeCode.includes('Manifest V2 emits support fields for golden app families'),
+        'Expected Manifest V2 support fields to flow through manifests, scan/import results, diagnostics, and renderer support badges.'
     )
 })
 

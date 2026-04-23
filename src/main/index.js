@@ -17,8 +17,10 @@ import {
     extractExeFromCommand,
     hashFile,
     inferAppType,
+    pickSupportFields,
     repairLegacyAppConfig,
     resolveImportedAppDataCapability,
+    resolveManifestSupportFields,
     safeAppName,
     selectBestExecutable,
     writeAppManifest
@@ -691,6 +693,11 @@ function registerIpcHandlers() {
                 appType: type,
                 appName: name
             })
+            const supportFields = resolveManifestSupportFields({
+                appType: type,
+                appName: name,
+                launchSourceType: 'vault-archive'
+            })
 
             const alreadyImported = existsSync(join(appsDir, name)) ||
                 existsSync(join(appsDir, `${name}.tar.zst`)) ||
@@ -712,8 +719,10 @@ function registerIpcHandlers() {
                 type,
                 dataPath: dataPath || null,
                 dataSizeMB,
+                ...supportFields,
                 importedDataSupported: importedDataCapability.importedDataSupported,
                 importedDataSupportLevel: importedDataCapability.importedDataSupportLevel,
+                importedDataAdapterId: importedDataCapability.importedDataAdapterId,
                 importedDataSupportReason: importedDataCapability.importedDataSupportReason,
                 alreadyImported
             })
@@ -821,6 +830,11 @@ function registerIpcHandlers() {
                         appType: type,
                         appName: name
                     })
+                    const supportFields = resolveManifestSupportFields({
+                        appType: type,
+                        appName: name,
+                        launchSourceType: 'vault-archive'
+                    })
 
                     const alreadyImported = existsSync(join(appsDir, name)) ||
                         existsSync(join(appsDir, `${name}.tar.zst`)) ||
@@ -842,8 +856,10 @@ function registerIpcHandlers() {
                         type,
                         dataPath: dataPath || null,
                         dataSizeMB,
+                        ...supportFields,
                         importedDataSupported: importedDataCapability.importedDataSupported,
                         importedDataSupportLevel: importedDataCapability.importedDataSupportLevel,
+                        importedDataAdapterId: importedDataCapability.importedDataAdapterId,
                         importedDataSupportReason: importedDataCapability.importedDataSupportReason,
                         alreadyImported
                     })
@@ -1028,8 +1044,10 @@ function registerIpcHandlers() {
                     launchProfile: manifest.launchProfile,
                     dataProfile: manifest.dataProfile,
                     readinessProfile: manifest.readinessProfile,
+                    ...pickSupportFields(manifest),
                     importedDataSupported: importedDataCapability.importedDataSupported,
                     importedDataSupportLevel: importedDataCapability.importedDataSupportLevel,
+                    importedDataAdapterId: importedDataCapability.importedDataAdapterId,
                     importedDataSupportReason: importedDataCapability.importedDataSupportReason,
                     binaryArchivePolicyVersion: BINARY_ARCHIVE_POLICY_VERSION,
                     id: Date.now(),
