@@ -16,6 +16,6 @@ temp-profile/
 diff.txt
 .gemini/
 
-# AI planning/review artifacts — never commit
+OMNILAUNCH*.md
 QUICKPASS*.md
 QUICKPASS_*.md

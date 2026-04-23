@@ -1,79 +1,129 @@
-# OmniLaunch 🚀 (QuickPass Engine)
+<p align="center">
+  <img src="build/appicon.png" alt="OmniLaunch" width="100" height="100" />
+</p>
 
-> A secure, hardware-bound workspace orchestration engine for ephemeral computing.
+<h1 align="center">OmniLaunch</h1>
 
-OmniLaunch provisions authenticated, trace-free workstation environments directly from portable storage. It orchestrates encrypted browser sessions and native portable applications without leaving forensic residue on the host operating system.
+<p align="center">
+  Portable workspace orchestration engine for Windows.
+</p>
 
-## 🏗️ Architecture Overview
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4?style=flat-square&logo=windows&logoColor=fff" alt="Windows" />
+  <img src="https://img.shields.io/badge/runtime-Electron-47848F?style=flat-square&logo=electron&logoColor=fff" alt="Electron" />
+  <img src="https://img.shields.io/badge/node-%3E%3D18-339933?style=flat-square&logo=nodedotjs&logoColor=fff" alt="Node ≥ 18" />
+  <img src="https://img.shields.io/badge/status-active%20development-blue?style=flat-square" alt="Status" />
+  <img src="https://img.shields.io/badge/license-proprietary-555?style=flat-square" alt="License" />
+</p>
 
-OmniLaunch leverages an Electron-based micro-architecture, separating the cryptographic initialization from the presentation and browser orchestration layers.
+---
 
-* **Core Runtime:** Node.js + Electron
-* **Presentation:** React 18, Vite, TailwindCSS
-* **Browser Engine:** Playwright (Chromium) via CDP (Chrome DevTools Protocol)
-* **Cryptography:** AES-256-GCM (Node `crypto`)
-* **Hardware Interop:** WMI (`wmic`) for hardware UUID and process management; `vol` for filesystem volume serial; `usb` for detach detection
+## Overview
 
-## ✨ Core Systems
+OmniLaunch provisions authenticated, isolated workstation environments from portable storage (USB or NVMe) on any Windows machine. It orchestrates encrypted browser sessions and native desktop applications, manages per-app runtime isolation, and performs full host cleanup on exit — leaving zero forensic residue on the host operating system.
 
-### Ephemeral Segregation ("Ghost Browser")
-Standard portable applications often leak state into `AppData` or the system registry. OmniLaunch mitigates this by wrapping an isolated Playwright Chromium instance. All session states, including TLS certificates, cookies, and local storage, are managed via a persistent Chrome profile stored in `BrowserProfile/`, synced between USB and local temp. The vault (`vault.json`) stores workspace configuration (tabs, app list) encrypted with AES-256-GCM. Upon session termination, the host machine retains zero state.
+The workspace configuration, browser profile, and imported application archives are stored in an AES-256-GCM encrypted vault on the portable drive. On launch, data is extracted to the host's local temp storage for performance. On quit, all host-side state is wiped and changes are synced back to the vault.
 
-### Hardware-Bound Cryptography
-The main vault is encrypted with the user's master password, deriving a 32-byte AES-256 key via PBKDF2-SHA512 (100,000 iterations). For convenience unlock methods (PIN, Fast Boot), the master password is separately encrypted using keys derived from the PIN or serial number, and stored in `vault.meta.json`.
-* **Anti-Cloning:** Cloning to a different drive will break PIN and Fast Boot unlock (which depend on the filesystem volume serial), but the main vault can still be unlocked with the correct master password on any machine.
-* **Local Fallback:** The codebase includes a fixed-drive encryption path using hardware UUID, but the current build forces removable-drive mode for simplicity. The local-drive path is architecturally supported but not active.
+## Features
 
-### Workspace Orchestration & Tear-down
-Context switching is precise and immediate. 
-* **Hydration:** Injects raw cookie states and navigates predefined tab structures via CDP in sub-second timeframes.
-* **Process Spawning:** Concurrently boots external portable executables (e.g., VS Code, Telegram).
-* **Sanitization:** Implements aggressive lifecycle hooks. On application `Quit`, the system terminates the Electron processes, halts the headless browser, issues `taskkill` equivalents to child executables, and actively scrubs temporary caching directories.
+- **Encrypted vault** — Workspace configuration encrypted with AES-256-GCM. Key derivation via PBKDF2-SHA512 (100,000 iterations). Optional PIN and Fast Boot convenience unlock bound to drive hardware serial.
+- **Browser orchestration** — Isolated Chromium instance via Playwright with a portable profile. Concurrent tab loading with configurable retry, backoff, and URL classification.
+- **Desktop app engine** — Import, extract, and launch portable desktop applications with per-app runtime profile isolation. Supports Chromium-family, VS Code-family, and generic Electron adapters.
+- **App support tiers** — Each app is classified by verified data portability level. Imported AppData for unverified apps is blocked by default.
+- **Process ownership safety** — PID-level tracking per app. Only owned processes are terminated on quit. Successor uncertainty fails closed.
+- **Host cleanup** — Runtime profiles, temp caches, and stale data from interrupted sessions are wiped. Junction and symlink traversal is blocked during cleanup.
+- **Run diagnostics** — Structured JSON diagnostics per session: timing, app readiness, browser sync, lifecycle events, and errors.
 
-## 🚀 Development & Build
+## App Support Classification
+
+| Tier | Description | Examples |
+|---|---|---|
+| **Verified** | Runtime and data behavior proven via adapter testing. Full data portability supported. | Microsoft Edge, Cursor |
+| **Best-effort** | Runtime isolation applied. Data portability unverified — imported AppData is blocked. | Generic Electron apps (Discord, Slack) |
+| **Launch-only** | App launches without managed data. | Native Win32 apps without adapters |
+
+## Portability Matrix
+
+| Item | Portable | Notes |
+|---|---|---|
+| Workspace layout and saved tabs | ✅ | Stored in encrypted vault. |
+| Browser bookmarks, history, and settings | ✅ | Carried via portable Chromium profile. |
+| Browser login sessions | ⚠️ | Machine-bound encryption may require re-authentication. |
+| Imported desktop app binaries | ✅ | Archives stored on drive, extracted per session. |
+| Desktop app login sessions | ⚠️ | Electron/Chromium apps may require re-authentication per machine. |
+| Host-specific absolute paths | ❌ | Not portable across machines. |
+
+## Security
+
+| Property | Implementation |
+|---|---|
+| Vault encryption | AES-256-GCM, PBKDF2-SHA512 (100k iterations) |
+| Drive binding | PIN/Fast Boot keys derived from drive volume serial. Cloning invalidates convenience unlock. Master password remains universal. |
+| Host isolation | All app and browser data runs from host temp, not directly from USB. Wiped on exit. |
+| Process safety | Per-app PID tracking. Only owned processes are terminated. Uncertain ownership fails closed. |
+| Stale cleanup | Leftover temp directories from interrupted sessions are detected and garbage-collected. |
+| Threat boundary | Protects against forensic data residue on shared machines. Does not protect against kernel-level rootkits, hardware keyloggers, or elevated malware on the host. |
+
+## Usage on Shared Machines
+
+- Quit through OmniLaunch to ensure the full cleanup sequence runs.
+- Keep "Clear App Cache on Exit" enabled on machines not owned by the operator.
+- Expect re-authentication for some browser and app sessions on different hardware.
+- If an imported app references absolute paths from another machine, update them manually after launch.
+
+## Getting Started
 
 ### Prerequisites
-* Node.js v18+
-* Windows OS (Required for WMI lookups and `.exe` process management)
 
-### Setup
+- Windows 10 or 11
+- Node.js 18+
+
+### Install
 
 ```bash
-cd omnilaunch
 npm install
 ```
 
-### Commands
+### Development
 
-| Command | Description |
-|---|---|
-| `npm run dev` | Boots the application in development mode with HMR enabled. |
-| `npm run build` | Compiles Vite and Electron assets into the `out/` directory. |
-| `npm run package` | Builds and bundles a production-ready Windows executable inside a `.zip`. |
+```bash
+npm run dev
+```
 
-## 🔒 Security Posture
+### Build
 
-1. **Zero Knowledge Recovery:** The system is explicitly designed without administrative backdoors. Data contained within `vault.json` relies concurrently on user memory (PIN) and physical possession (USB Serial). Loss of either guarantees cryptographic data loss.
-2. **Host Integrity:** OmniLaunch is designed to protect against data residue and downstream forensic analysis on shared/public machines. It does *not* protect against ring-0 rootkits or hardware-level keyloggers active on a compromised host machine.
+```bash
+npm run build
+```
 
-## What Transfers Between PCs
+### Package
 
-| Item | Status | Notes |
+```bash
+npm run package
+```
+
+Produces a portable `.zip` in `dist/`.
+
+### Validation
+
+```bash
+npm run probe:lifecycle
+node scripts/audit-engine.js
+```
+
+## Roadmap
+
+Planned features under active development:
+
+| Feature | Description | Status |
 |---|---|---|
-| Saved tabs and workspace layout | Yes | URLs and app launch configuration roam with the vault. |
-| Browser bookmarks, history, and settings | Usually | These live in the Chrome profile and are copied between machines. |
-| Browser login sessions | Limited | Chrome may require re-login on a different Windows PC because encrypted secrets are machine-bound. |
-| Imported desktop app binaries | Yes | Imported apps can launch from the USB workspace on another PC. |
-| Desktop app login sessions | Limited | Electron and Chromium-based apps may require re-login on a different PC. |
-| Host-specific workspace paths | No | Apps that store absolute `C:\Users\...` paths may partially break on another machine. |
+| **Support tier registry** | First-class app adapter registry with per-app capability resolution and Manifest V2 schema. | 🔜 Next |
+| **Phone companion** | Local-network control plane. Pair a phone via QR to manage workspaces, edit tabs, launch, and quit remotely. | Planned |
+| **Persistent browser mode** | Connect to a persistent browser instance on a trusted host for reliable signed-in account continuity. | Planned |
+| **Account slots** | Per-provider account readiness tracking with assisted re-authentication guidance. | Planned |
+| **Native app data adapters** | Exact directory-level data preservation for certified native apps (e.g., Notepad++, VLC). | Planned |
+| **Host-write detection** | Scoped before/after snapshots to verify zero-footprint claims with evidence. | Planned |
 
-## Lab/School PC Usage Guide
+## License
 
-- Keep `Clear App Cache on Exit` enabled on shared or school machines.
-- Expect some browser and desktop apps to ask you to sign in again on a different PC.
-- Save your session before unplugging the USB drive.
-- If OmniLaunch warns that an imported app contains paths from another PC, re-open that workspace inside the app and update the broken paths.
-- If a desktop app opens the system browser for sign-in, that external browser window is outside OmniLaunch's shutdown control.
-
----
-*OmniLaunch / QuickPass — Engineered for absolute workspace portability without compromise.*
+Proprietary. All rights reserved.
