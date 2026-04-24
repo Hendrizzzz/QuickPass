@@ -63,6 +63,7 @@ export const SUPPORT_FIELD_NAMES = Object.freeze([
     'ownershipProofLevel',
     'closePolicy',
     'canQuitFromOmniLaunch',
+    'closeManagedAfterSpawn',
     'availabilityStatus',
     'dataManagement',
     'requiresElevation',
@@ -599,12 +600,14 @@ export function resolveManifestSupportFields({
     appName,
     launchProfile,
     dataProfile,
+    supportSummary,
     adapterEvidence,
     launchSourceType = LAUNCH_SOURCE_TYPES.VAULT_ARCHIVE,
     launchMethod = LAUNCH_METHODS.SPAWN,
     ownershipProofLevel,
     closePolicy,
     canQuitFromOmniLaunch,
+    closeManagedAfterSpawn,
     availabilityStatus,
     dataManagement,
     requiresElevation,
@@ -642,13 +645,14 @@ export function resolveManifestSupportFields({
 
     return {
         supportTier: capability.supportTier,
-        supportSummary: capability.supportSummary,
+        supportSummary: supportSummary || capability.supportSummary,
         adapterEvidence: resolvedAdapterEvidence,
         launchSourceType: resolvedLaunchSourceType,
         launchMethod: resolvedLaunchMethod,
         ownershipProofLevel: resolvedOwnership,
         closePolicy: resolvedClosePolicy,
         canQuitFromOmniLaunch: resolvedCanQuit,
+        closeManagedAfterSpawn: typeof closeManagedAfterSpawn === 'boolean' ? closeManagedAfterSpawn : false,
         availabilityStatus: availabilityStatus || 'available',
         dataManagement: resolvedDataManagement,
         requiresElevation: typeof requiresElevation === 'boolean' ? requiresElevation : false,
@@ -680,6 +684,85 @@ export function pickSupportFields(source = {}) {
         }
     }
     return picked
+}
+
+export function resolveHostExeSupportFields({
+    appName,
+    availabilityStatus = 'unknown',
+    launchSourceType = LAUNCH_SOURCE_TYPES.HOST_EXE,
+    supportSummary,
+    limitations,
+    closeManagedAfterSpawn = true
+} = {}) {
+    return resolveManifestSupportFields({
+        appType: 'native',
+        appName,
+        launchProfile: 'native-windowed',
+        dataProfile: { mode: 'none' },
+        supportSummary: supportSummary || 'Host-installed launch-only app. Data is unmanaged and only available on PCs where this .exe exists.',
+        launchSourceType,
+        launchMethod: LAUNCH_METHODS.SPAWN,
+        ownershipProofLevel: OWNERSHIP_PROOF_LEVELS.NONE,
+        closePolicy: CLOSE_POLICIES.NEVER,
+        canQuitFromOmniLaunch: false,
+        closeManagedAfterSpawn,
+        availabilityStatus,
+        dataManagement: DATA_MANAGEMENT_LEVELS.UNMANAGED,
+        limitations: limitations || [
+            'Data is not copied or synced by OmniLaunch.',
+            'Quit is enabled only after OmniLaunch launches and owns the process.'
+        ]
+    })
+}
+
+export function resolveRegistryUninstallSupportFields({ appName, availabilityStatus = 'unknown' } = {}) {
+    return resolveHostExeSupportFields({
+        appName,
+        availabilityStatus,
+        launchSourceType: LAUNCH_SOURCE_TYPES.REGISTRY_UNINSTALL,
+        supportSummary: 'Registry-discovered host app. OmniLaunch stores a launch reference only; data is unmanaged.',
+        limitations: [
+            'Availability is rechecked on each PC before launch.',
+            'DisplayIcon is used only as a hint, never as the final executable by itself.'
+        ]
+    })
+}
+
+export function resolveAppPathsSupportFields({ appName, availabilityStatus = 'unknown' } = {}) {
+    return resolveHostExeSupportFields({
+        appName,
+        availabilityStatus,
+        launchSourceType: LAUNCH_SOURCE_TYPES.APP_PATHS,
+        supportSummary: 'App Paths host launch reference. Data is unmanaged and availability is checked on this PC.',
+        limitations: [
+            'App Paths are resolved from the current PC registry before launch.',
+            'Data is not copied or synced by OmniLaunch.'
+        ],
+        closeManagedAfterSpawn: true
+    })
+}
+
+export function resolveStartMenuShortcutSupportFields({
+    appName,
+    availabilityStatus = 'unknown',
+    strongDirectExecutable = false,
+    warning = ''
+} = {}) {
+    return resolveHostExeSupportFields({
+        appName,
+        availabilityStatus,
+        launchSourceType: LAUNCH_SOURCE_TYPES.START_MENU_SHORTCUT,
+        supportSummary: strongDirectExecutable
+            ? 'Start Menu shortcut to a direct executable. Data is unmanaged.'
+            : 'Ambiguous Start Menu shortcut. Data is unmanaged and OmniLaunch will not close it automatically.',
+        limitations: [
+            warning || (strongDirectExecutable
+                ? 'Shortcut target is a direct executable; arguments are shown before saving.'
+                : 'Shortcut target or arguments require weak ownership.'),
+            'Data is not copied or synced by OmniLaunch.'
+        ],
+        closeManagedAfterSpawn: !!strongDirectExecutable
+    })
 }
 
 function supportSnapshot(source = {}) {

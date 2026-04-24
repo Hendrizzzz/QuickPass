@@ -30,6 +30,7 @@ import {
     pickSupportFields,
     parseVaultAppPath,
     readAppManifest,
+    resolveHostExeSupportFields,
     resolveImportedAppDataCapability,
     safeAppName,
     validateExtractedAppCache
@@ -829,6 +830,28 @@ function createAppDiagnostic(appConfig, attemptedPath) {
         dangerousTarget: false,
         cacheValidation: null
     }
+}
+
+function isHostExeLaunchConfig(appConfig) {
+    return ['host-exe', 'registry-uninstall', 'app-paths', 'start-menu-shortcut'].includes(appConfig?.launchSourceType) &&
+        appConfig?.launchMethod === 'spawn'
+}
+
+function applyHostExeDiagnostic(diagRef, appConfig, availabilityStatus = 'unknown') {
+    Object.assign(diagRef, {
+        ...resolveHostExeSupportFields({
+            appName: appConfig?.name,
+            availabilityStatus,
+            launchSourceType: appConfig?.launchSourceType || 'host-exe',
+            supportSummary: appConfig?.supportSummary,
+            limitations: appConfig?.limitations
+        }),
+        launchSourceType: appConfig?.launchSourceType || 'host-exe'
+    })
+}
+
+function canCloseLaunchedApp(appObj) {
+    return appObj?.canQuitFromOmniLaunch !== false && appObj?.diagRef?.canQuitFromOmniLaunch !== false
 }
 
 const DEFAULT_LAUNCHER_HANDOFF_TIMEOUT_MS = 8000
@@ -2860,6 +2883,14 @@ export async function closeDesktopApps() {
 
         // Phase 1: Send ALL graceful kill signals in parallel
         for (const app of launchedApps) {
+            if (!canCloseLaunchedApp(app)) {
+                updateAppDiagnostic(app, {
+                    closeMethod: 'not-owned',
+                    cleanupSkippedForSafety: true,
+                    cleanupSafetyReason: 'OmniLaunch did not have ownership proof for this app; quit was skipped.'
+                })
+                continue
+            }
             if (!app.exited && app.child.exitCode === null) {
                 app.closeMethod = app.closeMethod || 'graceful'
                 updateAppDiagnostic(app, { closeMethod: app.closeMethod })
@@ -2870,6 +2901,7 @@ export async function closeDesktopApps() {
         // Phase 2: Await exits with Timeout Escalation
         await Promise.all(launchedApps.map(app => {
             return new Promise(resolve => {
+                if (!canCloseLaunchedApp(app)) return resolve()
                 // Already dead  just resolve (avoid hang on already-exited apps)
                 if (app.exited || app.child.exitCode !== null) return resolve()
 
@@ -2911,6 +2943,7 @@ export async function closeDesktopApps() {
         // first kill any owned successor PIDs we already tracked in-session and
         // only then fall back to command-line rediscovery.
         for (const app of launchedApps) {
+            if (!canCloseLaunchedApp(app)) continue
             const strongOwnershipRequired = requiresStrongOwnershipForCleanup(app)
             const shouldEvaluateSuccessors =
                 app.isLauncherPattern ||
@@ -3063,6 +3096,14 @@ export async function closeDesktopApps() {
  */
 export function emergencyKillDesktopAppsSync() {
     for (const app of launchedApps) {
+        if (!canCloseLaunchedApp(app)) {
+            updateAppDiagnostic(app, {
+                closeMethod: 'not-owned',
+                cleanupSkippedForSafety: true,
+                cleanupSafetyReason: 'OmniLaunch did not have ownership proof for this app; emergency quit was skipped.'
+            })
+            continue
+        }
         app.abandonSync = true
         app.abandonSyncReason = 'App was abandoned during emergency shutdown; deferred to stale runtime profile cleanup.'
         if (!app.exited && app.child.exitCode === null) {
@@ -3161,6 +3202,10 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
         let launchSource = 'raw-path'
         let usbPath = null
         let localPath = null
+        const isHostExeLaunch = isHostExeLaunchConfig(appConfig)
+        if (isHostExeLaunch) {
+            applyHostExeDiagnostic(diagRef, appConfig)
+        }
         let manifest = appConfig.manifest || (vaultDir ? readAppManifest(vaultDir, appConfig.manifestId || appConfig.name) : null)
         if (manifest) {
             manifest = normalizeManifestProfiles(manifest).manifest
@@ -3436,9 +3481,22 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
             return failLaunch('dangerous-launch-target', `Refusing to launch unsafe executable target: ${appPath}`, 'resolving')
         }
 
-        const effectiveLaunchProfile = resolveEffectiveLaunchProfile(appConfig, manifest, appPath)
-        const effectiveDataProfile = resolveEffectiveDataProfile(appConfig, manifest, effectiveLaunchProfile)
-        const importedDataRequested = !!appConfig.portableData
+        if (isHostExeLaunch && ['missing-on-this-PC', 'stale-registry-reference', 'stale-app-path-reference', 'stale-shortcut-reference'].includes(diagRef.availabilityStatus)) {
+            const reason = appConfig.registryResolution?.reason ||
+                appConfig.appPathsResolution?.reason ||
+                appConfig.shortcutClassification?.warning ||
+                appConfig.hostResolution?.reason ||
+                'Host app could not be resolved on this PC.'
+            return failLaunch('host-app-unavailable', `${appConfig.name} is unavailable on this PC. ${reason}`, 'resolving')
+        }
+
+        const effectiveLaunchProfile = isHostExeLaunch
+            ? 'native-windowed'
+            : resolveEffectiveLaunchProfile(appConfig, manifest, appPath)
+        const effectiveDataProfile = isHostExeLaunch
+            ? { mode: 'none' }
+            : resolveEffectiveDataProfile(appConfig, manifest, effectiveLaunchProfile)
+        const importedDataRequested = isHostExeLaunch ? false : !!appConfig.portableData
         const runtimeDataPlan = resolveRuntimeDataPlan(appConfig, effectiveLaunchProfile, effectiveDataProfile)
         const supportsRuntimeUserDataDir = runtimeDataPlan.runtimeProfileSupported
         const supportsImportedDataRedirection = supportsImportedAppDataRedirection(appConfig, effectiveLaunchProfile, effectiveDataProfile)
@@ -3527,11 +3585,17 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
         Object.assign(diagRef, {
             exePath: appPath,
             resolvedPath: appPath,
-            launchSource,
+            launchSource: isHostExeLaunch ? appConfig.launchSourceType : launchSource,
             launchStage: 'spawning'
         })
 
         if (!targetExists) {
+            if (isHostExeLaunch) {
+                Object.assign(diagRef, {
+                    availabilityStatus: 'missing-on-this-PC',
+                    launchStage: 'resolving'
+                })
+            }
             return failLaunch('app-path-missing', `Resolved path not found: ${appPath}`, 'resolving')
         }
 
@@ -3564,6 +3628,21 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
             return failLaunch('app-spawn', 'Failed to spawn process', 'spawning')
         }
 
+        if (isHostExeLaunch && appConfig.closeManagedAfterSpawn !== false) {
+            Object.assign(diagRef, {
+                availabilityStatus: 'available',
+                ownershipProofLevel: 'strong',
+                closePolicy: 'owned-tree',
+                canQuitFromOmniLaunch: true,
+                dataManagement: 'unmanaged'
+            })
+        } else if (isHostExeLaunch) {
+            Object.assign(diagRef, {
+                availabilityStatus: 'available',
+                dataManagement: 'unmanaged'
+            })
+        }
+
         const spawnTime = Date.now()
         appObj = {
             pid: child.pid,
@@ -3583,6 +3662,9 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
             launchProfile: effectiveLaunchProfile,
             dataProfile: effectiveDataProfile,
             requiresStrongOwnership: cleanupRequiresStrongOwnership,
+            canQuitFromOmniLaunch: diagRef.canQuitFromOmniLaunch !== false,
+            ownershipProofLevel: diagRef.ownershipProofLevel || null,
+            closePolicy: diagRef.closePolicy || null,
             ownershipFingerprint: localPath || null,
             realPidSignal: null,
             readyObserved: false,
