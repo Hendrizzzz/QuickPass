@@ -765,6 +765,79 @@ export function resolveStartMenuShortcutSupportFields({
     })
 }
 
+export function resolveShellExecuteSupportFields({
+    appName,
+    availabilityStatus = 'unknown',
+    warning = ''
+} = {}) {
+    return resolveManifestSupportFields({
+        appType: 'native',
+        appName,
+        launchProfile: 'native-windowed',
+        dataProfile: { mode: 'none' },
+        supportSummary: 'ShellExecute launch reference. Data is unmanaged and OmniLaunch will not close it automatically.',
+        launchSourceType: LAUNCH_SOURCE_TYPES.SHELL_EXECUTE,
+        launchMethod: LAUNCH_METHODS.SHELL_EXECUTE,
+        ownershipProofLevel: OWNERSHIP_PROOF_LEVELS.WEAK,
+        closePolicy: CLOSE_POLICIES.NEVER,
+        canQuitFromOmniLaunch: false,
+        closeManagedAfterSpawn: false,
+        availabilityStatus,
+        dataManagement: DATA_MANAGEMENT_LEVELS.UNMANAGED,
+        limitations: [
+            warning || 'ShellExecute can hand off to another process, so ownership is weak.',
+            'Data is not copied or synced by OmniLaunch.',
+            'Quit and cleanup are disabled for this launch source.'
+        ]
+    })
+}
+
+export function resolveProtocolUriSupportFields({ appName, availabilityStatus = 'unknown' } = {}) {
+    return resolveManifestSupportFields({
+        appType: 'native',
+        appName,
+        launchProfile: 'native-windowed',
+        dataProfile: { mode: 'none' },
+        supportSummary: 'Protocol URI launch reference. Data is unmanaged and OmniLaunch cannot prove process ownership.',
+        launchSourceType: LAUNCH_SOURCE_TYPES.PROTOCOL_URI,
+        launchMethod: LAUNCH_METHODS.PROTOCOL,
+        ownershipProofLevel: OWNERSHIP_PROOF_LEVELS.NONE,
+        closePolicy: CLOSE_POLICIES.NEVER,
+        canQuitFromOmniLaunch: false,
+        closeManagedAfterSpawn: false,
+        availabilityStatus,
+        dataManagement: DATA_MANAGEMENT_LEVELS.UNMANAGED,
+        limitations: [
+            'Protocol handlers are resolved by Windows on this PC.',
+            'Data is not copied or synced by OmniLaunch.',
+            'Quit and cleanup are disabled for protocol launches.'
+        ]
+    })
+}
+
+export function resolvePackagedAppSupportFields({ appName, availabilityStatus = 'unknown' } = {}) {
+    return resolveManifestSupportFields({
+        appType: 'native',
+        appName,
+        launchProfile: 'native-windowed',
+        dataProfile: { mode: 'none' },
+        supportSummary: 'Packaged/UWP app launch reference. Data is unmanaged and OmniLaunch cannot prove process ownership.',
+        launchSourceType: LAUNCH_SOURCE_TYPES.PACKAGED_APP,
+        launchMethod: LAUNCH_METHODS.PACKAGED_APP,
+        ownershipProofLevel: OWNERSHIP_PROOF_LEVELS.NONE,
+        closePolicy: CLOSE_POLICIES.NEVER,
+        canQuitFromOmniLaunch: false,
+        closeManagedAfterSpawn: false,
+        availabilityStatus,
+        dataManagement: DATA_MANAGEMENT_LEVELS.UNMANAGED,
+        limitations: [
+            'Packaged apps are activated through Windows shell activation.',
+            'Data is not copied or synced by OmniLaunch.',
+            'Quit and cleanup are disabled for packaged apps.'
+        ]
+    })
+}
+
 function supportSnapshot(source = {}) {
     return {
         schemaVersion: source.schemaVersion,

@@ -32,6 +32,9 @@ import {
     readAppManifest,
     resolveHostExeSupportFields,
     resolveImportedAppDataCapability,
+    resolvePackagedAppSupportFields,
+    resolveProtocolUriSupportFields,
+    resolveShellExecuteSupportFields,
     safeAppName,
     validateExtractedAppCache
 } from './appManifest.js'
@@ -837,6 +840,11 @@ function isHostExeLaunchConfig(appConfig) {
         appConfig?.launchMethod === 'spawn'
 }
 
+function isWeakShellHostLaunchConfig(appConfig) {
+    return ['shell-execute', 'protocol-uri', 'packaged-app'].includes(appConfig?.launchSourceType) &&
+        ['shell-execute', 'protocol', 'packaged-app'].includes(appConfig?.launchMethod)
+}
+
 function applyHostExeDiagnostic(diagRef, appConfig, availabilityStatus = 'unknown') {
     Object.assign(diagRef, {
         ...resolveHostExeSupportFields({
@@ -847,6 +855,32 @@ function applyHostExeDiagnostic(diagRef, appConfig, availabilityStatus = 'unknow
             limitations: appConfig?.limitations
         }),
         launchSourceType: appConfig?.launchSourceType || 'host-exe'
+    })
+}
+
+function applyWeakShellHostDiagnostic(diagRef, appConfig, availabilityStatus = appConfig?.availabilityStatus || 'unknown') {
+    let supportFields
+    if (appConfig?.launchSourceType === 'protocol-uri') {
+        supportFields = resolveProtocolUriSupportFields({ appName: appConfig?.name, availabilityStatus })
+    } else if (appConfig?.launchSourceType === 'packaged-app') {
+        supportFields = resolvePackagedAppSupportFields({ appName: appConfig?.name, availabilityStatus })
+    } else {
+        supportFields = resolveShellExecuteSupportFields({
+            appName: appConfig?.name,
+            availabilityStatus,
+            warning: appConfig?.shortcutClassification?.warning
+        })
+    }
+
+    Object.assign(diagRef, {
+        ...supportFields,
+        path: appConfig?.path || null,
+        availabilityStatus,
+        dataManagement: 'unmanaged',
+        ownershipProofLevel: supportFields.ownershipProofLevel || 'none',
+        closePolicy: 'never',
+        canQuitFromOmniLaunch: false,
+        closeManagedAfterSpawn: false
     })
 }
 
@@ -864,11 +898,123 @@ const READINESS_PROCESS_TREE_DEPTH = 3
 const READINESS_EMPTY_TREE_GRACE_MS = 3000
 const RUNTIME_APP_PROFILE_PREFIX = 'QuickPass-AppRuntime-'
 const EARLY_EXIT_OUTPUT_LIMIT = 8192
+const LAUNCHER_UPDATER_WINDOW_PATTERNS = [
+    { pattern: /\b(updater?|updating|update available)\b/i, classification: 'updater-window' },
+    { pattern: /\b(installer?|installing|setup)\b/i, classification: 'installer-window' },
+    { pattern: /\b(uninstaller?|uninstalling|remove)\b/i, classification: 'uninstaller-window' },
+    { pattern: /\b(helper|broker|crashpad|squirrel|stub)\b/i, classification: 'helper-window' },
+    { pattern: /\blauncher\b/i, classification: 'launcher-window' }
+]
+
+function escapeRegExp(value) {
+    return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function compactLabel(value) {
+    return String(value || '')
+        .toLowerCase()
+        .replace(/\.exe$/i, '')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .trim()
+}
+
+function buildExpectedWindowPatterns(appObj) {
+    const labels = new Set()
+    const appName = compactLabel(appObj?.diagRef?.name)
+    const exeName = compactLabel(pathParse(appObj?.exePath || '').name)
+    if (appName && appName.length >= 3) labels.add(appName)
+    if (exeName && exeName.length >= 3) labels.add(exeName)
+
+    return [...labels].slice(0, 4).map((label) => ({
+        label,
+        pattern: new RegExp(escapeRegExp(label).replace(/\s+/g, '.*'), 'i')
+    }))
+}
+
+function classifyReadinessWindow(appObj, window) {
+    const titleText = [window?.windowTitle, window?.className, window?.processName]
+        .map(value => String(value || '').trim())
+        .filter(Boolean)
+        .join(' | ')
+    const expectedPatterns = buildExpectedWindowPatterns(appObj)
+    const expectedMatch = expectedPatterns.find(entry => entry.pattern.test(titleText))
+    const launcherMatch = LAUNCHER_UPDATER_WINDOW_PATTERNS.find(entry => entry.pattern.test(titleText))
+
+    return {
+        titleText,
+        expected: !!expectedMatch,
+        expectedPattern: expectedMatch?.label || null,
+        classification: launcherMatch?.classification || (expectedMatch ? 'expected-window' : 'generic-window'),
+        isLauncherOrUpdater: !!launcherMatch
+    }
+}
+
+function resolveLaunchReadinessPolicy(appConfig = {}, diagRef = {}) {
+    const launchSourceType = appConfig.launchSourceType || diagRef.launchSourceType || 'raw-path'
+    const launchMethod = appConfig.launchMethod || diagRef.launchMethod || 'spawn'
+    const noOwnership = ['shell-execute', 'protocol-uri', 'packaged-app'].includes(launchSourceType) ||
+        ['shell-execute', 'protocol', 'packaged-app'].includes(launchMethod)
+    const closeManaged = appConfig.closeManagedAfterSpawn !== false &&
+        appConfig.canQuitFromOmniLaunch !== false &&
+        diagRef.canQuitFromOmniLaunch !== false
+
+    if (noOwnership) {
+        return {
+            mode: 'activation-only',
+            timeoutMs: 0,
+            ownershipMode: 'none',
+            closeManaged: false,
+            allowLauncherWindowAsReady: false,
+            partialReadyAllowed: true,
+            readinessDescription: 'Windows shell activation was sent; OmniLaunch cannot prove process ownership for this source.'
+        }
+    }
+
+    const profile = diagRef.readinessProfile || appConfig.readinessProfile || {}
+    return {
+        mode: profile.mode || 'visible-window',
+        timeoutMs: Number(profile.timeoutMs) || DEFAULT_READINESS_TIMEOUT_MS,
+        ownershipMode: closeManaged ? 'owned-spawn' : 'weak-spawn',
+        closeManaged,
+        allowLauncherWindowAsReady: false,
+        partialReadyAllowed: false,
+        readinessDescription: closeManaged
+            ? 'Readiness requires owned process/window evidence.'
+            : 'Readiness can observe launch state, but OmniLaunch will not close this app automatically.'
+    }
+}
+
+function classifyLaunchTarget(appConfig = {}, appPath = '') {
+    const sourceType = appConfig.launchSourceType || 'raw-path'
+    const method = appConfig.launchMethod || 'spawn'
+    const base = pathParse(appPath || '').base || String(appPath || '')
+
+    if (sourceType === 'protocol-uri') {
+        return { classification: 'protocol-activation', reason: 'Windows protocol handler launch; process ownership is not knowable.' }
+    }
+    if (sourceType === 'packaged-app') {
+        return { classification: 'packaged-app-activation', reason: 'Windows packaged app activation; process ownership is not knowable.' }
+    }
+    if (sourceType === 'shell-execute' || method === 'shell-execute') {
+        return { classification: 'shell-execute-activation', reason: 'ShellExecute may hand off to another process.' }
+    }
+    if (/\b(updater?|update|setup|install|uninstall|helper|broker|stub|launcher)\b/i.test(base)) {
+        return { classification: 'launcher-updater-target', reason: `Launch target looks like a helper/launcher/updater: ${base}` }
+    }
+    return { classification: 'direct-launch-target', reason: 'Launch target is treated as a direct app process until readiness proves otherwise.' }
+}
 
 function createReadinessDiagnostic(readinessProfile) {
     return {
         mode: readinessProfile?.mode || null,
         timeoutMs: readinessProfile?.timeoutMs || null,
+        policy: null,
+        ownershipMode: null,
+        expectedWindowPatterns: [],
+        partialReady: false,
+        partialReadyReason: null,
+        windowClassification: null,
+        launcherOrUpdaterWindowObserved: false,
         status: 'pending',
         durationMs: 0,
         checkedAt: null,
@@ -2547,7 +2693,7 @@ async function collectRelatedProcessSnapshot(appObj, {
     }
 }
 
-function pickVisibleWindow(windows) {
+function pickVisibleWindow(windows, appObj = null) {
     const visible = (windows || []).filter(window =>
         Number(window.windowHandle) !== 0 &&
         window.visible !== false
@@ -2555,6 +2701,12 @@ function pickVisibleWindow(windows) {
     if (visible.length === 0) return null
 
     return visible.sort((a, b) => {
+        if (appObj) {
+            const aClass = classifyReadinessWindow(appObj, a)
+            const bClass = classifyReadinessWindow(appObj, b)
+            if (aClass.expected !== bClass.expected) return aClass.expected ? -1 : 1
+            if (aClass.isLauncherOrUpdater !== bClass.isLauncherOrUpdater) return aClass.isLauncherOrUpdater ? 1 : -1
+        }
         const aHasTitle = String(a.windowTitle || '').trim() ? 1 : 0
         const bHasTitle = String(b.windowTitle || '').trim() ? 1 : 0
         return bHasTitle - aHasTitle
@@ -2562,16 +2714,13 @@ function pickVisibleWindow(windows) {
 }
 
 function getReadinessProfileForApp(appObj) {
-    const profile = appObj?.diagRef?.readinessProfile || {}
-    return {
-        mode: profile.mode || 'visible-window',
-        timeoutMs: Number(profile.timeoutMs) || DEFAULT_READINESS_TIMEOUT_MS
-    }
+    return resolveLaunchReadinessPolicy(appObj?.appConfig || {}, appObj?.diagRef || {})
 }
 
 function applyReadinessSnapshot(appObj, snapshot, patch = {}) {
     const { window: providedWindow, ...readinessPatch } = patch
-    const window = providedWindow || pickVisibleWindow(snapshot.windows)
+    const window = providedWindow || pickVisibleWindow(snapshot.windows, appObj)
+    const windowClassification = window ? classifyReadinessWindow(appObj, window) : null
     updateReadinessDiagnostic(appObj, {
         rootPids: snapshot.rootPids,
         processTree: snapshot.processTree,
@@ -2582,6 +2731,10 @@ function applyReadinessSnapshot(appObj, snapshot, patch = {}) {
         windowClassName: window?.className || null,
         windowBounds: window?.bounds || null,
         windowDetectionSource: window?.detectionSource || null,
+        windowClassification: windowClassification?.classification || null,
+        expectedWindowMatched: windowClassification?.expected || false,
+        expectedWindowPattern: windowClassification?.expectedPattern || null,
+        launcherOrUpdaterWindowObserved: windowClassification?.isLauncherOrUpdater || false,
         observedProcessName: window?.processName || null,
         ...readinessPatch
     })
@@ -2591,17 +2744,41 @@ async function ensureAppReadiness(appObj, {
     onStatus,
     includeProcessNameFallback = true
 } = {}) {
-    const { mode, timeoutMs } = getReadinessProfileForApp(appObj)
+    const policy = getReadinessProfileForApp(appObj)
+    const { mode, timeoutMs } = policy
     const startedAt = Date.now()
+    const expectedWindowPatterns = buildExpectedWindowPatterns(appObj).map(entry => entry.label)
 
     updateReadinessDiagnostic(appObj, {
         mode,
         timeoutMs,
+        policy: policy.readinessDescription,
+        ownershipMode: policy.ownershipMode,
+        expectedWindowPatterns,
         status: 'checking',
         checkedAt: startedAt,
         durationMs: 0,
         failureReason: null
     })
+
+    if (mode === 'activation-only') {
+        updateReadinessDiagnostic(appObj, {
+            status: 'partial-ready',
+            checkedAt: startedAt,
+            durationMs: 0,
+            partialReady: true,
+            partialReadyReason: policy.readinessDescription,
+            failureReason: null
+        })
+        return {
+            success: true,
+            status: 'partial-ready',
+            launchVerifiedBy: 'shell-activation-sent',
+            finalizedBy: 'activation-only',
+            observedPid: appObj?.pid || null,
+            partialReady: true
+        }
+    }
 
     if (mode === 'visible-window') {
         onStatus?.(`[INFO] ${appObj.diagRef.name} waiting for a visible window...`)
@@ -2617,7 +2794,7 @@ async function ensureAppReadiness(appObj, {
         const snapshot = await collectRelatedProcessSnapshot(appObj, {
             includeProcessNameFallback: includeProcessNameFallback && !requiresStrongOwnershipForCleanup(appObj)
         })
-        const window = pickVisibleWindow(snapshot.windows)
+        const window = pickVisibleWindow(snapshot.windows, appObj)
         if (requiresStrongOwnershipForCleanup(appObj) && snapshot.queryOk) {
             trackOwnedPids(appObj, snapshot.processTree.map(entry => entry.pid))
         }
@@ -2650,6 +2827,7 @@ async function ensureAppReadiness(appObj, {
         } else if (window) {
             const errorState = detectReadinessErrorState(appObj, window)
             const observedVia = window?.detectionSource || 'main-window'
+            const windowClassification = classifyReadinessWindow(appObj, window)
 
             trackOwnedPid(appObj, window.pid, {
                 signal: 'visible-window',
@@ -2677,23 +2855,39 @@ async function ensureAppReadiness(appObj, {
                 }
             }
 
-            applyReadinessSnapshot(appObj, snapshot, {
-                window,
-                status: appObj.isLauncherPattern || appObj.realPid ? 'handoff-ready' : 'ready',
-                durationMs,
-                checkedAt: Date.now(),
-                observedVia,
-                probeCount: readinessProbeCount,
-                probeFailureCount: readinessProbeFailureCount,
-                probeTotalMs: readinessProbeTotalMs,
-                failureReason: null
-            })
-            return {
-                success: true,
-                status: appObj.isLauncherPattern || appObj.realPid ? 'handoff-ready' : 'ready',
-                launchVerifiedBy: 'visible-window',
-                finalizedBy: 'visible-window',
-                observedPid: window.pid || null
+            if (windowClassification.isLauncherOrUpdater && !policy.allowLauncherWindowAsReady) {
+                applyReadinessSnapshot(appObj, snapshot, {
+                    window,
+                    status: 'partial-ready',
+                    durationMs,
+                    checkedAt: Date.now(),
+                    observedVia,
+                    probeCount: readinessProbeCount,
+                    probeFailureCount: readinessProbeFailureCount,
+                    probeTotalMs: readinessProbeTotalMs,
+                    partialReady: true,
+                    partialReadyReason: `Observed ${windowClassification.classification}, waiting for main app window.`,
+                    failureReason: null
+                })
+            } else {
+                applyReadinessSnapshot(appObj, snapshot, {
+                    window,
+                    status: appObj.isLauncherPattern || appObj.realPid ? 'handoff-ready' : 'ready',
+                    durationMs,
+                    checkedAt: Date.now(),
+                    observedVia,
+                    probeCount: readinessProbeCount,
+                    probeFailureCount: readinessProbeFailureCount,
+                    probeTotalMs: readinessProbeTotalMs,
+                    failureReason: null
+                })
+                return {
+                    success: true,
+                    status: appObj.isLauncherPattern || appObj.realPid ? 'handoff-ready' : 'ready',
+                    launchVerifiedBy: 'visible-window',
+                    finalizedBy: 'visible-window',
+                    observedPid: window.pid || null
+                }
             }
         }
 
@@ -3203,8 +3397,11 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
         let usbPath = null
         let localPath = null
         const isHostExeLaunch = isHostExeLaunchConfig(appConfig)
+        const isWeakShellHostLaunch = isWeakShellHostLaunchConfig(appConfig)
         if (isHostExeLaunch) {
             applyHostExeDiagnostic(diagRef, appConfig)
+        } else if (isWeakShellHostLaunch) {
+            applyWeakShellHostDiagnostic(diagRef, appConfig)
         }
         let manifest = appConfig.manifest || (vaultDir ? readAppManifest(vaultDir, appConfig.manifestId || appConfig.name) : null)
         if (manifest) {
@@ -3476,27 +3673,38 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
             }
         }
 
-        if (isDangerousExecutablePath(appPath)) {
+        if (!isWeakShellHostLaunch && isDangerousExecutablePath(appPath)) {
             diagRef.dangerousTarget = true
             return failLaunch('dangerous-launch-target', `Refusing to launch unsafe executable target: ${appPath}`, 'resolving')
         }
 
-        if (isHostExeLaunch && ['missing-on-this-PC', 'stale-registry-reference', 'stale-app-path-reference', 'stale-shortcut-reference'].includes(diagRef.availabilityStatus)) {
+        if ((isHostExeLaunch || isWeakShellHostLaunch) && [
+            'missing-on-this-PC',
+            'stale-registry-reference',
+            'stale-app-path-reference',
+            'stale-shortcut-reference',
+            'stale-shell-execute-reference',
+            'stale-protocol-reference',
+            'stale-packaged-app-reference'
+        ].includes(diagRef.availabilityStatus)) {
             const reason = appConfig.registryResolution?.reason ||
                 appConfig.appPathsResolution?.reason ||
                 appConfig.shortcutClassification?.warning ||
+                appConfig.shellExecuteResolution?.reason ||
+                appConfig.protocolResolution?.reason ||
+                appConfig.packagedAppResolution?.reason ||
                 appConfig.hostResolution?.reason ||
                 'Host app could not be resolved on this PC.'
             return failLaunch('host-app-unavailable', `${appConfig.name} is unavailable on this PC. ${reason}`, 'resolving')
         }
 
-        const effectiveLaunchProfile = isHostExeLaunch
+        const effectiveLaunchProfile = isHostExeLaunch || isWeakShellHostLaunch
             ? 'native-windowed'
             : resolveEffectiveLaunchProfile(appConfig, manifest, appPath)
-        const effectiveDataProfile = isHostExeLaunch
+        const effectiveDataProfile = isHostExeLaunch || isWeakShellHostLaunch
             ? { mode: 'none' }
             : resolveEffectiveDataProfile(appConfig, manifest, effectiveLaunchProfile)
-        const importedDataRequested = isHostExeLaunch ? false : !!appConfig.portableData
+        const importedDataRequested = isHostExeLaunch || isWeakShellHostLaunch ? false : !!appConfig.portableData
         const runtimeDataPlan = resolveRuntimeDataPlan(appConfig, effectiveLaunchProfile, effectiveDataProfile)
         const supportsRuntimeUserDataDir = runtimeDataPlan.runtimeProfileSupported
         const supportsImportedDataRedirection = supportsImportedAppDataRedirection(appConfig, effectiveLaunchProfile, effectiveDataProfile)
@@ -3581,15 +3789,21 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
 
         const isExe = appPath.toLowerCase().endsWith('.exe') || appPath.toLowerCase().endsWith('.bat') || appPath.toLowerCase().endsWith('.cmd')
         const targetExists = appPath ? existsSync(appPath) : false
+        const readinessPolicy = resolveLaunchReadinessPolicy(appConfig, diagRef)
+        const launchTargetClassification = classifyLaunchTarget(appConfig, appPath)
 
         Object.assign(diagRef, {
             exePath: appPath,
             resolvedPath: appPath,
-            launchSource: isHostExeLaunch ? appConfig.launchSourceType : launchSource,
+            launchSource: (isHostExeLaunch || isWeakShellHostLaunch) ? appConfig.launchSourceType : launchSource,
+            readinessPolicy: readinessPolicy.readinessDescription,
+            readinessOwnershipMode: readinessPolicy.ownershipMode,
+            launchTargetClassification: launchTargetClassification.classification,
+            launchTargetClassificationReason: launchTargetClassification.reason,
             launchStage: 'spawning'
         })
 
-        if (!targetExists) {
+        if (!targetExists && !isWeakShellHostLaunch) {
             if (isHostExeLaunch) {
                 Object.assign(diagRef, {
                     availabilityStatus: 'missing-on-this-PC',
@@ -3641,6 +3855,15 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
                 availabilityStatus: 'available',
                 dataManagement: 'unmanaged'
             })
+        } else if (isWeakShellHostLaunch) {
+            Object.assign(diagRef, {
+                availabilityStatus: 'available',
+                ownershipProofLevel: diagRef.ownershipProofLevel || (appConfig.launchSourceType === 'shell-execute' ? 'weak' : 'none'),
+                closePolicy: 'never',
+                canQuitFromOmniLaunch: false,
+                closeManagedAfterSpawn: false,
+                dataManagement: 'unmanaged'
+            })
         }
 
         const spawnTime = Date.now()
@@ -3666,6 +3889,7 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
             ownershipProofLevel: diagRef.ownershipProofLevel || null,
             closePolicy: diagRef.closePolicy || null,
             ownershipFingerprint: localPath || null,
+            appConfig,
             realPidSignal: null,
             readyObserved: false,
             readyWindowPid: null,
@@ -3712,7 +3936,7 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
 
             if (appObj.abandonSync) return
 
-            if (lifetime < 15000 && !appObj.readyObserved && !closeInProgress && !appObj.closeMethod) {
+            if (lifetime < 15000 && appObj.canQuitFromOmniLaunch !== false && !appObj.readyObserved && !closeInProgress && !appObj.closeMethod) {
                 appObj.isLauncherPattern = true
                 updateAppDiagnostic(appObj, {
                     isLauncher: true,
@@ -3789,6 +4013,12 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
                         : readiness.message
                     finish(failLaunch('app-readiness', message, readiness.stage || 'readiness-checking'))
                     return false
+                }
+
+                const launchPolicy = getReadinessProfileForApp(appObj)
+                if (launchPolicy.mode === 'activation-only') {
+                    await finishWithReadiness()
+                    return
                 }
 
                 if (appObj.exited) {
