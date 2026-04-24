@@ -139,7 +139,7 @@ runCheck('Manual host EXE launch mode is launch-only and ownership-gated', () =>
         engineCode.includes('function isHostExeLaunchConfig') &&
         engineCode.includes('function canCloseLaunchedApp') &&
         engineCode.includes("availabilityStatus: 'missing-on-this-PC'") &&
-        engineCode.includes('launchSource: isHostExeLaunch ? appConfig.launchSourceType : launchSource') &&
+        engineCode.includes('launchSource: (isHostExeLaunch || isWeakShellHostLaunch) ? appConfig.launchSourceType : launchSource') &&
         engineCode.includes("ownershipProofLevel: 'strong'") &&
         engineCode.includes("closePolicy: 'owned-tree'") &&
         engineCode.includes("canQuitFromOmniLaunch: true") &&
@@ -182,6 +182,37 @@ runCheck('App Paths and Start Menu shortcuts are discovered and ownership-classi
     )
 })
 
+runCheck('ShellExecute protocol and packaged app entries are weak non-close-managed launches', () => {
+    const lifecycleProbeCode = fs.readFileSync(join(process.cwd(), 'scripts/lifecycle-probe.js'), 'utf-8')
+    assert(
+        manifestCode.includes('export function resolveShellExecuteSupportFields') &&
+        manifestCode.includes('export function resolveProtocolUriSupportFields') &&
+        manifestCode.includes('export function resolvePackagedAppSupportFields') &&
+        manifestCode.includes('LAUNCH_SOURCE_TYPES.SHELL_EXECUTE') &&
+        manifestCode.includes('LAUNCH_METHODS.SHELL_EXECUTE') &&
+        manifestCode.includes('LAUNCH_METHODS.PROTOCOL') &&
+        manifestCode.includes('LAUNCH_METHODS.PACKAGED_APP') &&
+        indexCode.includes('function readProtocolUriEntries') &&
+        indexCode.includes('function readPackagedApps') &&
+        indexCode.includes('function buildShellExecuteLaunchReference') &&
+        indexCode.includes('function buildProtocolUriLaunchReference') &&
+        indexCode.includes('function buildPackagedAppLaunchReference') &&
+        indexCode.includes('resolveShellExecuteLaunchReference') &&
+        indexCode.includes('resolveProtocolUriLaunchReference') &&
+        indexCode.includes('resolvePackagedAppLaunchReference') &&
+        engineCode.includes('function isWeakShellHostLaunchConfig') &&
+        engineCode.includes('function applyWeakShellHostDiagnostic') &&
+        engineCode.includes('isWeakShellHostLaunch') &&
+        engineCode.includes("closePolicy: 'never'") &&
+        engineCode.includes('canQuitFromOmniLaunch: false') &&
+        dashboardCode.includes('Protocol') &&
+        dashboardCode.includes('Packaged') &&
+        dashboardCode.includes('No ownership: protocol handler launch') &&
+        lifecycleProbeCode.includes('ShellExecute protocol and packaged app fields stay non-close-managed'),
+        'Expected ShellExecute, protocol URI, and packaged app entries to be discoverable launch references with unmanaged data and no close authority.'
+    )
+})
+
 runCheck('Registry uninstall host launch references are data-unmanaged and re-resolved', () => {
     const preloadCode = fs.readFileSync(join(process.cwd(), 'src/preload/index.js'), 'utf-8')
     const lifecycleProbeCode = fs.readFileSync(join(process.cwd(), 'scripts/lifecycle-probe.js'), 'utf-8')
@@ -195,7 +226,7 @@ runCheck('Registry uninstall host launch references are data-unmanaged and re-re
         indexCode.includes("availabilityStatus: 'stale-registry-reference'") &&
         indexCode.includes("availabilityStatus: 'missing-on-this-PC'") &&
         indexCode.includes('registry-display-icon-hint') &&
-        indexCode.includes("['registry-uninstall', 'app-paths', 'start-menu-shortcut'].includes(desktopApp?.launchSourceType)") &&
+        indexCode.includes("'registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app'") &&
         preloadCode.includes('scanHostInstalledApps') &&
         dashboardCode.includes('scanInstalledApps') &&
         dashboardCode.includes('selectInstalledApp') &&
@@ -308,6 +339,20 @@ runCheck('Desktop readiness verifies window/process evidence', () => {
     assert(engineCode.includes("launchVerifiedBy: 'visible-window'"), 'Expected visible-window readiness to replace initial PID success.')
     assert(engineCode.includes("'running-no-window'"), 'Expected no-window diagnostics for running apps.')
     assert(engineCode.includes("'exited-early'"), 'Expected early-exit diagnostics.')
+})
+
+runCheck('Launch/readiness policy is source-aware and partial-ready safe', () => {
+    assert(engineCode.includes('function resolveLaunchReadinessPolicy'), 'Expected centralized launch/readiness policy.')
+    assert(engineCode.includes("mode: 'activation-only'"), 'Expected weak shell/protocol/packaged launches to use activation-only readiness.')
+    assert(engineCode.includes("status: 'partial-ready'"), 'Expected partial-ready diagnostics for activation-only or launcher/updater observations.')
+    assert(engineCode.includes('partialReadyReason'), 'Expected clear partial-ready reason diagnostics.')
+    assert(engineCode.includes('function classifyLaunchTarget'), 'Expected launch target helper/updater classification.')
+    assert(engineCode.includes('LAUNCHER_UPDATER_WINDOW_PATTERNS'), 'Expected launcher/updater window classification patterns.')
+    assert(engineCode.includes('function buildExpectedWindowPatterns'), 'Expected expected-window pattern generation.')
+    assert(engineCode.includes('function classifyReadinessWindow'), 'Expected window classification for readiness decisions.')
+    assert(engineCode.includes('readinessOwnershipMode'), 'Expected diagnostics to expose ownership mode.')
+    assert(engineCode.includes('appObj.canQuitFromOmniLaunch !== false'), 'Expected weak/no-close launches not to enter launcher handoff cleanup path.')
+    assert(engineCode.includes("launchVerifiedBy: 'shell-activation-sent'"), 'Expected activation-only launches to finalize as shell activation sent.')
 })
 
 runCheck('Desktop readiness hardening avoids P1 regressions', () => {

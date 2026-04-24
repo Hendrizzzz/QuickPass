@@ -56,7 +56,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const isInSessionMode = sessionMode !== null
     const hasUnsavedAppChanges = JSON.stringify(desktopApps) !== JSON.stringify(workspace?.desktopApps || [])
 
-    const HOST_LAUNCH_SOURCE_TYPES = new Set(['host-exe', 'registry-uninstall', 'app-paths', 'start-menu-shortcut'])
+    const HOST_LAUNCH_SOURCE_TYPES = new Set(['host-exe', 'registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app'])
     const isManualHostExePath = (path) => /\.exe$/i.test(String(path || '').trim())
     const isHostLaunchForm = (form = appForm) => HOST_LAUNCH_SOURCE_TYPES.has(form.launchSourceType) || isManualHostExePath(form.path)
 
@@ -144,6 +144,9 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const getHostSourceLabel = (item) => {
         if (item?.launchSourceType === 'app-paths') return 'App Paths'
         if (item?.launchSourceType === 'start-menu-shortcut') return 'Shortcut'
+        if (item?.launchSourceType === 'shell-execute') return 'Shell'
+        if (item?.launchSourceType === 'protocol-uri') return 'Protocol'
+        if (item?.launchSourceType === 'packaged-app') return 'Packaged'
         if (item?.launchSourceType === 'registry-uninstall') return 'Registry'
         return 'Host EXE'
     }
@@ -600,6 +603,12 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                             )}
                                             {app.shortcutClassification?.warning && (
                                                 <span className="block text-[10px] text-[#d4a44a] truncate">{app.shortcutClassification.warning}</span>
+                                            )}
+                                            {app.launchSourceType === 'protocol-uri' && (
+                                                <span className="block text-[10px] text-[#d4a44a] truncate">No ownership: protocol handler launch</span>
+                                            )}
+                                            {app.launchSourceType === 'packaged-app' && (
+                                                <span className="block text-[10px] text-[#d4a44a] truncate">No ownership: Windows packaged app activation</span>
                                             )}
                                         </button>
                                         )

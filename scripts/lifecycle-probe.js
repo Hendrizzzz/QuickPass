@@ -16,11 +16,14 @@ import {
     DATA_MANAGEMENT_LEVELS,
     getManifestPath,
     LAUNCH_SOURCE_TYPES,
+    resolvePackagedAppSupportFields,
+    resolveProtocolUriSupportFields,
     repairLegacyAppConfig,
     resolveAppPathsSupportFields,
     resolveHostExeSupportFields,
     resolveImportedAppDataCapability,
     resolveRegistryUninstallSupportFields,
+    resolveShellExecuteSupportFields,
     resolveStartMenuShortcutSupportFields,
     safeAppName,
     writeAppManifest
@@ -257,6 +260,43 @@ try {
         assert.equal(weakShortcut.closeManagedAfterSpawn, false)
         assert.equal(weakShortcut.canQuitFromOmniLaunch, false)
         assert.match(weakShortcut.limitations.join(' '), /launch arguments/i)
+    })
+
+    await runProbe('ShellExecute protocol and packaged app fields stay non-close-managed', async () => {
+        const shellExecute = resolveShellExecuteSupportFields({
+            appName: 'ShellExecute Probe',
+            availabilityStatus: 'available',
+            warning: 'Shortcut requires ShellExecute.'
+        })
+        assert.equal(shellExecute.launchSourceType, LAUNCH_SOURCE_TYPES.SHELL_EXECUTE)
+        assert.equal(shellExecute.launchMethod, 'shell-execute')
+        assert.equal(shellExecute.ownershipProofLevel, 'weak')
+        assert.equal(shellExecute.closePolicy, 'never')
+        assert.equal(shellExecute.canQuitFromOmniLaunch, false)
+        assert.equal(shellExecute.closeManagedAfterSpawn, false)
+        assert.equal(shellExecute.dataManagement, DATA_MANAGEMENT_LEVELS.UNMANAGED)
+
+        const protocol = resolveProtocolUriSupportFields({
+            appName: 'Protocol Probe',
+            availabilityStatus: 'available'
+        })
+        assert.equal(protocol.launchSourceType, LAUNCH_SOURCE_TYPES.PROTOCOL_URI)
+        assert.equal(protocol.launchMethod, 'protocol')
+        assert.equal(protocol.ownershipProofLevel, 'none')
+        assert.equal(protocol.closePolicy, 'never')
+        assert.equal(protocol.canQuitFromOmniLaunch, false)
+        assert.equal(protocol.dataManagement, DATA_MANAGEMENT_LEVELS.UNMANAGED)
+
+        const packaged = resolvePackagedAppSupportFields({
+            appName: 'Packaged Probe',
+            availabilityStatus: 'available'
+        })
+        assert.equal(packaged.launchSourceType, LAUNCH_SOURCE_TYPES.PACKAGED_APP)
+        assert.equal(packaged.launchMethod, 'packaged-app')
+        assert.equal(packaged.ownershipProofLevel, 'none')
+        assert.equal(packaged.closePolicy, 'never')
+        assert.equal(packaged.canQuitFromOmniLaunch, false)
+        assert.equal(packaged.dataManagement, DATA_MANAGEMENT_LEVELS.UNMANAGED)
     })
 
     await runProbe('generic Electron import manifest normalizes imported AppData to none', async () => {
