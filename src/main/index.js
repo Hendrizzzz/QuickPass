@@ -25,7 +25,10 @@ import {
     resolveHostExeSupportFields,
     resolveImportedAppDataCapability,
     resolveManifestSupportFields,
+    resolvePackagedAppSupportFields,
+    resolveProtocolUriSupportFields,
     resolveRegistryUninstallSupportFields,
+    resolveShellExecuteSupportFields,
     resolveStartMenuShortcutSupportFields,
     safeAppName,
     selectBestExecutable,
@@ -800,6 +803,88 @@ function registerIpcHandlers() {
         }
     }
 
+    function buildShellExecuteLaunchReference(shortcut, availabilityStatus = 'available') {
+        const name = shortcut.name || basename(shortcut.shortcutPath || '').replace(/\.lnk$/i, '')
+        const warning = shortcut?.shortcutClassification?.warning || 'Shortcut will be launched through Windows ShellExecute with weak ownership.'
+        return {
+            name,
+            path: shortcut.shortcutPath || shortcut.targetPath || '',
+            args: shortcut.arguments || '',
+            portableData: false,
+            enabled: true,
+            id: Date.now(),
+            ...resolveShellExecuteSupportFields({
+                appName: name,
+                availabilityStatus,
+                warning
+            }),
+            shortcutPath: shortcut.shortcutPath || '',
+            shortcutTargetPath: shortcut.targetPath || '',
+            shortcutArguments: shortcut.arguments || '',
+            shortcutWorkingDirectory: shortcut.workingDirectory || '',
+            shortcutIconLocation: shortcut.iconLocation || '',
+            shellExecuteResolution: {
+                status: availabilityStatus,
+                resolvedPath: shortcut.shortcutPath || shortcut.targetPath || '',
+                resolvedAt: Date.now()
+            },
+            shortcutClassification: {
+                status: 'shell-execute-weak',
+                warning,
+                resolvedAt: Date.now()
+            }
+        }
+    }
+
+    function buildProtocolUriLaunchReference(entry, availabilityStatus = 'available') {
+        const scheme = String(entry?.scheme || '').trim()
+        const uri = String(entry?.uri || `${scheme}:`).trim()
+        return {
+            name: entry?.name || `${scheme}:`,
+            path: uri,
+            args: '',
+            portableData: false,
+            enabled: true,
+            id: Date.now(),
+            ...resolveProtocolUriSupportFields({
+                appName: entry?.name || `${scheme}:`,
+                availabilityStatus
+            }),
+            protocolScheme: scheme,
+            protocolCommand: entry?.command || '',
+            protocolRegistryKey: entry?.registryKey || '',
+            protocolResolution: {
+                status: availabilityStatus,
+                resolvedUri: uri,
+                resolvedAt: Date.now()
+            }
+        }
+    }
+
+    function buildPackagedAppLaunchReference(entry, availabilityStatus = 'available') {
+        const appId = String(entry?.appId || '').trim()
+        const activationPath = appId ? `shell:AppsFolder\\${appId}` : ''
+        return {
+            name: entry?.name || appId,
+            path: activationPath,
+            args: '',
+            portableData: false,
+            enabled: true,
+            id: Date.now(),
+            ...resolvePackagedAppSupportFields({
+                appName: entry?.name || appId,
+                availabilityStatus
+            }),
+            packagedAppId: appId,
+            packagedAppResolution: {
+                status: availabilityStatus,
+                appId,
+                resolvedPath: activationPath,
+                resolvedAt: Date.now()
+            }
+        }
+    }
+
     async function readAppPathsEntries() {
         const entries = []
         await Promise.all(APP_PATHS_ROOTS.map(async (regRoot) => {
@@ -893,6 +978,79 @@ $items | ConvertTo-Json -Depth 3 -Compress
         }
     }
 
+    async function readProtocolUriEntries() {
+        const script = `
+$ErrorActionPreference = 'SilentlyContinue'
+$roots = @('Registry::HKEY_CURRENT_USER\\Software\\Classes', 'Registry::HKEY_CLASSES_ROOT')
+$blocked = @('file', 'javascript', 'vbscript', 'data', 'http', 'https')
+$items = @()
+foreach ($root in $roots) {
+  Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {
+    try {
+      $scheme = $_.PSChildName
+      if (-not $scheme -or $scheme -notmatch '^[a-z][a-z0-9+.-]{1,39}$') { return }
+      if ($blocked -contains $scheme.ToLowerInvariant()) { return }
+      $props = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+      if ($null -eq $props -or $null -eq $props.'URL Protocol') { return }
+      $commandKey = Join-Path $_.PSPath 'shell\\open\\command'
+      $commandProps = Get-ItemProperty -LiteralPath $commandKey -ErrorAction SilentlyContinue
+      $command = ''
+      if ($commandProps) { $command = [string]$commandProps.'(default)' }
+      $items += [pscustomobject]@{
+        name = "$scheme:"
+        scheme = $scheme
+        uri = "$scheme:"
+        command = $command
+        registryKey = $_.Name
+      }
+    } catch {}
+  }
+}
+$items | Sort-Object scheme -Unique | Select-Object -First 80 | ConvertTo-Json -Depth 3 -Compress
+`
+        try {
+            const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], {
+                encoding: 'utf8',
+                maxBuffer: 10 * 1024 * 1024
+            })
+            const trimmed = stdout.trim()
+            if (!trimmed) return []
+            const parsed = JSON.parse(trimmed)
+            return Array.isArray(parsed) ? parsed : [parsed]
+        } catch (_) {
+            return []
+        }
+    }
+
+    async function readPackagedApps() {
+        const script = `
+$ErrorActionPreference = 'SilentlyContinue'
+Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
+  Select-Object -First 120 -Property @{Name='name';Expression={$_.Name}}, @{Name='appId';Expression={$_.AppID}} |
+  ConvertTo-Json -Depth 3 -Compress
+`
+        try {
+            const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], {
+                encoding: 'utf8',
+                maxBuffer: 10 * 1024 * 1024
+            })
+            const trimmed = stdout.trim()
+            if (!trimmed) return []
+            const parsed = JSON.parse(trimmed)
+            return Array.isArray(parsed) ? parsed : [parsed]
+        } catch (_) {
+            return []
+        }
+    }
+
+    function isValidProtocolUri(uri) {
+        const value = String(uri || '').trim()
+        const match = value.match(/^([a-z][a-z0-9+.-]{1,39}):/i)
+        if (!match) return false
+        const scheme = match[1].toLowerCase()
+        return !['file', 'javascript', 'vbscript', 'data', 'http', 'https'].includes(scheme)
+    }
+
     async function resolveAppPathsLaunchReference(appConfig) {
         const entries = await readAppPathsEntries()
         const key = String(appConfig?.appPathsKey || '').toLowerCase()
@@ -959,6 +1117,122 @@ $items | ConvertTo-Json -Depth 3 -Compress
             id: appConfig?.id || Date.now(),
             enabled: appConfig?.enabled !== false
         }
+    }
+
+    async function resolveShellExecuteLaunchReference(appConfig) {
+        const shortcutPath = String(appConfig?.shortcutPath || appConfig?.path || '')
+        if (!shortcutPath || !existsSync(shortcutPath)) {
+            return {
+                ...appConfig,
+                ...resolveShellExecuteSupportFields({
+                    appName: appConfig?.name,
+                    availabilityStatus: 'stale-shell-execute-reference',
+                    warning: 'ShellExecute shortcut was not found on this PC.'
+                }),
+                shellExecuteResolution: {
+                    status: 'stale-shell-execute-reference',
+                    reason: 'ShellExecute shortcut was not found on this PC.',
+                    resolvedAt: Date.now()
+                }
+            }
+        }
+
+        return {
+            ...appConfig,
+            path: shortcutPath,
+            ...resolveShellExecuteSupportFields({
+                appName: appConfig?.name,
+                availabilityStatus: 'available',
+                warning: appConfig?.shortcutClassification?.warning
+            }),
+            shellExecuteResolution: {
+                status: 'available',
+                resolvedPath: shortcutPath,
+                resolvedAt: Date.now()
+            }
+        }
+    }
+
+    async function resolveProtocolUriLaunchReference(appConfig) {
+        const entries = await readProtocolUriEntries()
+        const scheme = String(appConfig?.protocolScheme || '').toLowerCase()
+        const entry = entries.find(item => scheme && String(item.scheme || '').toLowerCase() === scheme)
+        const uri = appConfig?.path || appConfig?.protocolResolution?.resolvedUri || (scheme ? `${scheme}:` : '')
+
+        if (!entry || !isValidProtocolUri(uri)) {
+            return {
+                ...appConfig,
+                ...resolveProtocolUriSupportFields({
+                    appName: appConfig?.name,
+                    availabilityStatus: 'stale-protocol-reference'
+                }),
+                protocolResolution: {
+                    status: 'stale-protocol-reference',
+                    reason: !entry ? 'Protocol handler was not found on this PC.' : 'Protocol URI is not allowed.',
+                    resolvedAt: Date.now()
+                }
+            }
+        }
+
+        return {
+            ...appConfig,
+            ...buildProtocolUriLaunchReference({
+                ...entry,
+                uri,
+                name: appConfig?.name || entry.name
+            }, 'available'),
+            id: appConfig?.id || Date.now(),
+            enabled: appConfig?.enabled !== false
+        }
+    }
+
+    async function resolvePackagedAppLaunchReference(appConfig) {
+        const apps = await readPackagedApps()
+        const appId = String(appConfig?.packagedAppId || '').toLowerCase()
+        const entry = apps.find(item => appId && String(item.appId || '').toLowerCase() === appId)
+
+        if (!entry) {
+            return {
+                ...appConfig,
+                ...resolvePackagedAppSupportFields({
+                    appName: appConfig?.name,
+                    availabilityStatus: 'stale-packaged-app-reference'
+                }),
+                packagedAppResolution: {
+                    status: 'stale-packaged-app-reference',
+                    reason: 'Packaged app was not found on this PC.',
+                    resolvedAt: Date.now()
+                }
+            }
+        }
+
+        return {
+            ...appConfig,
+            ...buildPackagedAppLaunchReference(entry, 'available'),
+            id: appConfig?.id || Date.now(),
+            enabled: appConfig?.enabled !== false
+        }
+    }
+
+    function resolveHostLaunchFailureSupportFields(desktopApp, availabilityStatus = 'missing-on-this-PC') {
+        if (desktopApp?.launchSourceType === 'shell-execute') {
+            return resolveShellExecuteSupportFields({
+                appName: desktopApp.name,
+                availabilityStatus,
+                warning: 'ShellExecute launch reference could not be resolved on this PC.'
+            })
+        }
+        if (desktopApp?.launchSourceType === 'protocol-uri') {
+            return resolveProtocolUriSupportFields({ appName: desktopApp.name, availabilityStatus })
+        }
+        if (desktopApp?.launchSourceType === 'packaged-app') {
+            return resolvePackagedAppSupportFields({ appName: desktopApp.name, availabilityStatus })
+        }
+        return resolveHostExeSupportFields({
+            appName: desktopApp.name,
+            availabilityStatus,
+            launchSourceType: desktopApp.launchSourceType || 'host-exe'
+        })
     }
 
     async function resolveRegistryUninstallLaunchReference(appConfig) {
@@ -1077,6 +1351,8 @@ $items | ConvertTo-Json -Depth 3 -Compress
             const entries = await readRegistryUninstallEntries()
             const appPathEntries = await readAppPathsEntries()
             const shortcuts = await readStartMenuShortcuts()
+            const protocolEntries = await readProtocolUriEntries()
+            const packagedApps = await readPackagedApps()
             const seen = new Set()
             const results = []
 
@@ -1104,7 +1380,25 @@ $items | ConvertTo-Json -Depth 3 -Compress
 
             for (const shortcut of shortcuts) {
                 if (!shortcut?.targetPath || !existsSync(shortcut.targetPath)) continue
-                addResult(buildShortcutLaunchReference(shortcut, 'available'))
+                const directReference = buildShortcutLaunchReference(shortcut, 'available')
+                if (directReference.shortcutClassification?.status === 'strong-direct-exe') {
+                    addResult(directReference)
+                } else if (shortcut.shortcutPath && existsSync(shortcut.shortcutPath)) {
+                    addResult(buildShellExecuteLaunchReference({
+                        ...shortcut,
+                        shortcutClassification: directReference.shortcutClassification
+                    }, 'available'))
+                }
+            }
+
+            for (const entry of protocolEntries) {
+                if (!entry?.scheme || !isValidProtocolUri(entry.uri)) continue
+                addResult(buildProtocolUriLaunchReference(entry, 'available'))
+            }
+
+            for (const entry of packagedApps) {
+                if (!entry?.appId) continue
+                addResult(buildPackagedAppLaunchReference(entry, 'available'))
             }
 
             results.sort((a, b) => a.name.localeCompare(b.name))
@@ -1876,7 +2170,7 @@ $items | ConvertTo-Json -Depth 3 -Compress
                     ...workspace,
                     desktopApps: (workspace.desktopApps || []).map((desktopApp) => {
                         try {
-                            if (['registry-uninstall', 'app-paths', 'start-menu-shortcut'].includes(desktopApp?.launchSourceType)) {
+                            if (['registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app'].includes(desktopApp?.launchSourceType)) {
                                 return desktopApp
                             }
                             const repair = repairLegacyAppConfig(desktopApp, vaultDir)
@@ -1891,7 +2185,7 @@ $items | ConvertTo-Json -Depth 3 -Compress
                     })
                 }
                 launchWorkspaceConfig.desktopApps = await Promise.all((launchWorkspaceConfig.desktopApps || []).map(async (desktopApp) => {
-                    if (!['registry-uninstall', 'app-paths', 'start-menu-shortcut'].includes(desktopApp?.launchSourceType)) return desktopApp
+                    if (!['registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app'].includes(desktopApp?.launchSourceType)) return desktopApp
                     try {
                         if (desktopApp.launchSourceType === 'registry-uninstall') {
                             return await resolveRegistryUninstallLaunchReference(desktopApp)
@@ -1899,16 +2193,21 @@ $items | ConvertTo-Json -Depth 3 -Compress
                         if (desktopApp.launchSourceType === 'app-paths') {
                             return await resolveAppPathsLaunchReference(desktopApp)
                         }
-                        return await resolveStartMenuShortcutLaunchReference(desktopApp)
+                        if (desktopApp.launchSourceType === 'start-menu-shortcut') {
+                            return await resolveStartMenuShortcutLaunchReference(desktopApp)
+                        }
+                        if (desktopApp.launchSourceType === 'shell-execute') {
+                            return await resolveShellExecuteLaunchReference(desktopApp)
+                        }
+                        if (desktopApp.launchSourceType === 'protocol-uri') {
+                            return await resolveProtocolUriLaunchReference(desktopApp)
+                        }
+                        return await resolvePackagedAppLaunchReference(desktopApp)
                     } catch (err) {
                         diagError('host-launch-resolve', `${desktopApp.name || desktopApp.path}: ${err.message}`)
                         return {
                             ...desktopApp,
-                            ...resolveHostExeSupportFields({
-                                appName: desktopApp.name,
-                                availabilityStatus: 'missing-on-this-PC',
-                                launchSourceType: desktopApp.launchSourceType || 'host-exe'
-                            }),
+                            ...resolveHostLaunchFailureSupportFields(desktopApp, 'missing-on-this-PC'),
                             hostResolution: {
                                 status: 'missing-on-this-PC',
                                 reason: err.message,
