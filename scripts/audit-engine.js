@@ -129,6 +129,83 @@ runCheck('Manifest V2 support metadata is visible without new app powers', () =>
     )
 })
 
+runCheck('Manual host EXE launch mode is launch-only and ownership-gated', () => {
+    const lifecycleProbeCode = fs.readFileSync(join(process.cwd(), 'scripts/lifecycle-probe.js'), 'utf-8')
+    assert(
+        manifestCode.includes('export function resolveHostExeSupportFields') &&
+        manifestCode.includes('launchSourceType = LAUNCH_SOURCE_TYPES.HOST_EXE') &&
+        manifestCode.includes("closePolicy: CLOSE_POLICIES.NEVER") &&
+        manifestCode.includes('canQuitFromOmniLaunch: false') &&
+        engineCode.includes('function isHostExeLaunchConfig') &&
+        engineCode.includes('function canCloseLaunchedApp') &&
+        engineCode.includes("availabilityStatus: 'missing-on-this-PC'") &&
+        engineCode.includes('launchSource: isHostExeLaunch ? appConfig.launchSourceType : launchSource') &&
+        engineCode.includes("ownershipProofLevel: 'strong'") &&
+        engineCode.includes("closePolicy: 'owned-tree'") &&
+        engineCode.includes("canQuitFromOmniLaunch: true") &&
+        dashboardCode.includes('createManualHostExeFields') &&
+        dashboardCode.includes("launchSourceType: 'host-exe'") &&
+        dashboardCode.includes("launchMethod: 'spawn'") &&
+        dashboardCode.includes('getHostSourceLabel(appForm)') &&
+        dashboardCode.includes('data unmanaged') &&
+        lifecycleProbeCode.includes('manual host exe support fields are launch-only and data unmanaged'),
+        'Expected manual host .exe entries to be launch-only, data-unmanaged, missing-aware, and quit-gated by ownership proof.'
+    )
+})
+
+runCheck('App Paths and Start Menu shortcuts are discovered and ownership-classified', () => {
+    const lifecycleProbeCode = fs.readFileSync(join(process.cwd(), 'scripts/lifecycle-probe.js'), 'utf-8')
+    assert(
+        manifestCode.includes('export function resolveAppPathsSupportFields') &&
+        manifestCode.includes('export function resolveStartMenuShortcutSupportFields') &&
+        manifestCode.includes('LAUNCH_SOURCE_TYPES.APP_PATHS') &&
+        manifestCode.includes('LAUNCH_SOURCE_TYPES.START_MENU_SHORTCUT') &&
+        indexCode.includes('const APP_PATHS_ROOTS') &&
+        indexCode.includes('function readAppPathsEntries') &&
+        indexCode.includes('function resolveAppPathEntryExecutable') &&
+        indexCode.includes('function readStartMenuShortcuts') &&
+        indexCode.includes('function classifyShortcutTarget') &&
+        indexCode.includes('function buildShortcutLaunchReference') &&
+        indexCode.includes('resolveAppPathsLaunchReference') &&
+        indexCode.includes('resolveStartMenuShortcutLaunchReference') &&
+        indexCode.includes('app-paths') &&
+        indexCode.includes('start-menu-shortcut') &&
+        indexCode.includes('closeManagedAfterSpawn: strongDirectExecutable') &&
+        engineCode.includes("'app-paths'") &&
+        engineCode.includes("'start-menu-shortcut'") &&
+        engineCode.includes('appConfig.closeManagedAfterSpawn !== false') &&
+        dashboardCode.includes('App Paths') &&
+        dashboardCode.includes('Shortcut') &&
+        dashboardCode.includes('Args:') &&
+        lifecycleProbeCode.includes('App Paths and Start Menu shortcut fields preserve ownership classes'),
+        'Expected App Paths and Start Menu shortcuts to be discoverable as data-unmanaged launch references with strong/weak ownership classification.'
+    )
+})
+
+runCheck('Registry uninstall host launch references are data-unmanaged and re-resolved', () => {
+    const preloadCode = fs.readFileSync(join(process.cwd(), 'src/preload/index.js'), 'utf-8')
+    const lifecycleProbeCode = fs.readFileSync(join(process.cwd(), 'scripts/lifecycle-probe.js'), 'utf-8')
+    assert(
+        manifestCode.includes('export function resolveRegistryUninstallSupportFields') &&
+        manifestCode.includes('LAUNCH_SOURCE_TYPES.REGISTRY_UNINSTALL') &&
+        indexCode.includes("ipcMain.handle('scan-host-installed-apps'") &&
+        indexCode.includes('function readRegistryUninstallEntries') &&
+        indexCode.includes('function resolveRegistryEntryExecutable') &&
+        indexCode.includes('function resolveRegistryUninstallLaunchReference') &&
+        indexCode.includes("availabilityStatus: 'stale-registry-reference'") &&
+        indexCode.includes("availabilityStatus: 'missing-on-this-PC'") &&
+        indexCode.includes('registry-display-icon-hint') &&
+        indexCode.includes("['registry-uninstall', 'app-paths', 'start-menu-shortcut'].includes(desktopApp?.launchSourceType)") &&
+        preloadCode.includes('scanHostInstalledApps') &&
+        dashboardCode.includes('scanInstalledApps') &&
+        dashboardCode.includes('selectInstalledApp') &&
+        dashboardCode.includes('getHostSourceLabel(appForm)') &&
+        dashboardCode.includes('data unmanaged') &&
+        lifecycleProbeCode.includes('registry uninstall support fields are launch references only'),
+        'Expected registry uninstall entries to be stored as launch-only references, re-resolved before launch, and kept data-unmanaged.'
+    )
+})
+
 runCheck('Stale AppData cleanup is saved-state and confirmation guarded', () => {
     assert(
         importAppsModalCode.includes('canImportAppData(app)') &&

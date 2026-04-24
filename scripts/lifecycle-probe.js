@@ -17,7 +17,11 @@ import {
     getManifestPath,
     LAUNCH_SOURCE_TYPES,
     repairLegacyAppConfig,
+    resolveAppPathsSupportFields,
+    resolveHostExeSupportFields,
     resolveImportedAppDataCapability,
+    resolveRegistryUninstallSupportFields,
+    resolveStartMenuShortcutSupportFields,
     safeAppName,
     writeAppManifest
 } from '../src/main/appManifest.js'
@@ -187,6 +191,72 @@ try {
         assert.equal(obs.launchAdapter, APP_ADAPTER_IDS.OBS_PORTABLE)
         assert.equal(obs.dataManagement, DATA_MANAGEMENT_LEVELS.UNSUPPORTED)
         assert.equal(obs.importedDataSupported, false)
+    })
+
+    await runProbe('manual host exe support fields are launch-only and data unmanaged', async () => {
+        const fields = resolveHostExeSupportFields({
+            appName: 'Notepad',
+            availabilityStatus: 'unknown'
+        })
+
+        assert.equal(fields.supportTier, SUPPORT_TIERS.LAUNCH_ONLY)
+        assert.equal(fields.launchSourceType, LAUNCH_SOURCE_TYPES.HOST_EXE)
+        assert.equal(fields.launchMethod, 'spawn')
+        assert.equal(fields.ownershipProofLevel, 'none')
+        assert.equal(fields.closePolicy, 'never')
+        assert.equal(fields.canQuitFromOmniLaunch, false)
+        assert.equal(fields.availabilityStatus, 'unknown')
+        assert.equal(fields.dataManagement, DATA_MANAGEMENT_LEVELS.UNMANAGED)
+        assert.equal(fields.importedDataSupported, false)
+        assert.equal(fields.importedDataAdapterId, APP_ADAPTER_IDS.NONE)
+    })
+
+    await runProbe('registry uninstall support fields are launch references only', async () => {
+        const fields = resolveRegistryUninstallSupportFields({
+            appName: 'Registry App Probe',
+            availabilityStatus: 'available'
+        })
+
+        assert.equal(fields.supportTier, SUPPORT_TIERS.LAUNCH_ONLY)
+        assert.equal(fields.launchSourceType, LAUNCH_SOURCE_TYPES.REGISTRY_UNINSTALL)
+        assert.equal(fields.launchMethod, 'spawn')
+        assert.equal(fields.dataManagement, DATA_MANAGEMENT_LEVELS.UNMANAGED)
+        assert.equal(fields.importedDataSupported, false)
+        assert.equal(fields.canQuitFromOmniLaunch, false)
+        assert.equal(fields.availabilityStatus, 'available')
+        assert.match(fields.supportSummary, /Registry-discovered host app/)
+    })
+
+    await runProbe('App Paths and Start Menu shortcut fields preserve ownership classes', async () => {
+        const appPaths = resolveAppPathsSupportFields({
+            appName: 'App Paths Probe',
+            availabilityStatus: 'available'
+        })
+        assert.equal(appPaths.launchSourceType, LAUNCH_SOURCE_TYPES.APP_PATHS)
+        assert.equal(appPaths.launchMethod, 'spawn')
+        assert.equal(appPaths.dataManagement, DATA_MANAGEMENT_LEVELS.UNMANAGED)
+        assert.equal(appPaths.closeManagedAfterSpawn, true)
+        assert.equal(appPaths.canQuitFromOmniLaunch, false)
+
+        const strongShortcut = resolveStartMenuShortcutSupportFields({
+            appName: 'Strong Shortcut Probe',
+            availabilityStatus: 'available',
+            strongDirectExecutable: true
+        })
+        assert.equal(strongShortcut.launchSourceType, LAUNCH_SOURCE_TYPES.START_MENU_SHORTCUT)
+        assert.equal(strongShortcut.closeManagedAfterSpawn, true)
+        assert.equal(strongShortcut.canQuitFromOmniLaunch, false)
+
+        const weakShortcut = resolveStartMenuShortcutSupportFields({
+            appName: 'Weak Shortcut Probe',
+            availabilityStatus: 'available',
+            strongDirectExecutable: false,
+            warning: 'Shortcut has launch arguments.'
+        })
+        assert.equal(weakShortcut.launchSourceType, LAUNCH_SOURCE_TYPES.START_MENU_SHORTCUT)
+        assert.equal(weakShortcut.closeManagedAfterSpawn, false)
+        assert.equal(weakShortcut.canQuitFromOmniLaunch, false)
+        assert.match(weakShortcut.limitations.join(' '), /launch arguments/i)
     })
 
     await runProbe('generic Electron import manifest normalizes imported AppData to none', async () => {

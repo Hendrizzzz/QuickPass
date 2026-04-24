@@ -15,6 +15,9 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
 
     const [showAppForm, setShowAppForm] = useState(false)
     const [appForm, setAppForm] = useState({ name: '', path: '', args: '', portableData: false })
+    const [hostInstalledApps, setHostInstalledApps] = useState([])
+    const [hostInstalledLoading, setHostInstalledLoading] = useState(false)
+    const [hostInstalledError, setHostInstalledError] = useState('')
     const [showImportModal, setShowImportModal] = useState(false)
 
     const [masterPassword, setMasterPassword] = useState('')
@@ -53,11 +56,50 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const isInSessionMode = sessionMode !== null
     const hasUnsavedAppChanges = JSON.stringify(desktopApps) !== JSON.stringify(workspace?.desktopApps || [])
 
+    const HOST_LAUNCH_SOURCE_TYPES = new Set(['host-exe', 'registry-uninstall', 'app-paths', 'start-menu-shortcut'])
+    const isManualHostExePath = (path) => /\.exe$/i.test(String(path || '').trim())
+    const isHostLaunchForm = (form = appForm) => HOST_LAUNCH_SOURCE_TYPES.has(form.launchSourceType) || isManualHostExePath(form.path)
+
+    const createManualHostExeFields = (name) => ({
+        supportTier: 'launch-only',
+        supportSummary: 'Host-installed launch-only app. Data is unmanaged and only available on PCs where this .exe exists.',
+        adapterEvidence: 'none',
+        launchSourceType: 'host-exe',
+        launchMethod: 'spawn',
+        ownershipProofLevel: 'none',
+        closePolicy: 'never',
+        canQuitFromOmniLaunch: false,
+        availabilityStatus: 'unknown',
+        dataManagement: 'unmanaged',
+        requiresElevation: false,
+        resolvedAt: null,
+        resolvedHostId: null,
+        launchAdapter: 'native-launch-only',
+        runtimeAdapter: 'none',
+        dataAdapters: [],
+        registryAdapters: [],
+        limitations: [
+            'Data is not copied or synced by OmniLaunch.',
+            'Quit is enabled only after OmniLaunch launches and owns the process.'
+        ],
+        certification: { status: 'uncertified', lastCheckedAt: null, checks: [] },
+        importedDataSupported: false,
+        importedDataSupportLevel: 'unsupported',
+        importedDataAdapterId: 'none',
+        importedDataSupportReason: `Host-installed app data is unmanaged for ${name || 'this app'}.`
+    })
+
     const browseExe = async () => {
         const filePath = await window.omnilaunch.browseExe()
         if (filePath) {
             const name = filePath.split('\\').pop().replace('.exe', '')
-            setAppForm({ ...appForm, path: filePath, name })
+            setAppForm({
+                ...appForm,
+                path: filePath,
+                name,
+                portableData: false,
+                ...createManualHostExeFields(name)
+            })
         }
     }
 
@@ -65,13 +107,60 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         const folderPath = await window.omnilaunch.browseFolder()
         if (folderPath) {
             const name = folderPath.split('\\').pop()
-            setAppForm({ ...appForm, path: folderPath, name })
+            setAppForm({
+                name,
+                path: folderPath,
+                args: appForm.args || '',
+                portableData: appForm.portableData || false
+            })
         }
+    }
+
+    const scanInstalledApps = async () => {
+        setHostInstalledLoading(true)
+        setHostInstalledError('')
+        try {
+            const result = await window.omnilaunch.scanHostInstalledApps()
+            if (!result?.success) {
+                throw new Error(result?.error || 'Installed app scan failed')
+            }
+            setHostInstalledApps(result.apps || [])
+        } catch (err) {
+            setHostInstalledError(err.message || 'Installed app scan failed')
+            setHostInstalledApps([])
+        } finally {
+            setHostInstalledLoading(false)
+        }
+    }
+
+    const selectInstalledApp = (app) => {
+        setAppForm({
+            ...app,
+            args: app.args || '',
+            portableData: false
+        })
+    }
+
+    const getHostSourceLabel = (item) => {
+        if (item?.launchSourceType === 'app-paths') return 'App Paths'
+        if (item?.launchSourceType === 'start-menu-shortcut') return 'Shortcut'
+        if (item?.launchSourceType === 'registry-uninstall') return 'Registry'
+        return 'Host EXE'
     }
 
     const addDesktopApp = () => {
         if (!appForm.path.trim()) return
-        setDesktopApps([...desktopApps, { ...appForm, id: Date.now(), enabled: true }])
+        const isKnownHostLaunch = HOST_LAUNCH_SOURCE_TYPES.has(appForm.launchSourceType)
+        const isHostExe = isManualHostExePath(appForm.path) && !isKnownHostLaunch
+        const isHostLaunch = isKnownHostLaunch || isHostExe
+        const nextApp = {
+            ...appForm,
+            ...(isHostExe ? createManualHostExeFields(appForm.name) : {}),
+            portableData: isHostLaunch ? false : appForm.portableData,
+            id: Date.now(),
+            enabled: true
+        }
+        setDesktopApps([...desktopApps, nextApp])
         setAppForm({ name: '', path: '', args: '', portableData: false })
         setShowAppForm(false)
     }
@@ -481,17 +570,59 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                 <div className="flex flex-col gap-1 justify-center">
                                     <button className="btn-secondary text-[10px] whitespace-nowrap px-2 py-0.5" onClick={browseExe}>.EXE</button>
                                     <button className="btn-secondary text-[10px] whitespace-nowrap px-2 py-0.5" onClick={browseFolder}>Folder</button>
+                                    <button className="btn-secondary text-[10px] whitespace-nowrap px-2 py-0.5" onClick={scanInstalledApps}>
+                                        {hostInstalledLoading ? '...' : 'Installed'}
+                                    </button>
                                 </div>
                             </div>
+                            {(hostInstalledApps.length > 0 || hostInstalledError) && (
+                                <div className="max-h-32 overflow-y-auto rounded-md border border-[#2a2a3a] bg-[#101018]">
+                                    {hostInstalledError && (
+                                        <p className="text-[10px] text-error p-2">{hostInstalledError}</p>
+                                    )}
+                                    {hostInstalledApps.slice(0, 25).map((app) => {
+                                        const selectedHostApp = appForm.path === app.path && appForm.launchSourceType === app.launchSourceType
+
+                                        return (
+                                        <button
+                                            key={app.registryKey || app.appPathsKey || app.shortcutPath || `${app.launchSourceType}:${app.path}`}
+                                            type="button"
+                                            className={`w-full text-left px-2 py-1.5 border-b border-[#242435] last:border-b-0 hover:bg-[#1a1a2e] ${selectedHostApp ? 'bg-[#1a1a2e]' : ''}`}
+                                            onClick={() => selectInstalledApp(app)}
+                                        >
+                                            <span className="flex items-center gap-1.5">
+                                                <span className="text-xs text-white truncate">{app.name}</span>
+                                                <span className="px-1 py-0.5 rounded text-[9px] bg-[#1a1a2e] text-muted border border-[#2a2a3a] flex-shrink-0">{getHostSourceLabel(app)}</span>
+                                            </span>
+                                            <span className="block text-[10px] text-muted truncate">{app.path}</span>
+                                            {app.args && (
+                                                <span className="block text-[10px] text-[#b8c7ff] truncate">Args: {app.args}</span>
+                                            )}
+                                            {app.shortcutClassification?.warning && (
+                                                <span className="block text-[10px] text-[#d4a44a] truncate">{app.shortcutClassification.warning}</span>
+                                            )}
+                                        </button>
+                                        )
+                                    })}
+                                </div>
+                            )}
                             <input className="form-input text-sm" placeholder="Launch Args (optional)" value={appForm.args} onChange={(e) => setAppForm({ ...appForm, args: e.target.value })} />
+                            {appForm.shortcutClassification?.warning && (
+                                <p className="text-[10px] text-[#d4a44a]">{appForm.shortcutClassification.warning}</p>
+                            )}
                             <label className="flex items-center gap-2 text-xs text-secondary cursor-pointer py-1">
                                 <input
                                     type="checkbox"
-                                    checked={appForm.portableData}
+                                    checked={isHostLaunchForm(appForm) ? false : appForm.portableData}
+                                    disabled={isHostLaunchForm(appForm)}
                                     onChange={(e) => setAppForm({ ...appForm, portableData: e.target.checked })}
                                     className="accent-[#5b7bd5]"
                                 />
-                                <span>Keep app data on USB <span className="text-muted">(Electron/Chrome apps)</span></span>
+                                <span>
+                                    {isHostLaunchForm(appForm)
+                                        ? `${getHostSourceLabel(appForm)} data unmanaged`
+                                        : <>Keep app data on USB <span className="text-muted">(Electron/Chrome apps)</span></>}
+                                </span>
                             </label>
                             <button className="btn-primary text-sm py-2" onClick={addDesktopApp}>Add Item</button>
                         </div>
@@ -525,6 +656,12 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                         )}
                                     </div>
                                     <p className="text-xs text-muted truncate">{dApp.path}</p>
+                                    {dApp.args && (
+                                        <p className="text-[10px] text-[#b8c7ff] truncate">Args: {dApp.args}</p>
+                                    )}
+                                    {dApp.shortcutClassification?.warning && (
+                                        <p className="text-[10px] text-[#d4a44a] truncate">{dApp.shortcutClassification.warning}</p>
+                                    )}
                                     {dApp.supportSummary && (
                                         <p className="text-[10px] text-[#d4a44a] truncate">{dApp.supportSummary}</p>
                                     )}
