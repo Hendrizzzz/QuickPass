@@ -28,6 +28,7 @@ contextBridge.exposeInMainWorld('omnilaunch', {
     // App Import
     scanApps: () => ipcRenderer.invoke('scan-apps'),
     importApp: (data) => ipcRenderer.invoke('import-app', data),
+    scanHostInstalledApps: () => ipcRenderer.invoke('scan-host-installed-apps'),
     scanStaleAppData: () => ipcRenderer.invoke('scan-stale-appdata'),
     cleanupStaleAppData: (data) => ipcRenderer.invoke('cleanup-stale-appdata', data),
     notifyImportStarted: () => ipcRenderer.send('import-started'),

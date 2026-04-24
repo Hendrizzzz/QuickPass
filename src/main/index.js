@@ -1,10 +1,11 @@
 import { app, BrowserWindow, ipcMain, dialog } from 'electron'
 import { join, basename } from 'path'
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, rmSync } from 'fs'
-import { execSync, spawn, exec } from 'child_process'
+import { execSync, spawn, exec, execFile } from 'child_process'
 import os from 'os'
 import util from 'util'
 const execAsync = util.promisify(exec)
+const execFileAsync = util.promisify(execFile)
 import crypto from 'crypto'
 import { launchWorkspace, launchSessionSetup, captureSession, captureCurrentSession, closeBrowser, closeDesktopApps, emergencyKillDesktopAppsSync, onBrowserAllClosed, hasActiveBrowserSession, wipeLocalTraces, wipeAllLocalProfiles, wipeAllLocalAppData, wipeLocalAppCache, wipeAllRuntimeAppProfiles, runDiagnostics, diagError, beginDiagnosticsCycle } from './engine.js'
 import {
@@ -17,10 +18,15 @@ import {
     extractExeFromCommand,
     hashFile,
     inferAppType,
+    isDangerousExecutablePath,
     pickSupportFields,
     repairLegacyAppConfig,
+    resolveAppPathsSupportFields,
+    resolveHostExeSupportFields,
     resolveImportedAppDataCapability,
     resolveManifestSupportFields,
+    resolveRegistryUninstallSupportFields,
+    resolveStartMenuShortcutSupportFields,
     safeAppName,
     selectBestExecutable,
     writeAppManifest
@@ -554,6 +560,460 @@ function registerIpcHandlers() {
         return total
     }
 
+    const HOST_APP_BLACKLIST_PATTERNS = [
+        /microsoft visual c\+\+/i, /microsoft \.net/i, /\.net (framework|runtime|sdk)/i,
+        /windows sdk/i, /windows kit/i, /nvidia/i, /amd software/i, /intel\b/i,
+        /java\b.*\b(update|development|runtime)/i, /python\b/i, /node\.?js/i,
+        /vulkan/i, /directx/i, /microsoft onedrive/i, /microsoft update/i,
+        /microsoft edge update/i, /google update/i, /windows driver/i,
+        /redistributable/i, /bonjour/i, /apple (mobile|application) support/i,
+        /quickpass/i, /omnilaunch/i
+    ]
+
+    const REGISTRY_UNINSTALL_ROOTS = [
+        'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+        'HKLM\\SOFTWARE\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+        'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall'
+    ]
+
+    const APP_PATHS_ROOTS = [
+        'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths',
+        'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths'
+    ]
+
+    function isBlacklistedHostApp(name) {
+        return HOST_APP_BLACKLIST_PATTERNS.some(pattern => pattern.test(name || ''))
+    }
+
+    function cleanRegistryPath(value) {
+        return String(value || '').replace(/["]/g, '').replace(/\\$/, '').trim()
+    }
+
+    function readRegistryValue(line) {
+        return String(line || '').trim().split(/\s{2,}REG_[A-Z_]*SZ\s{2,}/)[1]?.trim() || ''
+    }
+
+    function normalizeInstallRoot(installDir) {
+        try {
+            let currentDir = require('path').resolve(installDir)
+            for (let i = 0; i < 3; i++) {
+                const base = basename(currentDir).toLowerCase()
+                if (base === '64bit' || base === '32bit' || base === 'bin' || base === 'core' || base === 'uninst' || /^app-\d+\.\d+\.\d+$/.test(base)) {
+                    currentDir = require('path').resolve(currentDir, '..')
+                    continue
+                }
+                break
+            }
+            return currentDir
+        } catch (_) {
+            return installDir
+        }
+    }
+
+    async function readRegistryUninstallEntries() {
+        const entries = []
+
+        await Promise.all(REGISTRY_UNINSTALL_ROOTS.map(async (regRoot) => {
+            try {
+                const { stdout } = await execAsync(`reg query "${regRoot}" /s`, { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 })
+                let currentEntry = { registryKey: '', displayName: '', installLocation: '', displayIcon: '' }
+
+                for (const line of stdout.split(/\r?\n/)) {
+                    if (line.startsWith('HKEY_')) {
+                        if (currentEntry.displayName && !isBlacklistedHostApp(currentEntry.displayName)) {
+                            entries.push(currentEntry)
+                        }
+                        currentEntry = { registryKey: line.trim(), displayName: '', installLocation: '', displayIcon: '' }
+                        continue
+                    }
+
+                    const trimmed = line.trim()
+                    if (trimmed.startsWith('DisplayName')) {
+                        currentEntry.displayName = readRegistryValue(trimmed)
+                    } else if (trimmed.startsWith('InstallLocation')) {
+                        currentEntry.installLocation = readRegistryValue(trimmed)
+                    } else if (trimmed.startsWith('DisplayIcon')) {
+                        currentEntry.displayIcon = readRegistryValue(trimmed)
+                    }
+                }
+
+                if (currentEntry.displayName && !isBlacklistedHostApp(currentEntry.displayName)) {
+                    entries.push(currentEntry)
+                }
+            } catch (_) { }
+        }))
+
+        return entries
+    }
+
+    function resolveRegistryEntryExecutable(entry) {
+        const name = entry?.displayName || ''
+        if (!name) return { success: false, reason: 'missing-display-name' }
+
+        const displayIconExe = extractExeFromCommand(entry.displayIcon)
+        let installDir = cleanRegistryPath(entry.installLocation)
+
+        if (!installDir || !existsSync(installDir)) {
+            if (!displayIconExe || !existsSync(displayIconExe)) {
+                return { success: false, reason: 'install-location-and-display-icon-missing' }
+            }
+            installDir = require('path').dirname(displayIconExe)
+        }
+
+        installDir = normalizeInstallRoot(installDir)
+        if (!existsSync(installDir)) return { success: false, reason: 'install-location-missing' }
+
+        const selection = selectBestExecutable(installDir, name, displayIconExe ? [{ path: displayIconExe, source: 'registry-display-icon-hint' }] : [])
+        if (!selection.selected) return { success: false, reason: 'no-safe-executable-candidate' }
+
+        const relativeExePath = selection.selected.relativePath
+        const exePath = join(installDir, relativeExePath)
+        if (!existsSync(exePath)) return { success: false, reason: 'resolved-executable-missing' }
+
+        return {
+            success: true,
+            name,
+            path: exePath,
+            exe: basename(exePath),
+            sourcePath: installDir,
+            relativeExePath,
+            selectedExecutable: {
+                relativePath: relativeExePath,
+                confidence: selection.selected.confidence,
+                score: selection.selected.score,
+                reasons: selection.selected.reasons || []
+            },
+            candidateExecutables: selection.candidates || [],
+            registryKey: entry.registryKey || null,
+            registryDisplayName: name,
+            registryInstallLocation: entry.installLocation || '',
+            registryDisplayIcon: entry.displayIcon || ''
+        }
+    }
+
+    function buildRegistryLaunchReference(resolved, availabilityStatus = 'available') {
+        return {
+            name: resolved.name,
+            path: resolved.path,
+            args: '',
+            portableData: false,
+            enabled: true,
+            id: Date.now(),
+            ...resolveRegistryUninstallSupportFields({
+                appName: resolved.name,
+                availabilityStatus
+            }),
+            sourcePath: resolved.sourcePath,
+            relativeExePath: resolved.relativeExePath,
+            selectedExecutable: resolved.selectedExecutable,
+            candidateExecutables: resolved.candidateExecutables,
+            registryKey: resolved.registryKey,
+            registryDisplayName: resolved.registryDisplayName,
+            registryInstallLocation: resolved.registryInstallLocation,
+            registryDisplayIcon: resolved.registryDisplayIcon,
+            registryResolution: {
+                status: availabilityStatus,
+                resolvedPath: resolved.path,
+                resolvedAt: Date.now(),
+                usedDisplayIconAsHint: !!resolved.registryDisplayIcon
+            }
+        }
+    }
+
+    function buildAppPathsLaunchReference(resolved, availabilityStatus = 'available') {
+        return {
+            name: resolved.name,
+            path: resolved.path,
+            args: '',
+            portableData: false,
+            enabled: true,
+            id: Date.now(),
+            ...resolveAppPathsSupportFields({
+                appName: resolved.name,
+                availabilityStatus
+            }),
+            appPathsKey: resolved.appPathsKey,
+            appPathsExecutableName: resolved.appPathsExecutableName,
+            appPathsPathValue: resolved.appPathsPathValue || '',
+            appPathsResolution: {
+                status: availabilityStatus,
+                resolvedPath: resolved.path,
+                resolvedAt: Date.now()
+            }
+        }
+    }
+
+    function classifyShortcutTarget(shortcut) {
+        const targetPath = String(shortcut?.targetPath || '').trim()
+        const args = String(shortcut?.arguments || '').trim()
+        const lowerTarget = targetPath.toLowerCase()
+        const isDirectExe = lowerTarget.endsWith('.exe') && existsSync(targetPath)
+        const dangerous = isDirectExe && isDangerousExecutablePath(targetPath)
+        const hasArgs = !!args
+        const warnings = []
+
+        if (!isDirectExe) warnings.push('Shortcut target is not a direct executable.')
+        if (hasArgs) warnings.push(`Shortcut has launch arguments: ${args}`)
+        if (dangerous) warnings.push('Shortcut target looks like a helper, updater, or uninstaller.')
+
+        const strongDirectExecutable = isDirectExe && !hasArgs && !dangerous
+        return {
+            strongDirectExecutable,
+            ownershipProofLevel: strongDirectExecutable ? 'none' : 'weak',
+            closePolicy: 'never',
+            canQuitFromOmniLaunch: false,
+            closeManagedAfterSpawn: strongDirectExecutable,
+            warning: warnings.join(' ')
+        }
+    }
+
+    function buildShortcutLaunchReference(shortcut, availabilityStatus = 'available') {
+        const classification = classifyShortcutTarget(shortcut)
+        const name = shortcut.name || basename(shortcut.shortcutPath || '').replace(/\.lnk$/i, '')
+        return {
+            name,
+            path: shortcut.targetPath || '',
+            args: shortcut.arguments || '',
+            portableData: false,
+            enabled: true,
+            id: Date.now(),
+            ...resolveStartMenuShortcutSupportFields({
+                appName: name,
+                availabilityStatus,
+                strongDirectExecutable: classification.strongDirectExecutable,
+                warning: classification.warning
+            }),
+            ownershipProofLevel: classification.ownershipProofLevel,
+            closePolicy: classification.closePolicy,
+            canQuitFromOmniLaunch: classification.canQuitFromOmniLaunch,
+            closeManagedAfterSpawn: classification.closeManagedAfterSpawn,
+            shortcutPath: shortcut.shortcutPath || '',
+            shortcutTargetPath: shortcut.targetPath || '',
+            shortcutArguments: shortcut.arguments || '',
+            shortcutWorkingDirectory: shortcut.workingDirectory || '',
+            shortcutIconLocation: shortcut.iconLocation || '',
+            shortcutClassification: {
+                status: classification.strongDirectExecutable ? 'strong-direct-exe' : 'ambiguous',
+                warning: classification.warning,
+                resolvedAt: Date.now()
+            }
+        }
+    }
+
+    async function readAppPathsEntries() {
+        const entries = []
+        await Promise.all(APP_PATHS_ROOTS.map(async (regRoot) => {
+            try {
+                const { stdout } = await execAsync(`reg query "${regRoot}" /s`, { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 })
+                let currentEntry = { appPathsKey: '', executableName: '', targetPath: '', pathValue: '' }
+
+                for (const line of stdout.split(/\r?\n/)) {
+                    if (line.startsWith('HKEY_')) {
+                        if (currentEntry.targetPath) entries.push(currentEntry)
+                        const key = line.trim()
+                        currentEntry = {
+                            appPathsKey: key,
+                            executableName: basename(key),
+                            targetPath: '',
+                            pathValue: ''
+                        }
+                        continue
+                    }
+
+                    const trimmed = line.trim()
+                    if (trimmed.startsWith('(Default)')) {
+                        currentEntry.targetPath = readRegistryValue(trimmed)
+                    } else if (trimmed.startsWith('Path')) {
+                        currentEntry.pathValue = readRegistryValue(trimmed)
+                    }
+                }
+
+                if (currentEntry.targetPath) entries.push(currentEntry)
+            } catch (_) { }
+        }))
+        return entries
+    }
+
+    function resolveAppPathEntryExecutable(entry) {
+        const targetPath = cleanRegistryPath(entry?.targetPath)
+        if (!targetPath || !targetPath.toLowerCase().endsWith('.exe')) {
+            return { success: false, reason: 'app-paths-target-not-exe' }
+        }
+        if (!existsSync(targetPath)) return { success: false, reason: 'app-paths-target-missing' }
+        if (isDangerousExecutablePath(targetPath)) return { success: false, reason: 'app-paths-target-dangerous' }
+
+        const name = basename(entry.executableName || targetPath).replace(/\.exe$/i, '')
+        return {
+            success: true,
+            name,
+            path: targetPath,
+            appPathsKey: entry.appPathsKey || '',
+            appPathsExecutableName: entry.executableName || basename(targetPath),
+            appPathsPathValue: entry.pathValue || ''
+        }
+    }
+
+    async function readStartMenuShortcuts() {
+        const script = `
+$ErrorActionPreference = 'SilentlyContinue'
+$roots = @(
+  [System.IO.Path]::Combine($env:ProgramData, 'Microsoft\\Windows\\Start Menu\\Programs'),
+  [System.IO.Path]::Combine($env:APPDATA, 'Microsoft\\Windows\\Start Menu\\Programs')
+) | Where-Object { $_ -and (Test-Path $_) }
+$shell = New-Object -ComObject WScript.Shell
+$items = @()
+foreach ($root in $roots) {
+  Get-ChildItem -LiteralPath $root -Filter '*.lnk' -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+    try {
+      $shortcut = $shell.CreateShortcut($_.FullName)
+      $items += [pscustomobject]@{
+        name = [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
+        shortcutPath = $_.FullName
+        targetPath = $shortcut.TargetPath
+        arguments = $shortcut.Arguments
+        workingDirectory = $shortcut.WorkingDirectory
+        iconLocation = $shortcut.IconLocation
+      }
+    } catch {}
+  }
+}
+$items | ConvertTo-Json -Depth 3 -Compress
+`
+        try {
+            const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], {
+                encoding: 'utf8',
+                maxBuffer: 10 * 1024 * 1024
+            })
+            const trimmed = stdout.trim()
+            if (!trimmed) return []
+            const parsed = JSON.parse(trimmed)
+            return Array.isArray(parsed) ? parsed : [parsed]
+        } catch (_) {
+            return []
+        }
+    }
+
+    async function resolveAppPathsLaunchReference(appConfig) {
+        const entries = await readAppPathsEntries()
+        const key = String(appConfig?.appPathsKey || '').toLowerCase()
+        const exeName = String(appConfig?.appPathsExecutableName || '').toLowerCase()
+        const entry = entries.find(item => key && String(item.appPathsKey || '').toLowerCase() === key) ||
+            entries.find(item => exeName && String(item.executableName || '').toLowerCase() === exeName)
+
+        if (!entry) {
+            return {
+                ...appConfig,
+                ...resolveAppPathsSupportFields({ appName: appConfig?.name, availabilityStatus: 'stale-app-path-reference' }),
+                appPathsResolution: { status: 'stale-app-path-reference', reason: 'App Paths registry entry was not found on this PC.', resolvedAt: Date.now() }
+            }
+        }
+
+        const resolved = resolveAppPathEntryExecutable(entry)
+        if (!resolved.success) {
+            return {
+                ...appConfig,
+                ...resolveAppPathsSupportFields({ appName: appConfig?.name || entry.executableName, availabilityStatus: 'missing-on-this-PC' }),
+                appPathsResolution: { status: 'missing-on-this-PC', reason: resolved.reason, resolvedAt: Date.now() }
+            }
+        }
+
+        return {
+            ...appConfig,
+            ...buildAppPathsLaunchReference(resolved, 'available'),
+            id: appConfig?.id || Date.now(),
+            enabled: appConfig?.enabled !== false,
+            args: appConfig?.args || ''
+        }
+    }
+
+    async function resolveStartMenuShortcutLaunchReference(appConfig) {
+        const shortcuts = await readStartMenuShortcuts()
+        const shortcutPath = String(appConfig?.shortcutPath || '').toLowerCase()
+        const shortcut = shortcuts.find(item => shortcutPath && String(item.shortcutPath || '').toLowerCase() === shortcutPath)
+
+        if (!shortcut) {
+            return {
+                ...appConfig,
+                ...resolveStartMenuShortcutSupportFields({ appName: appConfig?.name, availabilityStatus: 'stale-shortcut-reference' }),
+                shortcutClassification: { status: 'stale-shortcut-reference', warning: 'Start Menu shortcut was not found on this PC.', resolvedAt: Date.now() }
+            }
+        }
+
+        if (!shortcut.targetPath || !existsSync(shortcut.targetPath)) {
+            return {
+                ...appConfig,
+                path: shortcut.targetPath || appConfig?.path || '',
+                ...resolveStartMenuShortcutSupportFields({
+                    appName: appConfig?.name || shortcut.name,
+                    availabilityStatus: 'missing-on-this-PC',
+                    strongDirectExecutable: false,
+                    warning: 'Shortcut target is missing on this PC.'
+                }),
+                shortcutClassification: { status: 'missing-on-this-PC', warning: 'Shortcut target is missing on this PC.', resolvedAt: Date.now() }
+            }
+        }
+
+        return {
+            ...appConfig,
+            ...buildShortcutLaunchReference(shortcut, 'available'),
+            id: appConfig?.id || Date.now(),
+            enabled: appConfig?.enabled !== false
+        }
+    }
+
+    async function resolveRegistryUninstallLaunchReference(appConfig) {
+        const entries = await readRegistryUninstallEntries()
+        const nameKey = String(appConfig?.registryDisplayName || appConfig?.name || '').toLowerCase()
+        const registryKey = String(appConfig?.registryKey || '').toLowerCase()
+        const entry = entries.find(item => registryKey && String(item.registryKey || '').toLowerCase() === registryKey) ||
+            entries.find(item => String(item.displayName || '').toLowerCase() === nameKey)
+
+        if (!entry) {
+            return {
+                ...appConfig,
+                path: appConfig?.path || '',
+                ...resolveRegistryUninstallSupportFields({
+                    appName: appConfig?.name,
+                    availabilityStatus: 'stale-registry-reference'
+                }),
+                registryResolution: {
+                    status: 'stale-registry-reference',
+                    reason: 'Registry uninstall entry was not found on this PC.',
+                    resolvedAt: Date.now()
+                }
+            }
+        }
+
+        const resolved = resolveRegistryEntryExecutable(entry)
+        if (!resolved.success) {
+            return {
+                ...appConfig,
+                path: appConfig?.path || '',
+                ...resolveRegistryUninstallSupportFields({
+                    appName: appConfig?.name || entry.displayName,
+                    availabilityStatus: 'missing-on-this-PC'
+                }),
+                registryKey: entry.registryKey || appConfig?.registryKey || null,
+                registryDisplayName: entry.displayName || appConfig?.registryDisplayName || appConfig?.name,
+                registryInstallLocation: entry.installLocation || '',
+                registryDisplayIcon: entry.displayIcon || '',
+                registryResolution: {
+                    status: 'missing-on-this-PC',
+                    reason: resolved.reason,
+                    resolvedAt: Date.now()
+                }
+            }
+        }
+
+        return {
+            ...appConfig,
+            ...buildRegistryLaunchReference(resolved, 'available'),
+            id: appConfig?.id || Date.now(),
+            enabled: appConfig?.enabled !== false,
+            args: appConfig?.args || ''
+        }
+    }
+
     ipcMain.handle('scan-stale-appdata', async () => {
         try {
             const workspace = loadActiveVaultWorkspace()
@@ -609,6 +1069,48 @@ function registerIpcHandlers() {
             }
         } catch (e) {
             return { success: false, error: e.message, removed: [], failed: [], remainingPayloads: [] }
+        }
+    })
+
+    ipcMain.handle('scan-host-installed-apps', async () => {
+        try {
+            const entries = await readRegistryUninstallEntries()
+            const appPathEntries = await readAppPathsEntries()
+            const shortcuts = await readStartMenuShortcuts()
+            const seen = new Set()
+            const results = []
+
+            const addResult = (result) => {
+                if (!result?.name || !result?.path) return
+                const key = `${String(result.launchSourceType || '').toLowerCase()}:${String(result.name).toLowerCase()}:${String(result.path).toLowerCase()}`
+                if (seen.has(key)) return
+                seen.add(key)
+                results.push(result)
+            }
+
+            for (const entry of entries) {
+                const name = entry.displayName
+                if (!name) continue
+                const resolved = resolveRegistryEntryExecutable(entry)
+                if (!resolved.success) continue
+                addResult(buildRegistryLaunchReference(resolved, 'available'))
+            }
+
+            for (const entry of appPathEntries) {
+                const resolved = resolveAppPathEntryExecutable(entry)
+                if (!resolved.success) continue
+                addResult(buildAppPathsLaunchReference(resolved, 'available'))
+            }
+
+            for (const shortcut of shortcuts) {
+                if (!shortcut?.targetPath || !existsSync(shortcut.targetPath)) continue
+                addResult(buildShortcutLaunchReference(shortcut, 'available'))
+            }
+
+            results.sort((a, b) => a.name.localeCompare(b.name))
+            return { success: true, apps: results }
+        } catch (err) {
+            return { success: false, error: err.message, apps: [] }
         }
     })
 
@@ -1374,6 +1876,9 @@ function registerIpcHandlers() {
                     ...workspace,
                     desktopApps: (workspace.desktopApps || []).map((desktopApp) => {
                         try {
+                            if (['registry-uninstall', 'app-paths', 'start-menu-shortcut'].includes(desktopApp?.launchSourceType)) {
+                                return desktopApp
+                            }
                             const repair = repairLegacyAppConfig(desktopApp, vaultDir)
                             return {
                                 ...repair.appConfig,
@@ -1385,6 +1890,33 @@ function registerIpcHandlers() {
                         }
                     })
                 }
+                launchWorkspaceConfig.desktopApps = await Promise.all((launchWorkspaceConfig.desktopApps || []).map(async (desktopApp) => {
+                    if (!['registry-uninstall', 'app-paths', 'start-menu-shortcut'].includes(desktopApp?.launchSourceType)) return desktopApp
+                    try {
+                        if (desktopApp.launchSourceType === 'registry-uninstall') {
+                            return await resolveRegistryUninstallLaunchReference(desktopApp)
+                        }
+                        if (desktopApp.launchSourceType === 'app-paths') {
+                            return await resolveAppPathsLaunchReference(desktopApp)
+                        }
+                        return await resolveStartMenuShortcutLaunchReference(desktopApp)
+                    } catch (err) {
+                        diagError('host-launch-resolve', `${desktopApp.name || desktopApp.path}: ${err.message}`)
+                        return {
+                            ...desktopApp,
+                            ...resolveHostExeSupportFields({
+                                appName: desktopApp.name,
+                                availabilityStatus: 'missing-on-this-PC',
+                                launchSourceType: desktopApp.launchSourceType || 'host-exe'
+                            }),
+                            hostResolution: {
+                                status: 'missing-on-this-PC',
+                                reason: err.message,
+                                resolvedAt: Date.now()
+                            }
+                        }
+                    }
+                }))
 
                 return launchWorkspace(launchWorkspaceConfig, (statusMsg) => {
                     if (win && !win.isDestroyed()) {
