@@ -9,6 +9,7 @@ const indexCode = fs.readFileSync(join(process.cwd(), 'src/main/index.js'), 'utf
 const manifestCode = fs.readFileSync(join(process.cwd(), 'src/main/appManifest.js'), 'utf-8')
 const appAdaptersCode = fs.readFileSync(join(process.cwd(), 'src/main/appAdapters.js'), 'utf-8')
 const staleAppDataCode = fs.readFileSync(join(process.cwd(), 'src/main/staleAppData.js'), 'utf-8')
+const ipcValidationCode = fs.readFileSync(join(process.cwd(), 'src/main/ipcValidation.js'), 'utf-8')
 const importAppsModalCode = fs.readFileSync(join(process.cwd(), 'src/renderer/src/components/ImportAppsModal.jsx'), 'utf-8')
 const dashboardCode = fs.readFileSync(join(process.cwd(), 'src/renderer/src/components/DashboardScreen.jsx'), 'utf-8')
 const packageJson = JSON.parse(fs.readFileSync(join(process.cwd(), 'package.json'), 'utf-8'))
@@ -69,11 +70,12 @@ runCheck('Imported AppData uses an explicit support matrix', () => {
         engineCode.includes('supportsImportedAppDataRedirection') &&
         indexCode.includes('requestedImportData && !importedDataCapability.importedDataSupported') &&
         indexCode.includes('importData: effectiveImportData') &&
-        indexCode.includes("ipcMain.handle('scan-stale-appdata'") &&
-        indexCode.includes("ipcMain.handle('cleanup-stale-appdata'") &&
+        indexCode.includes("trustedHandle('scan-stale-appdata'") &&
+        indexCode.includes("trustedHandle('cleanup-stale-appdata'") &&
         indexCode.includes('function loadActiveVaultWorkspace') &&
         indexCode.includes('findStaleUnsupportedAppDataPayloads(workspace, getVaultDir()') &&
-        indexCode.includes('!Array.isArray(payloadIds) || payloadIds.length === 0') &&
+        indexCode.includes('validatePayloadIdsInput(input)') &&
+        ipcValidationCode.includes('Select at least one AppData payload to remove.') &&
         staleAppDataCode.includes('realpathSync.native') &&
         staleAppDataCode.includes('lstatSync') &&
         staleAppDataCode.includes('cleanupBlocked') &&
@@ -219,14 +221,14 @@ runCheck('Registry uninstall host launch references are data-unmanaged and re-re
     assert(
         manifestCode.includes('export function resolveRegistryUninstallSupportFields') &&
         manifestCode.includes('LAUNCH_SOURCE_TYPES.REGISTRY_UNINSTALL') &&
-        indexCode.includes("ipcMain.handle('scan-host-installed-apps'") &&
+        indexCode.includes("trustedHandle('scan-host-installed-apps'") &&
         indexCode.includes('function readRegistryUninstallEntries') &&
         indexCode.includes('function resolveRegistryEntryExecutable') &&
         indexCode.includes('function resolveRegistryUninstallLaunchReference') &&
         indexCode.includes("availabilityStatus: 'stale-registry-reference'") &&
         indexCode.includes("availabilityStatus: 'missing-on-this-PC'") &&
         indexCode.includes('registry-display-icon-hint') &&
-        indexCode.includes("'registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app'") &&
+        indexCode.includes("'host-folder', 'registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app'") &&
         preloadCode.includes('scanHostInstalledApps') &&
         dashboardCode.includes('scanInstalledApps') &&
         dashboardCode.includes('selectInstalledApp') &&
@@ -241,7 +243,7 @@ runCheck('Stale AppData cleanup is saved-state and confirmation guarded', () => 
     assert(
         importAppsModalCode.includes('canImportAppData(app)') &&
         indexCode.includes('const workspace = loadActiveVaultWorkspace()') &&
-        indexCode.includes('Select at least one AppData payload to remove.') &&
+        ipcValidationCode.includes('Select at least one AppData payload to remove.') &&
         staleAppDataCode.includes('Selected AppData payloads are no longer stale in the saved workspace.') &&
         indexCode.includes('isSafePayloadDirectory') &&
         staleAppDataCode.includes('Refused to remove symbolic-link or junction AppData payload.') &&

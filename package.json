@@ -1,13 +1,18 @@
 {
     "name": "omnilaunch",
     "version": "1.0.0",
-    "description": "OmniLaunch — Portable Identity & Workspace Automation Engine",
+    "description": "OmniLaunch - Portable Identity & Workspace Automation Engine",
+    "author": "OmniLaunch",
+    "private": true,
     "main": "./out/main/index.js",
     "scripts": {
         "dev": "node scripts/dev.cjs",
         "build": "electron-vite build",
+        "check": "npm run check:syntax && node scripts/audit-engine.js && npm run probe:lifecycle && npm audit --audit-level=moderate",
+        "check:syntax": "node --check src/main/index.js && node --check src/main/engine.js && node --check src/main/appManifest.js && node --check src/main/appAdapters.js && node --check src/main/staleAppData.js && node --check src/main/ipcValidation.js && node --check src/main/ipcTrust.js && node --check src/main/ipcAuthorization.js && node --check src/main/sessionVaultCapture.js && node --check src/main/launchArgs.js && node --check src/preload/index.js && node --check scripts/audit-engine.js && node --check scripts/lifecycle-probe.js",
         "probe:lifecycle": "node --experimental-default-type=module scripts/lifecycle-probe.js",
         "start": "node scripts/dev.cjs",
+        "test": "node --experimental-default-type=module --test tests/*.test.js",
         "package": "electron-vite build && node -e \"delete process.env.ELECTRON_RUN_AS_NODE; require('child_process').execSync('npx electron-builder --win zip', {stdio:'inherit', env:process.env})\""
     },
     "dependencies": {
