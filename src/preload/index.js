@@ -9,7 +9,8 @@ contextBridge.exposeInMainWorld('omnilaunch', {
     loadVaultMeta: () => ipcRenderer.invoke('load-vault-meta'),
     saveVault: (data) => ipcRenderer.invoke('save-vault', data),
     saveWorkspace: (workspace) => ipcRenderer.invoke('save-workspace', workspace),
-    factoryReset: () => ipcRenderer.invoke('factory-reset'),
+    beginFactoryReset: () => ipcRenderer.invoke('begin-factory-reset'),
+    factoryReset: (data) => ipcRenderer.invoke('factory-reset', data),
 
     // Security Modular Updates
     updatePin: (newPin) => ipcRenderer.invoke('update-pin', newPin),
@@ -40,7 +41,6 @@ contextBridge.exposeInMainWorld('omnilaunch', {
     },
 
     // Session Setup & Capture
-    setMasterPassword: (pw) => ipcRenderer.invoke('set-master-password', pw),
     startSessionSetup: () => ipcRenderer.invoke('start-session-setup'),
     startSessionEdit: () => ipcRenderer.invoke('start-session-edit'),
     hasActiveBrowserSession: () => ipcRenderer.invoke('has-active-browser-session'),
@@ -54,17 +54,20 @@ contextBridge.exposeInMainWorld('omnilaunch', {
     // Automation Engine
     launchWorkspace: (workspace) => ipcRenderer.invoke('launch-workspace', workspace),
     onLaunchStatus: (callback) => {
-        ipcRenderer.on('launch-status', (_, msg) => callback(msg))
-        return () => ipcRenderer.removeAllListeners('launch-status')
+        const listener = (_, msg) => callback(msg)
+        ipcRenderer.on('launch-status', listener)
+        return () => ipcRenderer.removeListener('launch-status', listener)
     },
     // Phase 16: Async launch completion event (non-blocking IPC)
     onLaunchComplete: (callback) => {
-        ipcRenderer.on('launch-complete', (_, data) => callback(data))
-        return () => ipcRenderer.removeAllListeners('launch-complete')
+        const listener = (_, data) => callback(data)
+        ipcRenderer.on('launch-complete', listener)
+        return () => ipcRenderer.removeListener('launch-complete', listener)
     },
     onBrowserDisconnect: (callback) => {
-        ipcRenderer.on('browser-disconnected', () => callback())
-        return () => ipcRenderer.removeAllListeners('browser-disconnected')
+        const listener = () => callback()
+        ipcRenderer.on('browser-disconnected', listener)
+        return () => ipcRenderer.removeListener('browser-disconnected', listener)
     },
 
     // Window Controls
