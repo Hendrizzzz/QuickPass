@@ -3,6 +3,7 @@ import ImportAppsModal from './ImportAppsModal'
 
 export default function SetupScreen({ driveInfo, onComplete }) {
     const isRemovable = driveInfo?.isRemovable
+    const supportsConvenienceUnlock = driveInfo?.supportsConvenienceUnlock
     const [step, setStep] = useState(1)
     const [masterPassword, setMasterPassword] = useState('')
     const [confirmPassword, setConfirmPassword] = useState('')
@@ -43,13 +44,33 @@ export default function SetupScreen({ driveInfo, onComplete }) {
         const folderPath = await window.omnilaunch.browseFolder()
         if (folderPath) {
             const name = folderPath.split('\\').pop()
-            setAppForm({ ...appForm, path: folderPath, name })
+            setAppForm({
+                ...appForm,
+                path: folderPath,
+                name,
+                portableData: false,
+                launchSourceType: 'host-folder',
+                launchMethod: 'shell-execute'
+            })
         }
     }
 
     const addDesktopApp = () => {
         if (!appForm.path.trim()) return
-        setDesktopApps([...desktopApps, { ...appForm, id: Date.now(), enabled: true }])
+        const path = appForm.path.trim()
+        const isAbsoluteHostPath = /^[a-z]:\\/i.test(path)
+        const isExecutablePath = /\.(exe|bat|cmd)$/i.test(path)
+        const inferredHostFolder = isAbsoluteHostPath && !isExecutablePath && !appForm.launchSourceType
+        setDesktopApps([...desktopApps, {
+            ...appForm,
+            ...(inferredHostFolder ? {
+                portableData: false,
+                launchSourceType: 'host-folder',
+                launchMethod: 'shell-execute'
+            } : {}),
+            id: Date.now(),
+            enabled: true
+        }])
         setAppForm({ name: '', path: '', args: '' })
         setShowAppForm(false)
     }
@@ -63,9 +84,9 @@ export default function SetupScreen({ driveInfo, onComplete }) {
         // Save vault with desktop apps only; web tabs come from session capture.
         const workspace = { webTabs: [], desktopApps }
         const result = await window.omnilaunch.saveVault({
-            masterPassword: isRemovable ? hiddenMasterPassword : masterPassword,
-            pin: isRemovable && pin ? pin : null,
-            fastBoot: isRemovable ? fastBoot : false,
+            masterPassword: supportsConvenienceUnlock ? hiddenMasterPassword : masterPassword,
+            pin: supportsConvenienceUnlock && pin ? pin : null,
+            fastBoot: supportsConvenienceUnlock ? fastBoot : false,
             workspace
         })
 
@@ -150,7 +171,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
 
         setSessionState('saving')
 
-        const result = await window.omnilaunch.captureSession({ masterPassword: isRemovable ? hiddenMasterPassword : masterPassword })
+        const result = await window.omnilaunch.captureSession({})
         if (result.success) {
             setCapturedCount(result.tabCount)
             setCapturedSkippedCount(result.skippedCount || 0)
@@ -185,7 +206,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
                 <p className="text-secondary text-xs mt-1">
                     {step === sessionStep
                         ? 'Log into your sites and we\'ll remember them'
-                        : isRemovable ? 'USB Drive - PIN unlock available' : 'Local Drive'}
+                        : supportsConvenienceUnlock ? 'USB Drive - PIN unlock available' : isRemovable ? 'USB Drive - master password required' : 'Local Drive'}
                 </p>
             </div>
 
@@ -197,7 +218,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
             </div>
 
             {/* Step 1: Master Password (Local PC Only) */}
-            {step === 1 && !isRemovable && (
+            {step === 1 && !supportsConvenienceUnlock && (
                 <div className="flex flex-col gap-3 animate-fade-in">
                     <p className="text-secondary text-sm">
                         Create a master password. This encrypts everything on your local drive.
@@ -235,7 +256,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
             )}
 
             {/* Step 1: PIN Setup (USB Flash Drive Only) */}
-            {step === 1 && isRemovable && (
+            {step === 1 && supportsConvenienceUnlock && (
                 <div className="flex flex-col gap-3 animate-fade-in">
                     <p className="text-secondary text-sm">
                         Create a 4-digit PIN for quick daily access.

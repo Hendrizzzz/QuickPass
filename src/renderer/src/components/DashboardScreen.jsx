@@ -21,6 +21,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const [showImportModal, setShowImportModal] = useState(false)
 
     const [masterPassword, setMasterPassword] = useState('')
+    const [currentMasterPassword, setCurrentMasterPassword] = useState('')
     const [confirmMasterPassword, setConfirmMasterPassword] = useState('')
     const [expandedSecurityOption, setExpandedSecurityOption] = useState(null) // 'password' | 'pin' | null
 
@@ -56,8 +57,9 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const isInSessionMode = sessionMode !== null
     const hasUnsavedAppChanges = JSON.stringify(desktopApps) !== JSON.stringify(workspace?.desktopApps || [])
 
-    const HOST_LAUNCH_SOURCE_TYPES = new Set(['host-exe', 'registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app'])
+    const HOST_LAUNCH_SOURCE_TYPES = new Set(['host-exe', 'host-folder', 'registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app'])
     const isManualHostExePath = (path) => /\.exe$/i.test(String(path || '').trim())
+    const isManualAbsoluteHostPath = (path) => /^[a-z]:\\/i.test(String(path || '').trim())
     const isHostLaunchForm = (form = appForm) => HOST_LAUNCH_SOURCE_TYPES.has(form.launchSourceType) || isManualHostExePath(form.path)
 
     const createManualHostExeFields = (name) => ({
@@ -89,6 +91,35 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         importedDataSupportReason: `Host-installed app data is unmanaged for ${name || 'this app'}.`
     })
 
+    const createManualHostFolderFields = () => ({
+        supportTier: 'launch-only',
+        supportSummary: 'Host folder launch reference. OmniLaunch opens it through the Windows shell and does not own a child process.',
+        adapterEvidence: 'none',
+        launchSourceType: 'host-folder',
+        launchMethod: 'shell-execute',
+        ownershipProofLevel: 'none',
+        closePolicy: 'never',
+        canQuitFromOmniLaunch: false,
+        closeManagedAfterSpawn: false,
+        availabilityStatus: 'unknown',
+        dataManagement: 'unmanaged',
+        requiresElevation: false,
+        launchAdapter: 'windows-shell-folder',
+        runtimeAdapter: 'none',
+        dataAdapters: [],
+        registryAdapters: [],
+        limitations: [
+            'Folders are opened by the Windows shell.',
+            'OmniLaunch cannot prove process ownership for a folder launch.',
+            'Quit and cleanup are disabled for this launch source.'
+        ],
+        certification: { status: 'uncertified', lastCheckedAt: null, checks: [] },
+        importedDataSupported: false,
+        importedDataSupportLevel: 'unsupported',
+        importedDataAdapterId: 'none',
+        importedDataSupportReason: 'Folders do not have portable app data management.'
+    })
+
     const browseExe = async () => {
         const filePath = await window.omnilaunch.browseExe()
         if (filePath) {
@@ -111,7 +142,8 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                 name,
                 path: folderPath,
                 args: appForm.args || '',
-                portableData: appForm.portableData || false
+                portableData: false,
+                ...createManualHostFolderFields()
             })
         }
     }
@@ -148,6 +180,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         if (item?.launchSourceType === 'protocol-uri') return 'Protocol'
         if (item?.launchSourceType === 'packaged-app') return 'Packaged'
         if (item?.launchSourceType === 'registry-uninstall') return 'Registry'
+        if (item?.launchSourceType === 'host-folder') return 'Folder'
         return 'Host EXE'
     }
 
@@ -155,10 +188,12 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         if (!appForm.path.trim()) return
         const isKnownHostLaunch = HOST_LAUNCH_SOURCE_TYPES.has(appForm.launchSourceType)
         const isHostExe = isManualHostExePath(appForm.path) && !isKnownHostLaunch
-        const isHostLaunch = isKnownHostLaunch || isHostExe
+        const isHostFolder = isManualAbsoluteHostPath(appForm.path) && !isHostExe && !isKnownHostLaunch
+        const isHostLaunch = isKnownHostLaunch || isHostExe || isHostFolder
         const nextApp = {
             ...appForm,
             ...(isHostExe ? createManualHostExeFields(appForm.name) : {}),
+            ...(isHostFolder ? createManualHostFolderFields() : {}),
             portableData: isHostLaunch ? false : appForm.portableData,
             id: Date.now(),
             enabled: true
@@ -214,6 +249,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     }
 
     const handleUpdatePassword = async () => {
+        if (!currentMasterPassword.trim()) return setError('Current password is required')
         if (masterPassword.length < 8) return setError('Password must be at least 8 characters')
         if (masterPassword !== confirmMasterPassword) return setError('Passwords do not match')
 
@@ -221,13 +257,14 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         setError('')
         const result = await window.omnilaunch.saveVault({
             masterPassword,
+            currentPassword: currentMasterPassword,
             pin: null, // Wipe PIN securely when password changes
             fastBoot: false, // Wipe FastBoot securely when password changes
             workspace: { webTabs, desktopApps }
         })
 
         if (result.success) {
-            await window.omnilaunch.setMasterPassword(masterPassword)
+            setCurrentMasterPassword('')
             setMasterPassword('')
             setConfirmMasterPassword('')
             setUsePin(false)
@@ -264,7 +301,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
 
     const handleDisablePin = async () => {
         // Phase 17.2: USB uses hidden password and must keep at least one unlock method.
-        if (driveInfo?.isRemovable && !fastBoot) {
+        if (driveInfo?.supportsConvenienceUnlock && !fastBoot) {
             setError('Enable Fast Boot first - PIN is your only unlock method on USB drives')
             return
         }
@@ -288,7 +325,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const handleToggleFastBoot = async () => {
         const newState = !fastBoot
         // Phase 17.2: USB uses hidden password and must keep at least one unlock method.
-        if (!newState && driveInfo?.isRemovable && !usePin) {
+        if (!newState && driveInfo?.supportsConvenienceUnlock && !usePin) {
             setError('Enable PIN first - Fast Boot is your only unlock method on USB drives')
             return
         }
@@ -422,16 +459,10 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
 
     // Save and close after edit/recapture
     const handleSessionSave = async () => {
-        // Phase 17.2: USB users do not know the hidden master password.
-        // backend falls back to cached activeMasterPasswordBuffer (index.js:1011)
-        if (!driveInfo?.isRemovable && !masterPassword.trim()) {
-            setError('Enter your master password first')
-            return
-        }
         setSaving(true)
         setError('')
         setSessionWarning('')
-        const result = await window.omnilaunch.captureSession({ masterPassword })
+        const result = await window.omnilaunch.captureSession({})
         if (result.success) {
             const newWebTabs = result.urls.map(url => ({ url, enabled: true }))
             // Jump directly to LaunchingScreen and trigger auto-relaunch
@@ -484,16 +515,6 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
 
                     {browserOpen && (
                         <>
-                            {/* Phase 17.2: Hide password input for USB; backend uses cached password. */}
-                            {!driveInfo?.isRemovable && (
-                                <input
-                                    type="password"
-                                    className="form-input text-sm mb-2"
-                                    placeholder="Master Password (to re-encrypt)"
-                                    value={masterPassword}
-                                    onChange={(e) => { setMasterPassword(e.target.value); setError('') }}
-                                />
-                            )}
                             <button className="btn-primary w-full mb-2" disabled={saving} onClick={handleSessionSave}>
                                 {saving ? (
                                     <span className="flex items-center justify-center gap-2">
@@ -736,14 +757,21 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                 {expandedSecurityOption === 'password' && (
                                     <div className="p-3 bg-[#14141c] flex flex-col gap-2 animate-fade-in border-t border-[#2a2a3a]">
                                         <p className="text-xs text-muted mb-1">Changing the master password will reset all other security configurations.</p>
-                                        <input
-                                            type="password"
-                                            className={`form-input text-sm ${error && error.includes('assword') ? 'error' : ''}`}
-                                            placeholder="New Master Password (8+ chars)"
-                                            value={masterPassword}
-                                            onChange={(e) => { setMasterPassword(e.target.value); setError('') }}
-                                            autoFocus
-                                        />
+                                            <input
+                                                type="password"
+                                                className={`form-input text-sm ${error && error.includes('assword') ? 'error' : ''}`}
+                                                placeholder="Current Master Password"
+                                                value={currentMasterPassword}
+                                                onChange={(e) => { setCurrentMasterPassword(e.target.value); setError('') }}
+                                                autoFocus
+                                            />
+                                            <input
+                                                type="password"
+                                                className={`form-input text-sm ${error && error.includes('assword') ? 'error' : ''}`}
+                                                placeholder="New Master Password (8+ chars)"
+                                                value={masterPassword}
+                                                onChange={(e) => { setMasterPassword(e.target.value); setError('') }}
+                                            />
                                         <input
                                             type="password"
                                             className={`form-input text-sm ${error && error.includes('assword') ? 'error' : ''}`}
@@ -752,8 +780,8 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                             onChange={(e) => { setConfirmMasterPassword(e.target.value); setError('') }}
                                         />
                                         <div className="flex gap-2 mt-1">
-                                            <button className="btn-secondary flex-1 text-xs" disabled={saving} onClick={() => { setExpandedSecurityOption(null); setMasterPassword(''); setConfirmMasterPassword('') }}>Cancel</button>
-                                            <button className="btn-primary flex-1 text-xs py-2" disabled={saving || !masterPassword.trim()} onClick={handleUpdatePassword}>Update Password</button>
+                                            <button className="btn-secondary flex-1 text-xs" disabled={saving} onClick={() => { setExpandedSecurityOption(null); setCurrentMasterPassword(''); setMasterPassword(''); setConfirmMasterPassword('') }}>Cancel</button>
+                                            <button className="btn-primary flex-1 text-xs py-2" disabled={saving || !currentMasterPassword.trim() || !masterPassword.trim()} onClick={handleUpdatePassword}>Update Password</button>
                                         </div>
                                     </div>
                                 )}
@@ -761,7 +789,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                         )}
 
                         {/* PIN Unlock Accordion */}
-                        {driveInfo?.isRemovable && (
+                        {driveInfo?.supportsConvenienceUnlock && (
                             <div className="border border-[#2a2a3a] rounded-md overflow-hidden">
                                 <button
                                     className="w-full text-left p-3 bg-[#1a1a24] hover:bg-[#20202c] transition-colors text-sm text-white flex justify-between items-center"
@@ -813,7 +841,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                         )}
 
                         {/* Fast Boot Toggle */}
-                        {driveInfo?.isRemovable && (
+                        {driveInfo?.supportsConvenienceUnlock && (
                             <div className="border border-[#2a2a3a] rounded-md overflow-hidden bg-[#1a1a24] p-3 flex justify-between items-center">
                                 <div>
                                     <p className="text-sm text-white">Fast Boot</p>

@@ -28,7 +28,7 @@ export default function App() {
                 const meta = await window.omnilaunch.loadVaultMeta()
                 setVaultMeta(meta)
 
-                if (meta?.fastBoot && meta?.fastBootVault) {
+                if (meta?.fastBoot) {
                     const result = await window.omnilaunch.tryFastBoot()
                     if (result.success) {
                         setWorkspace(result.workspace)

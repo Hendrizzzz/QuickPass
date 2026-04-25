@@ -2,9 +2,8 @@ import { useState, useRef, useEffect } from 'react'
 
 export default function UnlockScreen({ driveInfo, vaultMeta, onUnlock }) {
     const isRemovable = driveInfo?.isRemovable
-    const hasPIN = vaultMeta?.hasPIN && isRemovable
-    const hardwareMismatch =
-        vaultMeta?.isRemovable && vaultMeta?.createdOn !== driveInfo?.serialNumber
+    const hasPIN = vaultMeta?.hasPIN && isRemovable && vaultMeta?.supportsConvenienceUnlock
+    const hardwareMismatch = !!vaultMeta?.hardwareMismatch
 
     const usePIN = hasPIN && !hardwareMismatch
 
@@ -31,6 +30,10 @@ export default function UnlockScreen({ driveInfo, vaultMeta, onUnlock }) {
         } else if (result.error === 'HARDWARE_MISMATCH') {
             setError(result.message)
             setPin('')
+        } else if (result.error === 'PIN_LOCKED') {
+            setError('Too many PIN attempts. Try again in about a minute.')
+            setPin('')
+            setLoading(false)
         } else {
             setError('Invalid PIN')
             setPin('')
@@ -70,8 +73,19 @@ export default function UnlockScreen({ driveInfo, vaultMeta, onUnlock }) {
     const handleFactoryReset = async () => {
         setLoading(true)
         setResetConfirming(false)
-        await window.omnilaunch.factoryReset()
-        window.location.reload()
+        const tokenResult = await window.omnilaunch.beginFactoryReset()
+        if (!tokenResult?.success) {
+            setError(tokenResult?.error || 'Factory reset could not start')
+            setLoading(false)
+            return
+        }
+        const resetResult = await window.omnilaunch.factoryReset({ token: tokenResult.token })
+        if (resetResult?.success) {
+            window.location.reload()
+        } else {
+            setError(resetResult?.error || 'Factory reset failed')
+            setLoading(false)
+        }
     }
 
     return (
@@ -156,7 +170,7 @@ export default function UnlockScreen({ driveInfo, vaultMeta, onUnlock }) {
                 <div className="mt-8 text-center border-t border-[#2a2a3a] pt-4">
                     {resetConfirming ? (
                         <div className="animate-fade-in">
-                            <p className="text-error text-xs mb-2 font-medium">WARNING: This will permanently wipe all saved tabs and apps.</p>
+                            <p className="text-error text-xs mb-2 font-medium">WARNING: This will delete the saved vault workspace and unlock settings.</p>
                             <div className="flex gap-2 justify-center">
                                 <button className="btn-secondary text-xs py-1 px-3" onClick={() => setResetConfirming(false)}>Cancel</button>
                                 <button className="btn-danger-text text-xs py-1 px-3 font-semibold" onClick={handleFactoryReset}>Yes, Wipe Vault</button>
