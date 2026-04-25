@@ -31,6 +31,7 @@ import {
     parseVaultAppPath,
     readAppManifest,
     resolveHostExeSupportFields,
+    resolveHostFolderSupportFields,
     resolveImportedAppDataCapability,
     resolvePackagedAppSupportFields,
     resolveProtocolUriSupportFields,
@@ -38,6 +39,7 @@ import {
     safeAppName,
     validateExtractedAppCache
 } from './appManifest.js'
+import { parseLaunchArgs } from './launchArgs.js'
 
 // Active browser/context references
 let activeBrowser = null
@@ -841,7 +843,7 @@ function isHostExeLaunchConfig(appConfig) {
 }
 
 function isWeakShellHostLaunchConfig(appConfig) {
-    return ['shell-execute', 'protocol-uri', 'packaged-app'].includes(appConfig?.launchSourceType) &&
+    return ['host-folder', 'shell-execute', 'protocol-uri', 'packaged-app'].includes(appConfig?.launchSourceType) &&
         ['shell-execute', 'protocol', 'packaged-app'].includes(appConfig?.launchMethod)
 }
 
@@ -860,7 +862,9 @@ function applyHostExeDiagnostic(diagRef, appConfig, availabilityStatus = 'unknow
 
 function applyWeakShellHostDiagnostic(diagRef, appConfig, availabilityStatus = appConfig?.availabilityStatus || 'unknown') {
     let supportFields
-    if (appConfig?.launchSourceType === 'protocol-uri') {
+    if (appConfig?.launchSourceType === 'host-folder') {
+        supportFields = resolveHostFolderSupportFields({ appName: appConfig?.name, availabilityStatus })
+    } else if (appConfig?.launchSourceType === 'protocol-uri') {
         supportFields = resolveProtocolUriSupportFields({ appName: appConfig?.name, availabilityStatus })
     } else if (appConfig?.launchSourceType === 'packaged-app') {
         supportFields = resolvePackagedAppSupportFields({ appName: appConfig?.name, availabilityStatus })
@@ -952,7 +956,7 @@ function classifyReadinessWindow(appObj, window) {
 function resolveLaunchReadinessPolicy(appConfig = {}, diagRef = {}) {
     const launchSourceType = appConfig.launchSourceType || diagRef.launchSourceType || 'raw-path'
     const launchMethod = appConfig.launchMethod || diagRef.launchMethod || 'spawn'
-    const noOwnership = ['shell-execute', 'protocol-uri', 'packaged-app'].includes(launchSourceType) ||
+    const noOwnership = ['host-folder', 'shell-execute', 'protocol-uri', 'packaged-app'].includes(launchSourceType) ||
         ['shell-execute', 'protocol', 'packaged-app'].includes(launchMethod)
     const closeManaged = appConfig.closeManagedAfterSpawn !== false &&
         appConfig.canQuitFromOmniLaunch !== false &&
@@ -994,6 +998,9 @@ function classifyLaunchTarget(appConfig = {}, appPath = '') {
     }
     if (sourceType === 'packaged-app') {
         return { classification: 'packaged-app-activation', reason: 'Windows packaged app activation; process ownership is not knowable.' }
+    }
+    if (sourceType === 'host-folder') {
+        return { classification: 'folder-shell-activation', reason: 'Windows folder launch is delegated to Explorer; process ownership is not knowable.' }
     }
     if (sourceType === 'shell-execute' || method === 'shell-execute') {
         return { classification: 'shell-execute-activation', reason: 'ShellExecute may hand off to another process.' }
@@ -3391,7 +3398,7 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
 
     try {
         onStatus(`Launching ${appConfig.name}...`)
-        let args = appConfig.args ? appConfig.args.split(' ').filter(Boolean) : []
+        let args = parseLaunchArgs(appConfig.args)
         let appPath = appConfig.path
         let launchSource = 'raw-path'
         let usbPath = null
@@ -3803,7 +3810,8 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
             launchStage: 'spawning'
         })
 
-        if (!targetExists && !isWeakShellHostLaunch) {
+        const canLaunchWithoutFilesystemTarget = ['protocol-uri', 'packaged-app'].includes(appConfig?.launchSourceType)
+        if (!targetExists && !canLaunchWithoutFilesystemTarget) {
             if (isHostExeLaunch) {
                 Object.assign(diagRef, {
                     availabilityStatus: 'missing-on-this-PC',

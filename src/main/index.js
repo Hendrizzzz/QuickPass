@@ -1,6 +1,7 @@
-import { app, BrowserWindow, ipcMain, dialog } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, session } from 'electron'
 import { join, basename } from 'path'
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, rmSync } from 'fs'
+import { pathToFileURL } from 'url'
+import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, rmSync, renameSync, unlinkSync, openSync, closeSync } from 'fs'
 import { execSync, spawn, exec, execFile } from 'child_process'
 import os from 'os'
 import util from 'util'
@@ -23,6 +24,7 @@ import {
     repairLegacyAppConfig,
     resolveAppPathsSupportFields,
     resolveHostExeSupportFields,
+    resolveHostFolderSupportFields,
     resolveImportedAppDataCapability,
     resolveManifestSupportFields,
     resolvePackagedAppSupportFields,
@@ -39,6 +41,42 @@ import {
     isSafePayloadDirectory,
     selectStaleAppDataPayloads
 } from './staleAppData.js'
+import {
+    createAvailableAppStorageId,
+    validateBooleanInput,
+    validateCaptureSessionInput,
+    validateFactoryResetInput,
+    validateImportAppInput,
+    validatePayloadIdsInput,
+    validatePasswordInput,
+    validatePinInput,
+    validateQuitOptions,
+    validateSaveVaultInput,
+    validateWorkspaceInput
+} from './ipcValidation.js'
+import {
+    assertTrustedIpcSender,
+    blockedIpcResponse,
+    configureTrustedIpcRenderer
+} from './ipcTrust.js'
+import {
+    hasUnlockedSession,
+    requireActiveSessionState,
+    requireConvenienceUnlockRequestSupported,
+    requireSessionSetupAllowedState,
+    requireUnlockedOrNoVaultState
+} from './ipcAuthorization.js'
+import { saveCapturedSessionToVault } from './sessionVaultCapture.js'
+import {
+    beforeQuitLifecycleCleanupCore,
+    closeDesktopAppsHandlerCore,
+    closeWindowHandlerCore,
+    createFactoryResetTokenRecord,
+    factoryResetHandlerCore,
+    quitAndRelaunchHandlerCore,
+    startSessionEditHandlerCore,
+    startSessionSetupHandlerCore
+} from './processControlHandlers.js'
 
 // Phase 11: The Honey Token
 const HONEY_TOKEN = {
@@ -68,28 +106,47 @@ async function getDriveInfo() {
     const vaultDir = getVaultDir()
     const driveLetter = vaultDir.split(':')[0] + ':'
 
+    let serialNumber = 'UNKNOWN'
+    let driveType = 0
+
     try {
-        let serialNumber = 'UNKNOWN'
-        
+        const escapedDrive = driveLetter.replace(/'/g, "''")
+        const script = `$d = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='${escapedDrive}'"; if ($d) { [pscustomobject]@{ DriveType = $d.DriveType; VolumeSerialNumber = $d.VolumeSerialNumber } | ConvertTo-Json -Compress }`
+        const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf-8' })
+        const parsed = stdout.trim() ? JSON.parse(stdout.trim()) : null
+        if (parsed) {
+            driveType = Number(parsed.DriveType) || 0
+            if (parsed.VolumeSerialNumber) serialNumber = String(parsed.VolumeSerialNumber).trim()
+        }
+    } catch (_) {
         try {
             const { stdout } = await execAsync(`vol ${driveLetter}`, { encoding: 'utf-8' })
             const lines = stdout.trim().split('\n')
             const serialLine = lines.find(l => l.toLowerCase().includes('serial number'))
-            if (serialLine) {
-                serialNumber = serialLine.split(' ').pop().trim()
-            }
-        } catch (_) {}
+            if (serialLine) serialNumber = serialLine.split(' ').pop().trim()
+        } catch (_) { }
+    }
 
-        cachedDriveInfo = {
-            driveLetter,
-            isRemovable: true, // Always assume removable for the portable build to allow PIN
-            serialNumber,
-            driveType: 2 // Treat as removable
-        }
-        return cachedDriveInfo
-    } catch (e) {
-        cachedDriveInfo = { driveLetter, isRemovable: true, serialNumber: 'UNKNOWN', driveType: 2 }
-        return cachedDriveInfo
+    const serialKnown = !!serialNumber && serialNumber !== 'UNKNOWN'
+    cachedDriveInfo = {
+        driveLetter,
+        isRemovable: driveType === 2,
+        serialNumber: serialKnown ? serialNumber : 'UNKNOWN',
+        serialKnown,
+        driveType,
+        driveTypeKnown: driveType > 0
+    }
+    return cachedDriveInfo
+}
+
+function sanitizeDriveInfoForRenderer(driveInfo) {
+    return {
+        driveLetter: driveInfo.driveLetter,
+        isRemovable: driveInfo.isRemovable,
+        driveType: driveInfo.driveType,
+        driveTypeKnown: driveInfo.driveTypeKnown,
+        serialKnown: driveInfo.serialKnown,
+        supportsConvenienceUnlock: driveInfo.isRemovable && driveInfo.serialKnown
     }
 }
 
@@ -181,13 +238,65 @@ function getMetaPath() {
     return join(getVaultDir(), 'vault.meta.json')
 }
 
-function saveVaultMeta(meta) {
-    const metaPath = getMetaPath()
-    if (existsSync(metaPath)) {
-        try { execSync(`attrib -H -R "${metaPath}"`) } catch (_) { }
+function writeJsonFileAtomic(filePath, data) {
+    const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`
+    if (existsSync(filePath)) {
+        try { execSync(`attrib -H -R "${filePath}"`) } catch (_) { }
     }
-    writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8')
-    try { execSync(`attrib +H "${metaPath}"`) } catch (_) { }
+    writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf-8')
+    renameSync(tempPath, filePath)
+    try { execSync(`attrib +H "${filePath}"`) } catch (_) { }
+}
+
+function isAppStorageIdTaken(vaultDir, candidate) {
+    return existsSync(join(vaultDir, 'Apps', candidate)) ||
+        existsSync(join(vaultDir, 'Apps', `${candidate}.tar.zst`)) ||
+        existsSync(join(vaultDir, 'Apps', `${candidate}.quickpass-app.json`)) ||
+        existsSync(join(vaultDir, 'AppData', candidate))
+}
+
+function reserveAppStorageId(vaultDir, name) {
+    const reservationsDir = join(vaultDir, 'Apps', '.reservations')
+    mkdirSync(reservationsDir, { recursive: true })
+    const rejected = new Set()
+
+    for (let attempt = 0; attempt < 1000; attempt += 1) {
+        const storageId = createAvailableAppStorageId(name, candidate => (
+            rejected.has(candidate) ||
+            isAppStorageIdTaken(vaultDir, candidate) ||
+            existsSync(join(reservationsDir, `${candidate}.lock`))
+        ))
+        const lockPath = join(reservationsDir, `${storageId}.lock`)
+        let fd = null
+        try {
+            fd = openSync(lockPath, 'wx')
+            writeFileSync(fd, JSON.stringify({
+                storageId,
+                pid: process.pid,
+                createdAt: new Date().toISOString()
+            }), 'utf-8')
+            closeSync(fd)
+            fd = null
+            return {
+                storageId,
+                release() {
+                    try { unlinkSync(lockPath) } catch (_) { }
+                }
+            }
+        } catch (err) {
+            if (fd != null) {
+                try { closeSync(fd) } catch (_) { }
+            }
+            if (err?.code !== 'EEXIST') throw err
+            rejected.add(storageId)
+        }
+    }
+
+    throw new Error('Could not reserve an app storage id.')
+}
+
+function saveVaultMeta(meta) {
+    writeJsonFileAtomic(getMetaPath(), meta)
 }
 
 function loadVaultMeta() {
@@ -200,8 +309,135 @@ function loadVaultMeta() {
     }
 }
 
+function sanitizeVaultMetaForRenderer(meta, driveInfo) {
+    if (!meta) return null
+    const createdOnMatchesCurrentDrive = meta.createdOn && driveInfo.serialKnown
+        ? meta.createdOn === driveInfo.serialNumber
+        : null
+    return {
+        version: meta.version || '1.0.0',
+        hasPIN: !!meta.hasPIN,
+        fastBoot: !!meta.fastBoot,
+        clearCacheOnExit: meta.clearCacheOnExit !== false,
+        isRemovable: !!meta.isRemovable,
+        createdOnMatchesCurrentDrive,
+        hardwareMismatch: createdOnMatchesCurrentDrive === false,
+        supportsConvenienceUnlock: driveInfo.isRemovable && driveInfo.serialKnown
+    }
+}
+
+async function loadVaultMetaForRenderer() {
+    const meta = loadVaultMeta()
+    if (!meta) return null
+    return sanitizeVaultMetaForRenderer(meta, await getDriveInfo())
+}
+
+const HOST_WORKSPACE_LAUNCH_TYPES = new Set([
+    'host-exe',
+    'host-folder',
+    'registry-uninstall',
+    'app-paths',
+    'start-menu-shortcut',
+    'shell-execute',
+    'protocol-uri',
+    'packaged-app'
+])
+
+const issuedLaunchCapabilities = new Map()
+
+function launchCapabilityReference(appConfig) {
+    const reference = {
+        launchSourceType: appConfig.launchSourceType,
+        launchMethod: appConfig.launchMethod,
+        path: appConfig.path
+    }
+    for (const key of [
+        'registryKey',
+        'appPathsKey',
+        'shortcutPath',
+        'protocolScheme',
+        'packagedAppId'
+    ]) {
+        if (appConfig[key]) reference[key] = appConfig[key]
+    }
+    return reference
+}
+
+function launchCapabilityIdFor(reference) {
+    return `cap_${crypto.createHash('sha256').update(JSON.stringify(reference)).digest('hex').slice(0, 24)}`
+}
+
+function referencesMatch(left, right) {
+    return JSON.stringify(launchCapabilityReference(left)) === JSON.stringify(launchCapabilityReference(right))
+}
+
+function registerLaunchCapability(appConfig, provenance = 'main') {
+    if (!HOST_WORKSPACE_LAUNCH_TYPES.has(appConfig?.launchSourceType)) return appConfig
+    const reference = launchCapabilityReference(appConfig)
+    const capability = {
+        id: launchCapabilityIdFor(reference),
+        ...reference,
+        provenance,
+        issuedAt: new Date().toISOString()
+    }
+    issuedLaunchCapabilities.set(capability.id, capability)
+    return { ...appConfig, launchCapabilityId: capability.id }
+}
+
+function readStoredLaunchCapabilities(meta = loadVaultMeta()) {
+    const records = meta?.launchCapabilities
+    if (!records || typeof records !== 'object' || Array.isArray(records)) return new Map()
+    return new Map(Object.values(records)
+        .filter(record => record?.id)
+        .map(record => [record.id, record]))
+}
+
+function authorizeWorkspaceLaunchCapabilities(workspace, { existingMeta = loadVaultMeta() } = {}) {
+    const stored = readStoredLaunchCapabilities(existingMeta)
+    const authorized = {}
+    const desktopApps = (workspace.desktopApps || []).map((appConfig) => {
+        if (!HOST_WORKSPACE_LAUNCH_TYPES.has(appConfig?.launchSourceType)) return appConfig
+
+        const reference = launchCapabilityReference(appConfig)
+        const expectedId = appConfig.launchCapabilityId || launchCapabilityIdFor(reference)
+        const storedCapability = stored.get(expectedId)
+        const issuedCapability = issuedLaunchCapabilities.get(expectedId)
+        const capability = storedCapability || issuedCapability
+
+        if (!capability || !referencesMatch(appConfig, capability)) {
+            throw new Error(`Untrusted launch reference for ${appConfig.name || appConfig.path}. Re-select this app from OmniLaunch before saving.`)
+        }
+
+        authorized[capability.id] = capability
+        return { ...appConfig, launchCapabilityId: capability.id }
+    })
+
+    return {
+        workspace: { ...workspace, desktopApps },
+        capabilities: authorized
+    }
+}
+
+function mergeLaunchCapabilitiesIntoMeta(meta, capabilities) {
+    if (!capabilities || Object.keys(capabilities).length === 0) return meta
+    return {
+        ...meta,
+        launchCapabilities: {
+            ...(meta.launchCapabilities || {}),
+            ...capabilities
+        }
+    }
+}
+
 // ─── Cryptographic Memory Buffer ───────────────────────────────────────────────
 let activeMasterPasswordBuffer = null
+const PIN_MAX_FAILURES = 5
+const PIN_LOCKOUT_MS = 60_000
+const pinUnlockState = {
+    failedAttempts: 0,
+    lockedUntil: 0
+}
+let factoryResetToken = null
 
 function setActiveMasterPassword(password) {
     if (!password) {
@@ -213,41 +449,184 @@ function setActiveMasterPassword(password) {
     }
 }
 
+function hasActiveSession() {
+    return hasUnlockedSession(activeMasterPasswordBuffer)
+}
+
+function requireActiveSession() {
+    requireActiveSessionState(hasActiveSession())
+}
+
+function requireUnlockedOrNoVault() {
+    requireUnlockedOrNoVaultState({
+        vaultExists: existsSync(getVaultPath()),
+        hasActiveSession: hasActiveSession()
+    })
+}
+
+function requireSessionSetupAllowed() {
+    requireSessionSetupAllowedState({
+        vaultExists: existsSync(getVaultPath()),
+        hasActiveSession: hasActiveSession()
+    })
+}
+
+function requireConvenienceUnlockDrive(driveInfo, featureName) {
+    requireConvenienceUnlockRequestSupported({
+        requested: true,
+        driveInfo,
+        featureName
+    })
+}
+
+function resetPinUnlockFailures() {
+    pinUnlockState.failedAttempts = 0
+    pinUnlockState.lockedUntil = 0
+}
+
+function assertPinUnlockAllowed() {
+    const now = Date.now()
+    if (pinUnlockState.lockedUntil > now) {
+        const retryAfterMs = pinUnlockState.lockedUntil - now
+        const err = new Error('PIN temporarily locked')
+        err.code = 'PIN_LOCKED'
+        err.retryAfterMs = retryAfterMs
+        throw err
+    }
+}
+
+function recordPinUnlockFailure() {
+    pinUnlockState.failedAttempts += 1
+    if (pinUnlockState.failedAttempts >= PIN_MAX_FAILURES) {
+        pinUnlockState.lockedUntil = Date.now() + PIN_LOCKOUT_MS
+    }
+}
+
+function createFactoryResetToken(webContentsId) {
+    factoryResetToken = createFactoryResetTokenRecord({
+        token: crypto.randomBytes(24).toString('hex'),
+        webContentsId
+    })
+    return factoryResetToken
+}
+
+function consumeFactoryResetToken(token, webContentsId) {
+    if (!factoryResetToken ||
+        factoryResetToken.expiresAt < Date.now() ||
+        factoryResetToken.token !== token ||
+        factoryResetToken.webContentsId !== Number(webContentsId)) {
+        throw new Error('Factory reset token is invalid or expired.')
+    }
+    factoryResetToken = null
+}
+
 // ─── IPC Handlers ──────────────────────────────────────────────────────────────
+function getActiveMasterPasswordText() {
+    return activeMasterPasswordBuffer ? activeMasterPasswordBuffer.toString('utf-8') : ''
+}
+
+function createProcessControlHandlerDeps() {
+    return {
+        vaultExists: () => existsSync(getVaultPath()),
+        hasActiveSession,
+        getActiveMasterPassword: getActiveMasterPasswordText,
+        beginDiagnosticsCycle,
+        beginSetupDiagnosticsCycle: () => beginDiagnosticsCycle('setup'),
+        beginEditDiagnosticsCycle: () => beginDiagnosticsCycle('edit'),
+        closeBrowser,
+        closeDesktopApps,
+        getWindowFromWebContents: (sender) => BrowserWindow.fromWebContents(sender),
+        getFocusedWindow: () => BrowserWindow.getFocusedWindow(),
+        getVaultDir,
+        onBrowserAllClosed,
+        launchSessionSetup,
+        readVault: () => JSON.parse(readFileSync(getVaultPath(), 'utf-8')),
+        decryptVault: decrypt,
+        validateQuitOptions,
+        quitApp: () => app.quit(),
+        exists: existsSync,
+        clearHiddenReadOnly: (filePath) => execSync(`attrib -H -R "${filePath}"`),
+        unlink: unlinkSync,
+        setActiveMasterPassword,
+        resetPinUnlockFailures,
+        onResetTokenConsumed: (nextResetToken) => {
+            factoryResetToken = nextResetToken
+        },
+        validateFactoryResetInput,
+        onCloseBrowserError: (err) => {
+            console.error('[QuickPass] Profile sync during quit failed:', err)
+            diagError('before-quit', err.message)
+        },
+        wipeRuntimeAppProfiles: wipeAllRuntimeAppProfiles,
+        persistDiagnostics: () => {
+            const vd = getVaultDir()
+            if (existsSync(vd)) {
+                writeFileSync(join(vd, 'run-diagnostics.json'), JSON.stringify(runDiagnostics, null, 2), 'utf-8')
+            }
+        },
+        removeTempTraces: () => rmSync(tmpPath, { recursive: true, force: true })
+    }
+}
+
+function trustedHandle(channel, handler) {
+    ipcMain.handle(channel, async (event, ...args) => {
+        try {
+            assertTrustedIpcSender(event)
+            return await handler(event, ...args)
+        } catch (err) {
+            return blockedIpcResponse(err.message)
+        }
+    })
+}
+
+function trustedOn(channel, listener) {
+    ipcMain.on(channel, (event, ...args) => {
+        try {
+            assertTrustedIpcSender(event)
+            listener(event, ...args)
+        } catch (_) { }
+    })
+}
+
 function registerIpcHandlers() {
 
-    ipcMain.handle('get-drive-info', async () => await getDriveInfo())
-    ipcMain.handle('vault-exists', () => existsSync(getVaultPath()))
-    ipcMain.handle('load-vault-meta', () => loadVaultMeta())
+    trustedHandle('get-drive-info', async () => sanitizeDriveInfoForRenderer(await getDriveInfo()))
+    trustedHandle('vault-exists', () => existsSync(getVaultPath()))
+    trustedHandle('load-vault-meta', async () => loadVaultMetaForRenderer())
 
-    ipcMain.handle('factory-reset', () => {
+    trustedHandle('begin-factory-reset', (event) => {
+        const reset = createFactoryResetToken(event.sender.id)
+        return { success: true, token: reset.token, expiresAt: reset.expiresAt }
+    })
+
+    trustedHandle('factory-reset', (event, input) => {
         try {
-            const paths = [getVaultPath(), getMetaPath(), getStatePath()]
-            for (const p of paths) {
-                if (existsSync(p)) {
-                    try { execSync(`attrib -H -R "${p}"`) } catch (_) { }
-                    require('fs').unlinkSync(p)
-                }
-            }
-            return { success: true }
+            const reset = factoryResetHandlerCore({
+                event,
+                input,
+                resetToken: factoryResetToken,
+                deps: createProcessControlHandlerDeps()
+            })
+            factoryResetToken = reset.resetToken
+            return reset.result
         } catch (e) {
             return { success: false, error: e.message }
         }
     })
 
-    ipcMain.handle('save-workspace', async (_, workspace) => {
+    trustedHandle('save-workspace', async (_, workspace) => {
         try {
-            if (!activeMasterPasswordBuffer) throw new Error('Session is locked')
+            requireActiveSession()
 
-            const payload = { ...workspace, _honeyToken: HONEY_TOKEN }
+            const safeWorkspace = validateWorkspaceInput(workspace)
+            const existingMeta = loadVaultMeta()
+            const authorized = authorizeWorkspaceLaunchCapabilities(safeWorkspace, { existingMeta })
+            const payload = { ...authorized.workspace, _honeyToken: HONEY_TOKEN }
             const driveInfo = await getDriveInfo()
             const encryptedVault = encrypt(payload, activeMasterPasswordBuffer.toString('utf-8'), driveInfo.driveType === 3)
 
-            if (existsSync(getVaultPath())) {
-                try { execSync(`attrib -H -R "${getVaultPath()}"`) } catch (_) { }
-            }
-            writeFileSync(getVaultPath(), JSON.stringify(encryptedVault, null, 2), 'utf-8')
-            try { execSync(`attrib +H "${getVaultPath()}"`) } catch (_) { }
+            writeJsonFileAtomic(getVaultPath(), encryptedVault)
+            saveVaultMeta(mergeLaunchCapabilitiesIntoMeta(existingMeta || { version: '1.0.0' }, authorized.capabilities))
 
             return { success: true }
         } catch (e) {
@@ -255,28 +634,39 @@ function registerIpcHandlers() {
         }
     })
 
-    ipcMain.handle('save-vault', async (_, { masterPassword, pin, fastBoot, workspace }) => {
+    trustedHandle('save-vault', async (_, input) => {
         try {
+            const { masterPassword, currentPassword, pin, fastBoot, workspace } = validateSaveVaultInput(input)
             const driveInfo = await getDriveInfo()
+            const vaultExists = existsSync(getVaultPath())
 
-            const payload = { ...workspace, _honeyToken: HONEY_TOKEN }
+            if (vaultExists) {
+                requireActiveSession()
+                if (!currentPassword) throw new Error('Current password is required to change the vault password.')
+                const existingVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
+                decrypt(existingVault, currentPassword)
+            }
+            requireConvenienceUnlockRequestSupported({
+                requested: !!(pin || fastBoot),
+                driveInfo,
+                featureName: 'Convenience unlock'
+            })
+
+            const existingMeta = loadVaultMeta()
+            const authorized = authorizeWorkspaceLaunchCapabilities(workspace, { existingMeta })
+            const payload = { ...authorized.workspace, _honeyToken: HONEY_TOKEN }
             const encryptedVault = encrypt(payload, masterPassword, driveInfo.driveType === 3)
 
-            if (existsSync(getVaultPath())) {
-                try { execSync(`attrib -H -R "${getVaultPath()}"`) } catch (_) { }
-            }
+            writeJsonFileAtomic(getVaultPath(), encryptedVault)
 
-            writeFileSync(getVaultPath(), JSON.stringify(encryptedVault, null, 2), 'utf-8')
-            try { execSync(`attrib +H "${getVaultPath()}"`) } catch (_) { }
-
-            const meta = {
+            let meta = {
                 version: '1.0.0',
                 createdOn: driveInfo.serialNumber,
                 isRemovable: driveInfo.isRemovable,
-                fastBoot: fastBoot || false
+                fastBoot: false
             }
 
-            if (driveInfo.isRemovable && pin) {
+            if (pin) {
                 const pinKey = pin + ':' + driveInfo.serialNumber
                 const encryptedMasterPw = encrypt({ masterPassword }, pinKey)
                 meta.pinVault = encryptedMasterPw
@@ -285,17 +675,20 @@ function registerIpcHandlers() {
                 meta.hasPIN = false
             }
 
-            if (driveInfo.isRemovable && fastBoot) {
+            if (fastBoot) {
                 const serialKey = 'FASTBOOT:' + driveInfo.serialNumber
                 const encryptedMasterPw = encrypt({ masterPassword }, serialKey)
                 meta.fastBootVault = encryptedMasterPw
+                meta.fastBoot = true
             }
 
+            meta = mergeLaunchCapabilitiesIntoMeta(meta, authorized.capabilities)
             saveVaultMeta(meta)
 
             // Cache the active master password so that subsequent actions 
             // (like secondary PIN/FastBoot toggles or Workspace edits) process correctly without requiring restart
             setActiveMasterPassword(masterPassword)
+            resetPinUnlockFailures()
 
             return { success: true }
         } catch (e) {
@@ -304,16 +697,17 @@ function registerIpcHandlers() {
     })
 
     // --- Isolated Security Handlers ---
-    ipcMain.handle('update-pin', async (_, newPin) => {
+    trustedHandle('update-pin', async (_, newPin) => {
         try {
-            if (!activeMasterPasswordBuffer) throw new Error('Session locked')
+            const safePin = validatePinInput(newPin)
+            requireActiveSession()
             const driveInfo = await getDriveInfo()
-            if (!driveInfo.isRemovable) throw new Error('PIN only supported on removable drives')
+            requireConvenienceUnlockDrive(driveInfo, 'PIN')
 
-            let meta = loadVaultMeta() || { version: '1.0.0', createdOn: driveInfo.serialNumber, isRemovable: true }
+            let meta = loadVaultMeta() || { version: '1.0.0', createdOn: driveInfo.serialNumber, isRemovable: driveInfo.isRemovable }
 
-            if (newPin) {
-                const pinKey = newPin + ':' + driveInfo.serialNumber
+            if (safePin) {
+                const pinKey = safePin + ':' + driveInfo.serialNumber
                 meta.pinVault = encrypt({ masterPassword: activeMasterPasswordBuffer.toString('utf-8') }, pinKey)
                 meta.hasPIN = true
             } else {
@@ -331,15 +725,16 @@ function registerIpcHandlers() {
         }
     })
 
-    ipcMain.handle('update-fastboot', async (_, enable) => {
+    trustedHandle('update-fastboot', async (_, enable) => {
         try {
-            if (!activeMasterPasswordBuffer) throw new Error('Session locked')
+            const safeEnable = validateBooleanInput(enable, 'enable')
+            requireActiveSession()
             const driveInfo = await getDriveInfo()
-            if (!driveInfo.isRemovable) throw new Error('FastBoot only supported on removable drives')
+            requireConvenienceUnlockDrive(driveInfo, 'FastBoot')
 
-            let meta = loadVaultMeta() || { version: '1.0.0', createdOn: driveInfo.serialNumber, isRemovable: true }
+            let meta = loadVaultMeta() || { version: '1.0.0', createdOn: driveInfo.serialNumber, isRemovable: driveInfo.isRemovable }
 
-            if (enable) {
+            if (safeEnable) {
                 const serialKey = 'FASTBOOT:' + driveInfo.serialNumber
                 meta.fastBootVault = encrypt({ masterPassword: activeMasterPasswordBuffer.toString('utf-8') }, serialKey)
                 meta.fastBoot = true
@@ -361,10 +756,12 @@ function registerIpcHandlers() {
     // Phase 17.1: Toggle for clearing extracted app cache on exit
     // ON  = Zero-footprint mode (safe for public/school PCs)
     // OFF = Keep cache for instant launches (ideal for home PC)
-    ipcMain.handle('update-clear-cache', async (_, enable) => {
+    trustedHandle('update-clear-cache', async (_, enable) => {
         try {
+            const safeEnable = validateBooleanInput(enable, 'enable')
+            requireActiveSession()
             let meta = loadVaultMeta() || { version: '1.0.0' }
-            meta.clearCacheOnExit = enable
+            meta.clearCacheOnExit = safeEnable
             saveVaultMeta(meta)
             return { success: true }
         } catch (e) {
@@ -372,14 +769,17 @@ function registerIpcHandlers() {
         }
     })
 
-    ipcMain.handle('unlock-with-pin', async (_, pin) => {
+    trustedHandle('unlock-with-pin', async (_, pin) => {
         try {
+            assertPinUnlockAllowed()
+            const safePin = validatePinInput(pin, { allowNull: false })
             const meta = loadVaultMeta()
             if (!meta || !meta.hasPIN || !meta.pinVault) {
                 return { success: false, error: 'PIN not configured' }
             }
 
             const driveInfo = await getDriveInfo()
+            requireConvenienceUnlockDrive(driveInfo, 'PIN')
 
             if (meta.createdOn !== driveInfo.serialNumber) {
                 return {
@@ -389,7 +789,7 @@ function registerIpcHandlers() {
                 }
             }
 
-            const pinKey = pin + ':' + driveInfo.serialNumber
+            const pinKey = safePin + ':' + driveInfo.serialNumber
             const { masterPassword } = decrypt(meta.pinVault, pinKey)
 
             const encryptedVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
@@ -400,22 +800,29 @@ function registerIpcHandlers() {
 
             // Cache the actual master password for future localized state saves / setting updates
             setActiveMasterPassword(masterPassword)
+            resetPinUnlockFailures()
 
             return { success: true, workspace }
         } catch (e) {
+            if (e.code === 'PIN_LOCKED') {
+                return { success: false, error: 'PIN_LOCKED', retryAfterMs: e.retryAfterMs }
+            }
+            recordPinUnlockFailure()
             return { success: false, error: 'Invalid PIN' }
         }
     })
 
-    ipcMain.handle('unlock-with-password', (_, password) => {
+    trustedHandle('unlock-with-password', (_, password) => {
         try {
+            const safePassword = validatePasswordInput(password)
             const encryptedVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
-            let workspace = decrypt(encryptedVault, password)
+            let workspace = decrypt(encryptedVault, safePassword)
 
             if (workspace._honeyToken) delete workspace._honeyToken
 
             // Cache the actual master password for future localized state saves / setting updates
-            setActiveMasterPassword(password)
+            setActiveMasterPassword(safePassword)
+            resetPinUnlockFailures()
 
             return { success: true, workspace }
         } catch (e) {
@@ -423,7 +830,7 @@ function registerIpcHandlers() {
         }
     })
 
-    ipcMain.handle('try-fast-boot', async () => {
+    trustedHandle('try-fast-boot', async () => {
         try {
             const meta = loadVaultMeta()
             if (!meta || !meta.fastBoot || !meta.fastBootVault) {
@@ -431,6 +838,7 @@ function registerIpcHandlers() {
             }
 
             const driveInfo = await getDriveInfo()
+            requireConvenienceUnlockDrive(driveInfo, 'FastBoot')
             if (meta.createdOn !== driveInfo.serialNumber) {
                 return { success: false }
             }
@@ -445,6 +853,7 @@ function registerIpcHandlers() {
 
             // Store the master password for session state encryption
             setActiveMasterPassword(masterPassword)
+            resetPinUnlockFailures()
 
             return { success: true, workspace }
         } catch (e) {
@@ -452,7 +861,8 @@ function registerIpcHandlers() {
         }
     })
 
-    ipcMain.handle('browse-exe', async () => {
+    trustedHandle('browse-exe', async () => {
+        requireUnlockedOrNoVault()
         const result = await dialog.showOpenDialog({
             properties: ['openFile'],
             filters: [{ name: 'Executables', extensions: ['exe', 'bat', 'cmd'] }]
@@ -460,23 +870,38 @@ function registerIpcHandlers() {
         if (result.canceled) return null
 
         const vaultDir = getVaultDir()
-        if (result.filePaths[0].startsWith(vaultDir)) {
-            return result.filePaths[0].replace(vaultDir, '[USB]')
+        const selectedPath = result.filePaths[0]
+        if (selectedPath.startsWith(vaultDir)) {
+            return selectedPath.replace(vaultDir, '[USB]')
         }
-        return result.filePaths[0]
+        registerLaunchCapability({
+            name: basename(selectedPath).replace(/\.(exe|bat|cmd)$/i, ''),
+            path: selectedPath,
+            launchSourceType: 'host-exe',
+            launchMethod: 'spawn'
+        }, 'browse-exe')
+        return selectedPath
     })
 
-    ipcMain.handle('browse-folder', async () => {
+    trustedHandle('browse-folder', async () => {
+        requireUnlockedOrNoVault()
         const result = await dialog.showOpenDialog({
             properties: ['openDirectory']
         })
         if (result.canceled) return null
 
         const vaultDir = getVaultDir()
-        if (result.filePaths[0].startsWith(vaultDir)) {
-            return result.filePaths[0].replace(vaultDir, '[USB]')
+        const selectedPath = result.filePaths[0]
+        if (selectedPath.startsWith(vaultDir)) {
+            return selectedPath.replace(vaultDir, '[USB]')
         }
-        return result.filePaths[0]
+        registerLaunchCapability({
+            name: basename(selectedPath),
+            path: selectedPath,
+            launchSourceType: 'host-folder',
+            launchMethod: 'shell-execute'
+        }, 'browse-folder')
+        return selectedPath
     })
 
     // ─── App Scanner & Importer ────────────────────────────────────────────
@@ -1215,6 +1640,12 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
     }
 
     function resolveHostLaunchFailureSupportFields(desktopApp, availabilityStatus = 'missing-on-this-PC') {
+        if (desktopApp?.launchSourceType === 'host-folder') {
+            return resolveHostFolderSupportFields({
+                appName: desktopApp.name,
+                availabilityStatus
+            })
+        }
         if (desktopApp?.launchSourceType === 'shell-execute') {
             return resolveShellExecuteSupportFields({
                 appName: desktopApp.name,
@@ -1288,7 +1719,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
         }
     }
 
-    ipcMain.handle('scan-stale-appdata', async () => {
+    trustedHandle('scan-stale-appdata', async () => {
         try {
             const workspace = loadActiveVaultWorkspace()
             const payloads = await findStaleUnsupportedAppDataPayloads(workspace, getVaultDir(), {
@@ -1300,11 +1731,9 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
         }
     })
 
-    ipcMain.handle('cleanup-stale-appdata', async (_, { payloadIds } = {}) => {
+    trustedHandle('cleanup-stale-appdata', async (_, input = {}) => {
         try {
-            if (!Array.isArray(payloadIds) || payloadIds.length === 0) {
-                throw new Error('Select at least one AppData payload to remove.')
-            }
+            const { payloadIds } = validatePayloadIdsInput(input)
 
             const workspace = loadActiveVaultWorkspace()
             const appDataRoot = join(getVaultDir(), 'AppData')
@@ -1346,8 +1775,9 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
         }
     })
 
-    ipcMain.handle('scan-host-installed-apps', async () => {
+    trustedHandle('scan-host-installed-apps', async () => {
         try {
+            requireUnlockedOrNoVault()
             const entries = await readRegistryUninstallEntries()
             const appPathEntries = await readAppPathsEntries()
             const shortcuts = await readStartMenuShortcuts()
@@ -1361,7 +1791,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                 const key = `${String(result.launchSourceType || '').toLowerCase()}:${String(result.name).toLowerCase()}:${String(result.path).toLowerCase()}`
                 if (seen.has(key)) return
                 seen.add(key)
-                results.push(result)
+                results.push(registerLaunchCapability(result, 'host-scan'))
             }
 
             for (const entry of entries) {
@@ -1408,7 +1838,8 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
         }
     })
 
-    ipcMain.handle('scan-apps', async () => {
+    trustedHandle('scan-apps', async () => {
+        requireUnlockedOrNoVault()
         const vaultDir = getVaultDir()
         const appsDir = join(vaultDir, 'Apps')
         const results = []
@@ -1495,9 +1926,12 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                 launchSourceType: 'vault-archive'
             })
 
-            const alreadyImported = existsSync(join(appsDir, name)) ||
-                existsSync(join(appsDir, `${name}.tar.zst`)) ||
-                existsSync(join(appsDir, `${safeAppName(name)}.quickpass-app.json`))
+            const storageId = safeAppName(name)
+            const alreadyImported = existsSync(join(appsDir, storageId)) ||
+                existsSync(join(appsDir, `${storageId}.tar.zst`)) ||
+                existsSync(join(appsDir, `${storageId}.quickpass-app.json`)) ||
+                existsSync(join(appsDir, name)) ||
+                existsSync(join(appsDir, `${name}.tar.zst`))
 
             results.push({
                 name,
@@ -1632,9 +2066,12 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                         launchSourceType: 'vault-archive'
                     })
 
-                    const alreadyImported = existsSync(join(appsDir, name)) ||
-                        existsSync(join(appsDir, `${name}.tar.zst`)) ||
-                        existsSync(join(appsDir, `${safeAppName(name)}.quickpass-app.json`))
+                    const storageId = safeAppName(name)
+                    const alreadyImported = existsSync(join(appsDir, storageId)) ||
+                        existsSync(join(appsDir, `${storageId}.tar.zst`)) ||
+                        existsSync(join(appsDir, `${storageId}.quickpass-app.json`)) ||
+                        existsSync(join(appsDir, name)) ||
+                        existsSync(join(appsDir, `${name}.tar.zst`))
 
                     results.push({
                         name,
@@ -1675,16 +2112,31 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
         return results
     })
 
-    ipcMain.handle('import-app', async (event, { sourcePath, name, exe, relativeExePath, importData, dataPath, sizeMB, dataSizeMB }) => {
+    trustedHandle('import-app', async (event, input) => {
+        requireUnlockedOrNoVault()
         const win = BrowserWindow.fromWebContents(event.sender)
         const vaultDir = getVaultDir()
-        // Phase 17.2: Sanitize AppData folder name to match engine.js launch path
-        const safeName = safeAppName(name)
-        const dataDest = join(vaultDir, 'AppData', safeName)
-        // Fix 1: Hoist tempArchive so catch block can clean it up on failure
-        const tempArchive = join(os.tmpdir(), `omnilaunch-import-${name}-${Date.now()}.tar.zst`)
+        let tempArchive = null
+        let storageReservation = null
 
         try {
+            const {
+                sourcePath,
+                name,
+                exe,
+                relativeExePath,
+                importData,
+                dataPath,
+                sizeMB,
+                dataSizeMB,
+            } = validateImportAppInput(input)
+            storageReservation = reserveAppStorageId(vaultDir, name)
+            const storageId = storageReservation.storageId
+            const archiveName = `${storageId}.tar.zst`
+            const safeName = storageId
+            const dataDest = join(vaultDir, 'AppData', safeName)
+            tempArchive = join(os.tmpdir(), `omnilaunch-import-${safeName}-${Date.now()}.tar.zst`)
+
             if (!sourcePath || !existsSync(sourcePath)) {
                 throw new Error(`Source app folder not found: ${sourcePath}`)
             }
@@ -1740,7 +2192,6 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
             //   2. Copy ONE large compressed file to USB (fast: sequential write)
             // This turns a 25-minute import into ~2-3 minutes.
 
-            const archiveName = `${name}.tar.zst`
             const archiveDest = join(vaultDir, 'Apps', archiveName)
 
             // Phase 1: Compress on SSD (fast — no USB involved)
@@ -1800,6 +2251,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
 
             // Cleanup temp archive
             try { fs.unlinkSync(tempArchive) } catch (_) {}
+            tempArchive = null
 
             // Phase 3: Copy user data (if requested) — still uses robocopy
             // because AppData needs incremental sync (robocopy /MIR) later
@@ -1823,7 +2275,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                 importData: effectiveImportData,
                 archiveHash,
                 archiveSizeBytes: compressedSize,
-                legacyPath: `[USB]\\Apps\\${name}\\${exePathInApp}`,
+                legacyPath: `[USB]\\Apps\\${safeName}\\${exePathInApp}`,
                 requiredFiles
             })
             writeAppManifest(vaultDir, manifest)
@@ -1833,7 +2285,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                 appConfig: {
                     name,
                     // Store the ORIGINAL relative exe path — launch flow will handle extraction
-                    path: `[USB]\\Apps\\${name}\\${exePathInApp}`,
+                    path: `[USB]\\Apps\\${safeName}\\${exePathInApp}`,
                     args: '',
                     portableData: !!effectiveImportData,
                     manifestId: manifest.manifestId,
@@ -1852,8 +2304,12 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
             }
         } catch (err) {
             // Fix 1: Clean up the ACTUAL temp archive (not a new Date.now() filename)
-            try { require('fs').unlinkSync(tempArchive) } catch (_) {}
+            if (tempArchive) {
+                try { require('fs').unlinkSync(tempArchive) } catch (_) {}
+            }
             return { success: false, error: err.message }
+        } finally {
+            if (storageReservation) storageReservation.release()
         }
     })
 
@@ -1945,42 +2401,18 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
 
     // ─── Session State & Setup ─────────────────────────────────────────────
 
-    ipcMain.handle('set-master-password', (_, password) => {
-        setActiveMasterPassword(password)
-        return { success: true }
-    })
-
-    ipcMain.handle('start-session-setup', async (event) => {
+    trustedHandle('start-session-setup', async (event) => {
         try {
-            beginDiagnosticsCycle('setup')
-            await closeBrowser()
-            await closeDesktopApps()
-
-            const win = BrowserWindow.fromWebContents(event.sender)
-            const vaultDir = getVaultDir()
-
-            // Register disconnect callback BEFORE launching
-            // This fires when the user closes all Chrome windows
-            onBrowserAllClosed(() => {
-                if (win && !win.isDestroyed()) {
-                    win.webContents.send('browser-disconnected')
-                }
+            return await startSessionSetupHandlerCore({
+                event,
+                deps: createProcessControlHandlerDeps()
             })
-
-            // Phase 13: Pass vaultDir for persistent Chrome profile on USB
-            const result = await launchSessionSetup((statusMsg) => {
-                if (win && !win.isDestroyed()) {
-                    win.webContents.send('launch-status', statusMsg)
-                }
-            }, vaultDir, [], { skipDiagnosticsCycle: true })
-
-            return result
         } catch (err) {
             return { success: false, error: err.message }
         }
     })
 
-    ipcMain.handle('has-active-browser-session', async () => {
+    trustedHandle('has-active-browser-session', async () => {
         try {
             return { success: true, active: hasActiveBrowserSession() }
         } catch (err) {
@@ -1988,48 +2420,48 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
         }
     })
 
-    ipcMain.handle('capture-session', async (_, { masterPassword: pw }) => {
+    const saveSessionCaptureResult = async ({
+        input = {},
+        capture,
+        requireActiveSession = false,
+        allowNewVaultPassword = true
+    }) => {
+        const vaultPath = getVaultPath()
+        const vaultExists = existsSync(vaultPath)
+
+        return saveCapturedSessionToVault({
+            input,
+            vaultExists,
+            activeMasterPassword: activeMasterPasswordBuffer ? activeMasterPasswordBuffer.toString('utf-8') : '',
+            capture,
+            requireActiveSession,
+            allowNewVaultPassword,
+            readVault: () => JSON.parse(readFileSync(vaultPath, 'utf-8')),
+            decryptVault: decrypt,
+            encryptVault: (payload, masterPassword, driveInfo) => encrypt(payload, masterPassword, driveInfo.driveType === 3),
+            writeVault: (encryptedVault) => {
+                if (vaultExists) {
+                    try { execSync(`attrib -H -R "${vaultPath}"`) } catch (_) { }
+                }
+                writeJsonFileAtomic(vaultPath, encryptedVault)
+            },
+            getDriveInfo,
+            loadMeta: loadVaultMeta,
+            saveMeta: saveVaultMeta,
+            mergeMeta: mergeLaunchCapabilitiesIntoMeta,
+            authorizeWorkspaceLaunchCapabilities,
+            honeyToken: HONEY_TOKEN,
+            validateInput: validateCaptureSessionInput,
+            validateWorkspace: validateWorkspaceInput
+        })
+    }
+
+    trustedHandle('capture-session', async (_, input = {}) => {
         try {
-            const mp = pw || (activeMasterPasswordBuffer ? activeMasterPasswordBuffer.toString('utf-8') : null)
-            if (!mp) return { success: false, error: 'No master password available' }
-
-            const result = await captureSession()
-            if (!result.success) return result
-
-            // Save the captured URLs into the vault workspace
-            // Phase 13: No longer saving cookies to vault.state.json —
-            // persistent Chrome profile on USB handles all auth data
-            const vaultPath = getVaultPath()
-            if (existsSync(vaultPath)) {
-                try { execSync(`attrib -H -R "${vaultPath}"`) } catch (_) { }
-            }
-
-            // Load existing vault and update webTabs with captured URLs
-            let workspace = { webTabs: [], desktopApps: [] }
-            try {
-                const encryptedVault = JSON.parse(readFileSync(vaultPath, 'utf-8'))
-                workspace = decrypt(encryptedVault, mp)
-                if (workspace._honeyToken) delete workspace._honeyToken
-            } catch (_) { }
-
-            // Replace webTabs with captured URLs
-            workspace.webTabs = result.urls.map(url => ({ url, enabled: true }))
-
-            const payload = { ...workspace, _honeyToken: HONEY_TOKEN }
-
-            // Re-encrypt and save the vault
-            const driveInfo = await getDriveInfo()
-            const encryptedVault = encrypt(payload, mp, driveInfo.driveType === 3)
-            writeFileSync(vaultPath, JSON.stringify(encryptedVault, null, 2), 'utf-8')
-            try { execSync(`attrib +H "${vaultPath}"`) } catch (_) { }
-
-            return {
-                success: true,
-                tabCount: result.tabCount,
-                urls: result.urls,
-                skippedUrls: result.skippedUrls || [],
-                skippedCount: result.skippedCount || 0
-            }
+            return await saveSessionCaptureResult({
+                input,
+                capture: captureSession
+            })
         } catch (err) {
             console.error('Failed to capture session:', err)
             return { success: false, error: err.message }
@@ -2037,122 +2469,61 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
     })
 
     // ─── Session Edit (opens browser with saved tabs) ────────────────────
-    ipcMain.handle('start-session-edit', async (event) => {
+    trustedHandle('start-session-edit', async (event) => {
         try {
-            beginDiagnosticsCycle('edit')
-            await closeBrowser()
-            await closeDesktopApps()
-
-            const win = BrowserWindow.fromWebContents(event.sender)
-            const mp = activeMasterPasswordBuffer ? activeMasterPasswordBuffer.toString('utf-8') : null
-            if (!mp) return { success: false, error: 'No master password' }
-
-            const vaultDir = getVaultDir()
-
-            // Phase 13: No longer loading savedState (cookies) —
-            // persistent Chrome profile handles auth. Only load URLs.
-            let urls = []
-            try {
-                const vaultPath = getVaultPath()
-                if (existsSync(vaultPath)) {
-                    const encrypted = JSON.parse(readFileSync(vaultPath, 'utf-8'))
-                    const workspace = decrypt(encrypted, mp)
-                    urls = (workspace.webTabs || []).filter(t => t.enabled).map(t => t.url)
-                }
-            } catch (_) { }
-
-            // Register disconnect callback
-            onBrowserAllClosed(() => {
-                if (win && !win.isDestroyed()) {
-                    win.webContents.send('browser-disconnected')
-                }
+            return await startSessionEditHandlerCore({
+                event,
+                deps: createProcessControlHandlerDeps()
             })
-
-            // Phase 13: Pass vaultDir for persistent profile, urls for tab restoration
-            const result = await launchSessionSetup((statusMsg) => {
-                if (win && !win.isDestroyed()) {
-                    win.webContents.send('launch-status', statusMsg)
-                }
-            }, vaultDir, urls, { skipDiagnosticsCycle: true })
-
-            return result
         } catch (err) {
             return { success: false, error: err.message }
         }
     })
 
     // ─── Save Current Session (without closing browser) ──────────────────
-    ipcMain.handle('save-current-session', async () => {
+    trustedHandle('save-current-session', async () => {
         try {
-            const mp = activeMasterPasswordBuffer ? activeMasterPasswordBuffer.toString('utf-8') : null
-            if (!mp) return { success: false, error: 'No master password' }
-
-            const result = await captureCurrentSession()
-            if (!result.success) return result
-
-            // Phase 13: Save URLs only — persistent Chrome profile handles auth
-            const vaultPath = getVaultPath()
-            if (existsSync(vaultPath)) {
-                try { execSync(`attrib -H -R "${vaultPath}"`) } catch (_) { }
-            }
-
-            let workspace = { webTabs: [], desktopApps: [] }
-            try {
-                const encryptedVault = JSON.parse(readFileSync(vaultPath, 'utf-8'))
-                workspace = decrypt(encryptedVault, mp)
-                if (workspace._honeyToken) delete workspace._honeyToken
-            } catch (_) { }
-
-            workspace.webTabs = result.urls.map(url => ({ url, enabled: true }))
-
-            const payload = { ...workspace, _honeyToken: HONEY_TOKEN }
-            const driveInfo = await getDriveInfo()
-            const encryptedVault = encrypt(payload, mp, driveInfo.driveType === 3)
-
-            writeFileSync(vaultPath, JSON.stringify(encryptedVault, null, 2), 'utf-8')
-            try { execSync(`attrib +H "${vaultPath}"`) } catch (_) { }
-
-            return {
-                success: true,
-                tabCount: result.tabCount,
-                urls: result.urls,
-                skippedUrls: result.skippedUrls || [],
-                skippedCount: result.skippedCount || 0
-            }
+            return await saveSessionCaptureResult({
+                capture: captureCurrentSession,
+                requireActiveSession: true,
+                allowNewVaultPassword: false
+            })
         } catch (err) {
             return { success: false, error: err.message }
         }
     })
 
     // ─── Quit & Relaunch ─────────────────────────────────────────────────
-    ipcMain.handle('quit-and-relaunch', async (_, { closeApps = false } = {}) => {
+    trustedHandle('quit-and-relaunch', async (_, input = {}) => {
         try {
-            await closeBrowser()
-            if (closeApps) await closeDesktopApps()
-
-            app.quit()
-
-            return { success: true }
+            return await quitAndRelaunchHandlerCore({
+                input,
+                deps: createProcessControlHandlerDeps()
+            })
         } catch (err) {
             return { success: false, error: err.message }
         }
     })
 
     // ─── Close Desktop Apps ──────────────────────────────────────────────
-    ipcMain.handle('close-desktop-apps', async () => {
-        await closeDesktopApps()
-        return { success: true }
+    trustedHandle('close-desktop-apps', async () => {
+        return closeDesktopAppsHandlerCore({
+            deps: createProcessControlHandlerDeps()
+        })
     })
 
     // ─── Launch Workspace Engine ─────────────────────────────────────────
-    ipcMain.handle('launch-workspace', (event, workspace) => {
+    trustedHandle('launch-workspace', (event) => {
         try {
             const win = BrowserWindow.fromWebContents(event.sender)
+            const safeWorkspace = authorizeWorkspaceLaunchCapabilities(
+                validateWorkspaceInput(loadActiveVaultWorkspace()),
+                { existingMeta: loadVaultMeta() }
+            ).workspace
 
             // Phase 12: Dynamically resolve [USB] portable macros back into absolute paths
-            const vaultDir = getVaultDir()
-            if (workspace && workspace.desktopApps) {
-                workspace.desktopApps = workspace.desktopApps.map(app => {
+            if (safeWorkspace && safeWorkspace.desktopApps) {
+                safeWorkspace.desktopApps = safeWorkspace.desktopApps.map(app => {
                     if (app.path && app.path.startsWith('[USB]')) {
                         return { ...app, path: app.path.replace('[USB]', vaultDir) }
                     }
@@ -2167,10 +2538,10 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                 await closeBrowser()
                 await closeDesktopApps()
                 const launchWorkspaceConfig = {
-                    ...workspace,
-                    desktopApps: (workspace.desktopApps || []).map((desktopApp) => {
+                    ...safeWorkspace,
+                    desktopApps: (safeWorkspace.desktopApps || []).map((desktopApp) => {
                         try {
-                            if (['registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app'].includes(desktopApp?.launchSourceType)) {
+                            if (['host-folder', 'registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app'].includes(desktopApp?.launchSourceType)) {
                                 return desktopApp
                             }
                             const repair = repairLegacyAppConfig(desktopApp, vaultDir)
@@ -2185,8 +2556,11 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                     })
                 }
                 launchWorkspaceConfig.desktopApps = await Promise.all((launchWorkspaceConfig.desktopApps || []).map(async (desktopApp) => {
-                    if (!['registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app'].includes(desktopApp?.launchSourceType)) return desktopApp
+                    if (!['host-folder', 'registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app'].includes(desktopApp?.launchSourceType)) return desktopApp
                     try {
+                        if (desktopApp.launchSourceType === 'host-folder') {
+                            return desktopApp
+                        }
                         if (desktopApp.launchSourceType === 'registry-uninstall') {
                             return await resolveRegistryUninstallLaunchReference(desktopApp)
                         }
@@ -2243,28 +2617,51 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
     })
 
     // ─── Window Controls ─────────────────────────────────────────────────
-    ipcMain.handle('close-window', () => {
-        const win = BrowserWindow.getFocusedWindow()
-        if (win) win.close()
+    trustedHandle('close-window', () => {
+        return closeWindowHandlerCore({
+            deps: createProcessControlHandlerDeps()
+        })
     })
 
-    ipcMain.handle('minimize-window', () => {
+    trustedHandle('minimize-window', () => {
         const win = BrowserWindow.getFocusedWindow()
         if (win) win.minimize()
     })
 
     // ─── Import Close Guard ─────────────────────────────────────────────
-    ipcMain.on('import-started', (event) => {
+    trustedOn('import-started', (event) => {
         importInProgress = true
     })
 
-    ipcMain.on('import-finished', (event) => {
+    trustedOn('import-finished', (event) => {
         importInProgress = false
     })
 }
 
 // ─── Import Guard State ────────────────────────────────────────────────────────
 let importInProgress = false
+let electronSecurityHandlersInstalled = false
+
+function normalizeRendererTrustUrl(value) {
+    try {
+        const parsed = new URL(String(value || ''))
+        parsed.hash = ''
+        return parsed.toString()
+    } catch (_) {
+        return ''
+    }
+}
+
+function installElectronSecurityHandlers() {
+    if (electronSecurityHandlersInstalled) return
+    electronSecurityHandlersInstalled = true
+    session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false))
+    app.on('web-contents-created', (_event, contents) => {
+        if (typeof contents.setWindowOpenHandler === 'function') {
+            contents.setWindowOpenHandler(() => ({ action: 'deny' }))
+        }
+    })
+}
 
 // ─── Window Creation ───────────────────────────────────────────────────────────
 function createWindow() {
@@ -2279,9 +2676,24 @@ function createWindow() {
         show: false,
         webPreferences: {
             preload: join(__dirname, '../preload/index.js'),
-            sandbox: false,
+            sandbox: true,
             contextIsolation: true,
             nodeIntegration: false
+        }
+    })
+
+    const devRendererUrl = !app.isPackaged ? process.env['ELECTRON_RENDERER_URL'] : ''
+    const rendererIndexPath = join(__dirname, '../renderer/index.html')
+    const expectedRendererUrl = devRendererUrl || pathToFileURL(rendererIndexPath).toString()
+    configureTrustedIpcRenderer({
+        urls: [expectedRendererUrl],
+        webContentsId: mainWindow.webContents.id
+    })
+
+    mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+    mainWindow.webContents.on('will-navigate', (event, navigationUrl) => {
+        if (normalizeRendererTrustUrl(navigationUrl) !== normalizeRendererTrustUrl(expectedRendererUrl)) {
+            event.preventDefault()
         }
     })
 
@@ -2310,10 +2722,10 @@ function createWindow() {
         }
     })
 
-    if (process.env['ELECTRON_RENDERER_URL']) {
-        mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+    if (devRendererUrl) {
+        mainWindow.loadURL(devRendererUrl)
     } else {
-        mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+        mainWindow.loadFile(rendererIndexPath)
     }
 
 
@@ -2367,6 +2779,7 @@ app.whenReady().then(() => {
     runDiagnostics.osVersion = os.release()
     runDiagnostics.startTime = Date.now()
 
+    installElectronSecurityHandlers()
     registerIpcHandlers()
     createWindow()
     setupKillCord()
@@ -2379,31 +2792,18 @@ app.whenReady().then(() => {
 // Phase 14: before-quit with try/finally — guarantees profile sync + cleanup
 let isQuitting = false
 app.on('before-quit', async (e) => {
-    if (isQuitting) return
-    e.preventDefault()
-
-    try {
-        // Sync Chrome profile back to USB + wipe local copy
-        await closeBrowser()
-    } catch (err) {
-        console.error('[QuickPass] Profile sync during quit failed:', err)
-        diagError('before-quit', err.message)
-    } finally {
-        // Cryptographic memory wipe
-        setActiveMasterPassword(null)
-        await closeDesktopApps()
-        try { wipeAllRuntimeAppProfiles({ staleOnly: true }) } catch (_) { }
-        try {
-            const vd = getVaultDir()
-            if (existsSync(vd)) {
-                writeFileSync(join(vd, 'run-diagnostics.json'), JSON.stringify(runDiagnostics, null, 2), 'utf-8')
+    await beforeQuitLifecycleCleanupCore({
+        event: e,
+        state: {
+            get isQuitting() {
+                return isQuitting
+            },
+            set isQuitting(value) {
+                isQuitting = value
             }
-        } catch (_) { }
-        // Wipe Electron temp traces from local PC
-        try { require('fs').rmSync(tmpPath, { recursive: true, force: true }) } catch (_) { }
-        isQuitting = true
-        app.quit()
-    }
+        },
+        deps: createProcessControlHandlerDeps()
+    })
 })
 
 // Belt-and-suspenders: wipe ALL traces on ANY exit path (including kill cord crash)

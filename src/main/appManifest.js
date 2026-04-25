@@ -18,6 +18,7 @@ export const LAUNCH_SOURCE_TYPES = Object.freeze({
     VAULT_ARCHIVE: 'vault-archive',
     VAULT_DIRECTORY: 'vault-directory',
     HOST_EXE: 'host-exe',
+    HOST_FOLDER: 'host-folder',
     REGISTRY_UNINSTALL: 'registry-uninstall',
     APP_PATHS: 'app-paths',
     START_MENU_SHORTCUT: 'start-menu-shortcut',
@@ -711,6 +712,32 @@ export function resolveHostExeSupportFields({
         limitations: limitations || [
             'Data is not copied or synced by OmniLaunch.',
             'Quit is enabled only after OmniLaunch launches and owns the process.'
+        ]
+    })
+}
+
+export function resolveHostFolderSupportFields({
+    appName,
+    availabilityStatus = 'unknown'
+} = {}) {
+    return resolveManifestSupportFields({
+        appType: 'native',
+        appName,
+        launchProfile: 'native-windowed',
+        dataProfile: { mode: 'none' },
+        supportSummary: 'Host folder launch reference. OmniLaunch opens it through the Windows shell and does not own a child process.',
+        launchSourceType: LAUNCH_SOURCE_TYPES.HOST_FOLDER,
+        launchMethod: LAUNCH_METHODS.SHELL_EXECUTE,
+        ownershipProofLevel: OWNERSHIP_PROOF_LEVELS.NONE,
+        closePolicy: CLOSE_POLICIES.NEVER,
+        canQuitFromOmniLaunch: false,
+        closeManagedAfterSpawn: false,
+        availabilityStatus,
+        dataManagement: DATA_MANAGEMENT_LEVELS.UNMANAGED,
+        limitations: [
+            'Folders are opened by the Windows shell.',
+            'OmniLaunch cannot prove process ownership for a folder launch.',
+            'Quit and cleanup are disabled for this launch source.'
         ]
     })
 }
