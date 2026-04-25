@@ -50,9 +50,7 @@ import {
     validatePayloadIdsInput,
     validatePasswordInput,
     validatePinInput,
-    validateQuitOptions,
-    validateSaveVaultInput,
-    validateWorkspaceInput
+    validateQuitOptions
 } from './ipcValidation.js'
 import {
     assertTrustedIpcSender,
@@ -77,6 +75,12 @@ import {
     startSessionEditHandlerCore,
     startSessionSetupHandlerCore
 } from './processControlHandlers.js'
+import {
+    WORKSPACE_CAPABILITY_VAULT_KEY,
+    migrateWorkspaceLaunchCapabilities,
+    migrationReportToMetadataSummary,
+    rehydrateWorkspaceLaunchCapabilities
+} from './workspaceCapabilityMigration.js'
 
 // Phase 11: The Honey Token
 const HONEY_TOKEN = {
@@ -233,6 +237,42 @@ function loadActiveVaultWorkspace() {
     }
 }
 
+function validateSaveVaultSecurityInput(input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+        throw new Error('save-vault payload must be an object.')
+    }
+    return {
+        masterPassword: validatePasswordInput(input.masterPassword),
+        currentPassword: input.currentPassword ? validatePasswordInput(input.currentPassword, 'currentPassword') : '',
+        pin: validatePinInput(input.pin),
+        fastBoot: validateBooleanInput(input.fastBoot, 'fastBoot'),
+        workspace: input.workspace || {}
+    }
+}
+
+async function persistMigratedWorkspaceIfChanged(workspace, masterPassword, migrationResult) {
+    const existingMeta = loadVaultMeta()
+    const metaHasLegacyLaunchAuthority = !!existingMeta?.launchCapabilities
+    if (!migrationResult?.changed && !metaHasLegacyLaunchAuthority) return
+    if (migrationResult?.changed) {
+        const driveInfo = await getDriveInfo()
+        const payload = { ...workspace, _honeyToken: HONEY_TOKEN }
+        const encryptedVault = encrypt(payload, masterPassword, driveInfo.driveType === 3)
+        writeJsonFileAtomic(getVaultPath(), encryptedVault)
+    }
+    saveVaultMeta(mergeLaunchCapabilitiesIntoMeta(existingMeta || { version: '1.0.0' }, migrationResult))
+}
+
+async function migrateUnlockedWorkspaceForRenderer(workspace, masterPassword) {
+    const existingMeta = loadVaultMeta()
+    const migrated = authorizeWorkspaceLaunchCapabilities(workspace, {
+        existingMeta,
+        existingWorkspace: workspace
+    })
+    await persistMigratedWorkspaceIfChanged(migrated.workspace, masterPassword, migrated)
+    return migrated.workspace
+}
+
 // ─── Vault Metadata ────────────────────────────────────────────────────────────
 function getMetaPath() {
     return join(getVaultDir(), 'vault.meta.json')
@@ -367,10 +407,6 @@ function launchCapabilityIdFor(reference) {
     return `cap_${crypto.createHash('sha256').update(JSON.stringify(reference)).digest('hex').slice(0, 24)}`
 }
 
-function referencesMatch(left, right) {
-    return JSON.stringify(launchCapabilityReference(left)) === JSON.stringify(launchCapabilityReference(right))
-}
-
 function registerLaunchCapability(appConfig, provenance = 'main') {
     if (!HOST_WORKSPACE_LAUNCH_TYPES.has(appConfig?.launchSourceType)) return appConfig
     const reference = launchCapabilityReference(appConfig)
@@ -392,41 +428,48 @@ function readStoredLaunchCapabilities(meta = loadVaultMeta()) {
         .map(record => [record.id, record]))
 }
 
-function authorizeWorkspaceLaunchCapabilities(workspace, { existingMeta = loadVaultMeta() } = {}) {
-    const stored = readStoredLaunchCapabilities(existingMeta)
-    const authorized = {}
-    const desktopApps = (workspace.desktopApps || []).map((appConfig) => {
-        if (!HOST_WORKSPACE_LAUNCH_TYPES.has(appConfig?.launchSourceType)) return appConfig
-
-        const reference = launchCapabilityReference(appConfig)
-        const expectedId = appConfig.launchCapabilityId || launchCapabilityIdFor(reference)
-        const storedCapability = stored.get(expectedId)
-        const issuedCapability = issuedLaunchCapabilities.get(expectedId)
-        const capability = storedCapability || issuedCapability
-
-        if (!capability || !referencesMatch(appConfig, capability)) {
-            throw new Error(`Untrusted launch reference for ${appConfig.name || appConfig.path}. Re-select this app from OmniLaunch before saving.`)
-        }
-
-        authorized[capability.id] = capability
-        return { ...appConfig, launchCapabilityId: capability.id }
-    })
-
-    return {
-        workspace: { ...workspace, desktopApps },
-        capabilities: authorized
+function readMigrationManifest(manifestId, context = {}) {
+    try {
+        return readAppManifest(getVaultDir(), manifestId || context.storageId || context?.capability?.launch?.storageId)
+    } catch (_) {
+        return null
     }
 }
 
-function mergeLaunchCapabilitiesIntoMeta(meta, capabilities) {
-    if (!capabilities || Object.keys(capabilities).length === 0) return meta
+function legacyLaunchCapabilitiesForMigration(existingMeta = loadVaultMeta()) {
+    return new Map([
+        ...readStoredLaunchCapabilities(existingMeta),
+        ...issuedLaunchCapabilities
+    ])
+}
+
+function authorizeWorkspaceLaunchCapabilities(workspace, {
+    existingMeta = loadVaultMeta(),
+    existingWorkspace = null
+} = {}) {
+    const migrated = migrateWorkspaceLaunchCapabilities(workspace, {
+        existingCapabilityVault: existingWorkspace?.[WORKSPACE_CAPABILITY_VAULT_KEY] || null,
+        legacyCapabilities: legacyLaunchCapabilitiesForMigration(existingMeta),
+        manifestResolver: readMigrationManifest
+    })
+
     return {
-        ...meta,
-        launchCapabilities: {
-            ...(meta.launchCapabilities || {}),
-            ...capabilities
-        }
+        workspace: migrated.workspace,
+        capabilityVault: migrated.capabilityVault,
+        migrationReport: migrated.migrationReport,
+        changed: migrated.changed,
+        capabilities: {}
     }
+}
+
+function mergeLaunchCapabilitiesIntoMeta(meta, migration = null) {
+    const next = { ...(meta || { version: '1.0.0' }) }
+    delete next.launchCapabilities
+
+    const report = migration?.migrationReport || null
+    const summary = migrationReportToMetadataSummary(report)
+    if (summary) next.launchCapabilityMigration = summary
+    return next
 }
 
 // ─── Cryptographic Memory Buffer ───────────────────────────────────────────────
@@ -618,15 +661,15 @@ function registerIpcHandlers() {
         try {
             requireActiveSession()
 
-            const safeWorkspace = validateWorkspaceInput(workspace)
             const existingMeta = loadVaultMeta()
-            const authorized = authorizeWorkspaceLaunchCapabilities(safeWorkspace, { existingMeta })
+            const existingWorkspace = loadActiveVaultWorkspace()
+            const authorized = authorizeWorkspaceLaunchCapabilities(workspace, { existingMeta, existingWorkspace })
             const payload = { ...authorized.workspace, _honeyToken: HONEY_TOKEN }
             const driveInfo = await getDriveInfo()
             const encryptedVault = encrypt(payload, activeMasterPasswordBuffer.toString('utf-8'), driveInfo.driveType === 3)
 
             writeJsonFileAtomic(getVaultPath(), encryptedVault)
-            saveVaultMeta(mergeLaunchCapabilitiesIntoMeta(existingMeta || { version: '1.0.0' }, authorized.capabilities))
+            saveVaultMeta(mergeLaunchCapabilitiesIntoMeta(existingMeta || { version: '1.0.0' }, authorized))
 
             return { success: true }
         } catch (e) {
@@ -636,15 +679,17 @@ function registerIpcHandlers() {
 
     trustedHandle('save-vault', async (_, input) => {
         try {
-            const { masterPassword, currentPassword, pin, fastBoot, workspace } = validateSaveVaultInput(input)
+            const { masterPassword, currentPassword, pin, fastBoot, workspace } = validateSaveVaultSecurityInput(input)
             const driveInfo = await getDriveInfo()
             const vaultExists = existsSync(getVaultPath())
+            let existingWorkspace = null
 
             if (vaultExists) {
                 requireActiveSession()
                 if (!currentPassword) throw new Error('Current password is required to change the vault password.')
                 const existingVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
                 decrypt(existingVault, currentPassword)
+                existingWorkspace = loadActiveVaultWorkspace()
             }
             requireConvenienceUnlockRequestSupported({
                 requested: !!(pin || fastBoot),
@@ -653,7 +698,7 @@ function registerIpcHandlers() {
             })
 
             const existingMeta = loadVaultMeta()
-            const authorized = authorizeWorkspaceLaunchCapabilities(workspace, { existingMeta })
+            const authorized = authorizeWorkspaceLaunchCapabilities(workspace, { existingMeta, existingWorkspace })
             const payload = { ...authorized.workspace, _honeyToken: HONEY_TOKEN }
             const encryptedVault = encrypt(payload, masterPassword, driveInfo.driveType === 3)
 
@@ -682,7 +727,7 @@ function registerIpcHandlers() {
                 meta.fastBoot = true
             }
 
-            meta = mergeLaunchCapabilitiesIntoMeta(meta, authorized.capabilities)
+            meta = mergeLaunchCapabilitiesIntoMeta(meta, authorized)
             saveVaultMeta(meta)
 
             // Cache the active master password so that subsequent actions 
@@ -797,6 +842,7 @@ function registerIpcHandlers() {
 
             // Remove honey token before sending to frontend
             if (workspace._honeyToken) delete workspace._honeyToken
+            workspace = await migrateUnlockedWorkspaceForRenderer(workspace, masterPassword)
 
             // Cache the actual master password for future localized state saves / setting updates
             setActiveMasterPassword(masterPassword)
@@ -812,13 +858,14 @@ function registerIpcHandlers() {
         }
     })
 
-    trustedHandle('unlock-with-password', (_, password) => {
+    trustedHandle('unlock-with-password', async (_, password) => {
         try {
             const safePassword = validatePasswordInput(password)
             const encryptedVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
             let workspace = decrypt(encryptedVault, safePassword)
 
             if (workspace._honeyToken) delete workspace._honeyToken
+            workspace = await migrateUnlockedWorkspaceForRenderer(workspace, safePassword)
 
             // Cache the actual master password for future localized state saves / setting updates
             setActiveMasterPassword(safePassword)
@@ -850,6 +897,7 @@ function registerIpcHandlers() {
             let workspace = decrypt(encryptedVault, masterPassword)
 
             if (workspace._honeyToken) delete workspace._honeyToken
+            workspace = await migrateUnlockedWorkspaceForRenderer(workspace, masterPassword)
 
             // Store the master password for session state encryption
             setActiveMasterPassword(masterPassword)
@@ -2452,7 +2500,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
             authorizeWorkspaceLaunchCapabilities,
             honeyToken: HONEY_TOKEN,
             validateInput: validateCaptureSessionInput,
-            validateWorkspace: validateWorkspaceInput
+            validateWorkspace: (workspace) => workspace
         })
     }
 
@@ -2513,13 +2561,23 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
     })
 
     // ─── Launch Workspace Engine ─────────────────────────────────────────
-    trustedHandle('launch-workspace', (event) => {
+    trustedHandle('launch-workspace', async (event) => {
         try {
             const win = BrowserWindow.fromWebContents(event.sender)
-            const safeWorkspace = authorizeWorkspaceLaunchCapabilities(
-                validateWorkspaceInput(loadActiveVaultWorkspace()),
-                { existingMeta: loadVaultMeta() }
-            ).workspace
+            const vaultWorkspace = loadActiveVaultWorkspace()
+            const authorized = authorizeWorkspaceLaunchCapabilities(vaultWorkspace, {
+                existingMeta: loadVaultMeta(),
+                existingWorkspace: vaultWorkspace
+            })
+            await persistMigratedWorkspaceIfChanged(
+                authorized.workspace,
+                activeMasterPasswordBuffer.toString('utf-8'),
+                authorized
+            )
+            const safeWorkspace = rehydrateWorkspaceLaunchCapabilities(authorized.workspace, {
+                capabilityVault: authorized.capabilityVault,
+                manifestResolver: readMigrationManifest
+            })
 
             // Phase 12: Dynamically resolve [USB] portable macros back into absolute paths
             if (safeWorkspace && safeWorkspace.desktopApps) {

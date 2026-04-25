@@ -107,7 +107,7 @@ export async function saveCapturedSessionToVault({
 
     const safeWorkspace = validateWorkspace(workspace)
     const existingMeta = loadMeta()
-    const authorized = authorizeWorkspaceLaunchCapabilities(safeWorkspace, { existingMeta })
+    const authorized = authorizeWorkspaceLaunchCapabilities(safeWorkspace, { existingMeta, existingWorkspace })
     const payload = { ...authorized.workspace, _honeyToken: honeyToken }
     const driveInfo = await getDriveInfo()
     const encryptedVault = encryptVault(payload, masterPassword, driveInfo)
