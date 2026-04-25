@@ -15,7 +15,12 @@ temp-profile/
 .codex-tar-probe/
 diff.txt
 .gemini/
+electron.vite.config.*.mjs
 
 OMNILAUNCH*.md
 QUICKPASS*.md
 QUICKPASS_*.md
+PROMPT_*.md
+
+AGENTS.md
+docs/
