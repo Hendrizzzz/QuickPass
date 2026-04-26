@@ -14,7 +14,7 @@ import {
 } from '../src/main/pinLockout.js'
 
 function createHarness() {
-    const vaultDir = mkdtempSync(join(tmpdir(), 'omnilaunch-pin-lockout-'))
+    const vaultDir = mkdtempSync(join(tmpdir(), 'wipesnap-pin-lockout-'))
     return {
         statePath: join(vaultDir, 'vault.state.json'),
         cleanup: () => {

@@ -247,7 +247,7 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
             return
         }
 
-        const cleanupStatus = window.omnilaunch.onLaunchStatus((rawMessage) => {
+        const cleanupStatus = window.wipesnap.onLaunchStatus((rawMessage) => {
             const message = normalizeStatusMessage(rawMessage)
             if (!message) return
 
@@ -282,7 +282,7 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
             }
         })
 
-        const cleanupComplete = window.omnilaunch.onLaunchComplete((result) => {
+        const cleanupComplete = window.wipesnap.onLaunchComplete((result) => {
             if (!result.success) {
                 setPhase('error')
                 setErrorMsg(result.error)
@@ -334,7 +334,7 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
             )
         })
 
-        window.omnilaunch.launchWorkspace(workspace).catch((err) => {
+        window.wipesnap.launchWorkspace(workspace).catch((err) => {
             setPhase('error')
             setErrorMsg(err.message)
         })
@@ -348,7 +348,7 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
     const handleSaveSession = async () => {
         setSavingSession(true)
         setSaveSuccess(false)
-        const result = await window.omnilaunch.saveCurrentSession()
+        const result = await window.wipesnap.saveCurrentSession()
         setSavingSession(false)
         if (result.success) {
             setSaveSuccess(true)
@@ -360,9 +360,9 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
         if (isClosing) return
         setIsClosing(true)
         try {
-            await window.omnilaunch.quitAndRelaunch({ closeApps: true })
+            await window.wipesnap.quitAndRelaunch({ closeApps: true })
         } catch (_) { }
-        window.omnilaunch.close()
+        window.wipesnap.close()
     }
 
     const statusSummary = useMemo(() => {

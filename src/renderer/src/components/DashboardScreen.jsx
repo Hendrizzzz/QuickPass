@@ -37,7 +37,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     // Read the freshest meta from disk on mount to perfectly sync security UI toggles
     useEffect(() => {
         const fetchMeta = async () => {
-            const latestMeta = await window.omnilaunch.loadVaultMeta()
+            const latestMeta = await window.wipesnap.loadVaultMeta()
             if (latestMeta) {
                 setSecurityMeta(latestMeta)
                 setUsePin(latestMeta.hasPIN || false)
@@ -110,8 +110,8 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         dataAdapters: [],
         registryAdapters: [],
         limitations: [
-            'Data is not copied or synced by OmniLaunch.',
-            'Quit is enabled only after OmniLaunch launches and owns the process.'
+            'Data is not copied or synced by Wipesnap.',
+            'Quit is enabled only after Wipesnap launches and owns the process.'
         ],
         certification: { status: 'uncertified', lastCheckedAt: null, checks: [] },
         importedDataSupported: false,
@@ -122,7 +122,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
 
     const createManualHostFolderFields = () => ({
         supportTier: 'launch-only',
-        supportSummary: 'Host folder launch reference. OmniLaunch opens it through the Windows shell and does not own a child process.',
+        supportSummary: 'Host folder launch reference. Wipesnap opens it through the Windows shell and does not own a child process.',
         adapterEvidence: 'none',
         launchSourceType: 'host-folder',
         launchMethod: 'shell-execute',
@@ -139,7 +139,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         registryAdapters: [],
         limitations: [
             'Folders are opened by the Windows shell.',
-            'OmniLaunch cannot prove process ownership for a folder launch.',
+            'Wipesnap cannot prove process ownership for a folder launch.',
             'Quit and cleanup are disabled for this launch source.'
         ],
         certification: { status: 'uncertified', lastCheckedAt: null, checks: [] },
@@ -156,7 +156,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     }
 
     const browseExe = async () => {
-        const selected = await window.omnilaunch.browseExe()
+        const selected = await window.wipesnap.browseExe()
         if (!selected || handleUnsupportedBrowseSelection(selected)) return
 
         const filePath = typeof selected === 'string' ? selected : selected.path
@@ -181,7 +181,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     }
 
     const browseFolder = async () => {
-        const selected = await window.omnilaunch.browseFolder()
+        const selected = await window.wipesnap.browseFolder()
         if (!selected || handleUnsupportedBrowseSelection(selected)) return
 
         const folderPath = typeof selected === 'string' ? selected : selected.path
@@ -205,7 +205,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         setHostInstalledLoading(true)
         setHostInstalledError('')
         try {
-            const result = await window.omnilaunch.scanHostInstalledApps()
+            const result = await window.wipesnap.scanHostInstalledApps()
             if (!result?.success) {
                 throw new Error(result?.error || 'Installed app scan failed')
             }
@@ -296,7 +296,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         setSaving(true)
         setError('')
         const workspacePayload = { webTabs, desktopApps: toCapabilityWorkspace(desktopApps) }
-        const result = await window.omnilaunch.saveWorkspace(workspacePayload)
+        const result = await window.wipesnap.saveWorkspace(workspacePayload)
         if (result.success) {
             onSave(false, result.workspace || workspacePayload)
         } else {
@@ -312,7 +312,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
 
         setSaving(true)
         setError('')
-        const result = await window.omnilaunch.saveVault({
+        const result = await window.wipesnap.saveVault({
             masterPassword,
             currentPassword: currentMasterPassword,
             pin: null, // Wipe PIN securely when password changes
@@ -352,7 +352,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
 
         setSaving(true)
         setError('')
-        const result = await window.omnilaunch.updatePin(pin, freshPin)
+        const result = await window.wipesnap.updatePin(pin, freshPin)
 
         if (result.success) {
             setUsePin(true)
@@ -378,7 +378,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         if (freshPin === false) return
         setSaving(true)
         setError('')
-        const result = await window.omnilaunch.updatePin(null, freshPin)
+        const result = await window.wipesnap.updatePin(null, freshPin)
 
         if (result.success) {
             setUsePin(false)
@@ -404,7 +404,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         const freshPin = requireSecurityPinProof()
         if (freshPin === false) return
         setError('')
-        const result = await window.omnilaunch.updateFastBoot(newState, freshPin)
+        const result = await window.wipesnap.updateFastBoot(newState, freshPin)
         if (result.success) {
             setFastBoot(newState)
             setSecurityPinProof('')
@@ -416,7 +416,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const handleToggleClearCache = async () => {
         const newState = !clearCacheOnExit
         setError('')
-        const result = await window.omnilaunch.updateClearCache(newState)
+        const result = await window.wipesnap.updateClearCache(newState)
         if (result.success) {
             setClearCacheOnExit(newState)
         } else {
@@ -425,11 +425,11 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     }
 
     const refreshStaleAppDataPayloads = async () => {
-        if (!window.omnilaunch?.scanStaleAppData) return
+        if (!window.wipesnap?.scanStaleAppData) return
         const requestId = ++staleAppDataScanRef.current
         setStaleAppDataLoading(true)
         try {
-            const result = await window.omnilaunch.scanStaleAppData()
+            const result = await window.wipesnap.scanStaleAppData()
             if (requestId === staleAppDataScanRef.current && result?.success) {
                 setStaleAppDataPayloads(result.payloads || [])
             }
@@ -468,7 +468,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         setStaleAppDataStatus('')
         setError('')
         try {
-            const result = await window.omnilaunch.cleanupStaleAppData({
+            const result = await window.wipesnap.cleanupStaleAppData({
                 payloadIds: removablePayloads.map(payload => payload.id)
             })
             if (result?.success) {
@@ -524,12 +524,12 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
 
     // Edit: opens browser with current saved tabs
     const handleEdit = async () => {
-        await startBrowserSession('edit', () => window.omnilaunch.startSessionEdit())
+        await startBrowserSession('edit', () => window.wipesnap.startSessionEdit())
     }
 
     // Re-capture: opens fresh browser from scratch
     const handleRecapture = async () => {
-        await startBrowserSession('recapture', () => window.omnilaunch.startSessionSetup())
+        await startBrowserSession('recapture', () => window.wipesnap.startSessionSetup())
     }
 
     // Save and close after edit/recapture
@@ -537,7 +537,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         setSaving(true)
         setError('')
         setSessionWarning('')
-        const result = await window.omnilaunch.captureSession({})
+        const result = await window.wipesnap.captureSession({})
         if (result.success) {
             const newWebTabs = result.urls.map(url => ({ url, enabled: true }))
             // Jump directly to LaunchingScreen and trigger auto-relaunch
@@ -791,7 +791,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                         <div className="mt-3 p-3 rounded-md border border-[#6f4b1f]/70 bg-[#22170c]">
                             <p className="text-xs text-[#f0c978] font-medium">Unused imported AppData found</p>
                             <p className="text-[11px] text-[#d8b985] mt-1">
-                                QuickPass no longer uses this data because the app profile is unsupported or no saved app references the payload.
+                                Wipesnap no longer uses this data because the app profile is unsupported or no saved app references the payload.
                             </p>
                             <p className="text-[11px] text-muted mt-1 truncate">
                                 {staleAppDataPayloads.map(payload => payload.name).join(', ')}

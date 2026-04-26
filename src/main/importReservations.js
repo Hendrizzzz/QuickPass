@@ -12,14 +12,18 @@ import {
 } from 'fs'
 import { basename, join } from 'path'
 import crypto from 'crypto'
-import { safeAppName } from './appManifest.js'
+import {
+    APP_MANIFEST_SUFFIX,
+    LEGACY_APP_MANIFEST_SUFFIX,
+    safeAppName
+} from './appManifest.js'
 import { createAvailableAppStorageId } from './ipcValidation.js'
 
 export const IMPORT_RESERVATION_SCHEMA_VERSION = 1
 export const DEFAULT_IMPORT_RESERVATION_STALE_MS = 6 * 60 * 60 * 1000
 
 const RESERVATION_EXTENSION = '.lock'
-const MANIFEST_SUFFIX = '.quickpass-app.json'
+const MANIFEST_SUFFIXES = [APP_MANIFEST_SUFFIX, LEGACY_APP_MANIFEST_SUFFIX]
 const ARCHIVE_SUFFIX = '.tar.zst'
 const STORAGE_ID_PATTERN = /^[a-zA-Z0-9_-]{1,160}$/
 
@@ -126,8 +130,9 @@ function cleanStorageIdFromArchiveName(value) {
 
 function cleanStorageIdFromManifestName(value) {
     const name = basename(String(value || ''))
-    if (!name.toLowerCase().endsWith(MANIFEST_SUFFIX)) return null
-    return name.slice(0, -MANIFEST_SUFFIX.length)
+    const suffix = MANIFEST_SUFFIXES.find(candidate => name.toLowerCase().endsWith(candidate))
+    if (!suffix) return null
+    return name.slice(0, -suffix.length)
 }
 
 function displayNameKey(value) {
@@ -264,7 +269,7 @@ export function isAppStorageIdTaken(vaultDir, candidate) {
     return inventory.storageIds.has(candidate) ||
         existsSync(join(vaultDir, 'Apps', candidate)) ||
         existsSync(join(vaultDir, 'Apps', `${candidate}${ARCHIVE_SUFFIX}`)) ||
-        existsSync(join(vaultDir, 'Apps', `${candidate}${MANIFEST_SUFFIX}`)) ||
+        MANIFEST_SUFFIXES.some(suffix => existsSync(join(vaultDir, 'Apps', `${candidate}${suffix}`))) ||
         existsSync(join(vaultDir, 'AppData', candidate))
 }
 

@@ -4,11 +4,11 @@ import crypto from 'crypto'
 import assert from 'assert'
 import { execSync } from 'child_process'
 
-console.log('🧪 Starting QuickPass Milestone 1 Automated QA Audit...\n')
+console.log('🧪 Starting Wipesnap Milestone 1 Automated QA Audit...\n')
 
 // -- Mocking App Environment for Testing --
 const projectRoot = join(process.cwd())
-const roamingAppData = join(process.env.APPDATA || '', 'omnilaunch')
+const roamingAppData = join(process.env.APPDATA || '', 'wipesnap')
 
 // --- Test 4: Zero Data Persistence ---
 console.log('▶ Running Test 4: Zero Data Persistence')
@@ -144,7 +144,7 @@ if (existsSync(vaultPath)) {
         console.error('❌ FAIL: [Edge Case] Malicious Honey Token injection bypassed backend sanitization.')
     }
 } else {
-    console.log('ℹ️  vault.json not found. Run QuickPass and create a vault to test.')
+    console.log('ℹ️  vault.json not found. Run Wipesnap and create a vault to test.')
 }
 console.log('--------------------------------------------------')
 

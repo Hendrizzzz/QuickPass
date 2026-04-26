@@ -2,7 +2,7 @@ const assert = require('assert')
 const fs = require('fs')
 const { join } = require('path')
 
-console.log('Starting QuickPass orchestration audit...\n')
+console.log('Starting Wipesnap orchestration audit...\n')
 
 const engineCode = fs.readFileSync(join(process.cwd(), 'src/main/engine.js'), 'utf-8')
 const indexCode = fs.readFileSync(join(process.cwd(), 'src/main/index.js'), 'utf-8')
@@ -372,7 +372,7 @@ runCheck('Browser app ownership is isolated and cleanup-safe', () => {
     assert(manifestCode.includes('msedge.dll') && manifestCode.includes('normalizeManifestProfiles'), 'Expected Edge/Chromium manifests to be detected and normalized.')
     assert(engineCode.includes('resolveEffectiveLaunchProfile'), 'Expected launch path to compute an effective runtime profile.')
     assert(engineCode.includes('needsRuntimeUserDataDir'), 'Expected runtime profile handling beyond appConfig.portableData.')
-    assert(engineCode.includes('QuickPass-AppRuntime'), 'Expected runtime-only isolated user-data directories for browser apps.')
+    assert(engineCode.includes('Wipesnap-AppRuntime'), 'Expected runtime-only isolated user-data directories for browser apps.')
     assert(engineCode.includes('isOwnedRuntimeProfilePath'), 'Expected strict ownership validation before runtime profile deletion.')
     assert(engineCode.includes('findRuntimeProfileUsersSync'), 'Expected live process checks before runtime profile deletion.')
     assert(engineCode.includes('wipeAllRuntimeAppProfiles'), 'Expected global stale runtime profile cleanup.')
@@ -391,4 +391,4 @@ runCheck('Early-exit diagnostics and top-level window evidence', () => {
     assert(engineCode.includes('windowDetectionSource'), 'Expected readiness diagnostics to record the window detection source.')
 })
 
-console.log('\nQuickPass orchestration audit passed.')
+console.log('\nWipesnap orchestration audit passed.')

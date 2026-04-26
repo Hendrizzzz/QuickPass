@@ -1,6 +1,5 @@
-import { app, BrowserWindow, ipcMain, dialog, session } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, session, protocol, net } from 'electron'
 import { join, basename } from 'path'
-import { pathToFileURL } from 'url'
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, rmSync, renameSync, unlinkSync } from 'fs'
 import { execSync, spawn, exec, execFile } from 'child_process'
 import os from 'os'
@@ -110,10 +109,19 @@ import {
     createImportedAppLookup,
     reserveAppStorageId
 } from './importReservations.js'
+import {
+    PACKAGED_RENDERER_URL,
+    installGlobalWebContentsGuards,
+    isAllowedRendererNavigationUrl,
+    registerPackagedRendererProtocolHandler,
+    registerPackagedRendererProtocolScheme
+} from './electronShellHardening.js'
+
+registerPackagedRendererProtocolScheme(protocol)
 
 // Phase 11: The Honey Token
 const HONEY_TOKEN = {
-    aws_tracking_key: "AKIA-FAKE-DO-NOT-USE-QUICKPASS-HONEY-TOKEN"
+    aws_tracking_key: "AKIA-FAKE-DO-NOT-USE-WIPESNAP-HONEY-TOKEN"
 }
 
 // ─── Vault Path Resolution ─────────────────────────────────────────────────────
@@ -333,10 +341,10 @@ const vaultDurability = createVaultDurabilityController({
 function recoverVaultDurabilityOnStartup() {
     vaultDurabilityStatus = vaultDurability.recover()
     if (!vaultDurabilityStatus.ok) {
-        console.error('[QuickPass] Vault durability check failed:', vaultDurabilityStatus.error)
+        console.error('[Wipesnap] Vault durability check failed:', vaultDurabilityStatus.error)
         try { diagError('vault-durability', vaultDurabilityStatus.error) } catch (_) { }
     } else if (vaultDurabilityStatus.recovered) {
-        console.warn('[QuickPass] Recovered incomplete vault transaction:', vaultDurabilityStatus.operation)
+        console.warn('[Wipesnap] Recovered incomplete vault transaction:', vaultDurabilityStatus.operation)
     }
     return vaultDurabilityStatus
 }
@@ -565,7 +573,7 @@ function createProcessControlHandlerDeps() {
         },
         validateFactoryResetInput,
         onCloseBrowserError: (err) => {
-            console.error('[QuickPass] Profile sync during quit failed:', err)
+            console.error('[Wipesnap] Profile sync during quit failed:', err)
             diagError('before-quit', err.message)
         },
         wipeRuntimeAppProfiles: wipeAllRuntimeAppProfiles,
@@ -575,7 +583,7 @@ function createProcessControlHandlerDeps() {
                 writeFileSync(join(vd, 'run-diagnostics.json'), JSON.stringify(runDiagnostics, null, 2), 'utf-8')
             }
         },
-        removeTempTraces: () => rmSync(tmpPath, { recursive: true, force: true })
+        removeTempTraces: removeElectronTempTraces
     }
 }
 
@@ -968,7 +976,7 @@ function registerIpcHandlers() {
         /vulkan/i, /directx/i, /microsoft onedrive/i, /microsoft update/i,
         /microsoft edge update/i, /google update/i, /windows driver/i,
         /redistributable/i, /bonjour/i, /apple (mobile|application) support/i,
-        /quickpass/i, /omnilaunch/i
+        /wipesnap/i, /quickpass/i, /omnilaunch/i
     ]
 
     const REGISTRY_UNINSTALL_ROOTS = [
@@ -1734,7 +1742,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
 
                 try {
                     rmSync(payload.path, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 })
-                    console.log(`[QuickPass] Removed stale AppData payload: ${payload.path} (${payload.sizeBytes || 0} bytes)`)
+                    console.log(`[Wipesnap] Removed stale AppData payload: ${payload.path} (${payload.sizeBytes || 0} bytes)`)
                     removed.push(payload)
                 } catch (err) {
                     failed.push({ ...payload, error: err.message })
@@ -1837,7 +1845,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
             /vulkan/i, /directx/i, /microsoft onedrive/i, /microsoft update/i,
             /microsoft edge update/i, /google update/i, /windows driver/i,
             /redistributable/i, /bonjour/i, /apple (mobile|application) support/i,
-            /quickpass/i, /omnilaunch/i
+            /wipesnap/i, /quickpass/i, /omnilaunch/i
         ]
 
         function isBlacklisted(name) {
@@ -2109,7 +2117,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
             const archiveName = `${storageId}.tar.zst`
             const safeName = storageId
             const dataDest = join(vaultDir, 'AppData', safeName)
-            tempArchive = join(os.tmpdir(), `omnilaunch-import-${safeName}-${Date.now()}.tar.zst`)
+            tempArchive = join(os.tmpdir(), `wipesnap-import-${safeName}-${Date.now()}.tar.zst`)
 
             if (!sourcePath || !existsSync(sourcePath)) {
                 throw new Error(`Source app folder not found: ${sourcePath}`)
@@ -2154,7 +2162,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                 throw new Error(`${name} was selected with AppData, but the detected AppData path is no longer available.`)
             }
             if (requestedImportData && !importedDataCapability.importedDataSupported) {
-                throw new Error(`${name} was selected with AppData, but QuickPass cannot safely import AppData for this app profile. ${importedDataCapability.importedDataSupportReason}`)
+                throw new Error(`${name} was selected with AppData, but Wipesnap cannot safely import AppData for this app profile. ${importedDataCapability.importedDataSupportReason}`)
             }
             const effectiveImportData = requestedImportData && importedDataCapability.importedDataSupported
             const requiredFiles = detectRequiredFilesFromRoot(sourcePath)
@@ -2587,25 +2595,15 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
 // ─── Import Guard State ────────────────────────────────────────────────────────
 let importInProgress = false
 let electronSecurityHandlersInstalled = false
-
-function normalizeRendererTrustUrl(value) {
-    try {
-        const parsed = new URL(String(value || ''))
-        parsed.hash = ''
-        return parsed.toString()
-    } catch (_) {
-        return ''
-    }
-}
+let trustedShellNavigationUrls = []
 
 function installElectronSecurityHandlers() {
     if (electronSecurityHandlersInstalled) return
     electronSecurityHandlersInstalled = true
-    session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false))
-    app.on('web-contents-created', (_event, contents) => {
-        if (typeof contents.setWindowOpenHandler === 'function') {
-            contents.setWindowOpenHandler(() => ({ action: 'deny' }))
-        }
+    installGlobalWebContentsGuards({
+        electronApp: app,
+        defaultSession: session.defaultSession,
+        getAllowedRendererUrls: () => trustedShellNavigationUrls
     })
 }
 
@@ -2629,8 +2627,8 @@ function createWindow() {
     })
 
     const devRendererUrl = !app.isPackaged ? process.env['ELECTRON_RENDERER_URL'] : ''
-    const rendererIndexPath = join(__dirname, '../renderer/index.html')
-    const expectedRendererUrl = devRendererUrl || pathToFileURL(rendererIndexPath).toString()
+    const expectedRendererUrl = devRendererUrl || PACKAGED_RENDERER_URL
+    trustedShellNavigationUrls = [expectedRendererUrl]
     configureTrustedIpcRenderer({
         urls: [expectedRendererUrl],
         webContentsId: mainWindow.webContents.id
@@ -2638,7 +2636,7 @@ function createWindow() {
 
     mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
     mainWindow.webContents.on('will-navigate', (event, navigationUrl) => {
-        if (normalizeRendererTrustUrl(navigationUrl) !== normalizeRendererTrustUrl(expectedRendererUrl)) {
+        if (!isAllowedRendererNavigationUrl(navigationUrl, [expectedRendererUrl])) {
             event.preventDefault()
         }
     })
@@ -2671,7 +2669,7 @@ function createWindow() {
     if (devRendererUrl) {
         mainWindow.loadURL(devRendererUrl)
     } else {
-        mainWindow.loadFile(rendererIndexPath)
+        mainWindow.loadURL(PACKAGED_RENDERER_URL)
     }
 
 
@@ -2695,7 +2693,7 @@ function setupKillCord() {
             try { wipeAllLocalAppData() } catch (_) { }
             try { wipeAllRuntimeAppProfiles({ staleOnly: true }) } catch (_) { }
             try { wipeLocalAppCache() } catch (_) { }
-            try { require('fs').rmSync(tmpPath, { recursive: true, force: true }) } catch (_) { }
+            removeElectronTempTraces()
             process.exit(1)
         }
     }
@@ -2710,7 +2708,13 @@ function setupKillCord() {
 }
 
 // Phase 14: Redirect Electron temp to LOCAL PC (not USB) to avoid USB I/O
-const tmpPath = join(require('os').tmpdir(), 'QuickPass-electron')
+const tmpPath = join(require('os').tmpdir(), 'Wipesnap-electron')
+const legacyTmpPath = join(require('os').tmpdir(), 'QuickPass-electron')
+function removeElectronTempTraces() {
+    for (const targetPath of [tmpPath, legacyTmpPath]) {
+        try { require('fs').rmSync(targetPath, { recursive: true, force: true }) } catch (_) { }
+    }
+}
 if (!existsSync(tmpPath)) {
     try { require('fs').mkdirSync(tmpPath, { recursive: true }) } catch (_) { }
 }
@@ -2726,6 +2730,11 @@ app.whenReady().then(() => {
     runDiagnostics.startTime = Date.now()
 
     recoverVaultDurabilityOnStartup()
+    registerPackagedRendererProtocolHandler({
+        protocolApi: protocol,
+        netApi: net,
+        rendererRoot: join(__dirname, '../renderer')
+    })
     installElectronSecurityHandlers()
     registerIpcHandlers()
     createWindow()
@@ -2755,10 +2764,9 @@ app.on('before-quit', async (e) => {
 
 // Belt-and-suspenders: wipe ALL traces on ANY exit path (including kill cord crash)
 process.on('exit', () => {
-    const fs = require('fs')
-    // Wipe Electron temp
-    try { fs.rmSync(tmpPath, { recursive: true, force: true }) } catch (_) { }
-    // Wipe ALL QuickPass Chrome profiles (wildcard — no dependency on vault dir)
+    // Wipe Electron temp, including the legacy QuickPass temp root.
+    removeElectronTempTraces()
+    // Wipe ALL Wipesnap Chrome profiles (wildcard — no dependency on vault dir)
     wipeAllLocalProfiles()
     // ALWAYS wipe auth tokens/profiles — these must never persist on host PCs
     wipeAllLocalAppData()

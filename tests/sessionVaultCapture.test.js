@@ -94,7 +94,7 @@ test('session capture rejects existing vault decrypt failure before capture or w
 })
 
 test('session capture leaves existing vault file unchanged on decrypt failure', async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), 'omnilaunch-session-capture-'))
+    const tempDir = mkdtempSync(join(tmpdir(), 'wipesnap-session-capture-'))
     const vaultPath = join(tempDir, 'vault.json')
     const originalVault = JSON.stringify({ encrypted: 'original' })
     writeFileSync(vaultPath, originalVault, 'utf-8')

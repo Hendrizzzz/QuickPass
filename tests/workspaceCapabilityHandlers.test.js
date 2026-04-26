@@ -14,13 +14,14 @@ import {
     saveWorkspaceHandlerCore
 } from '../src/main/workspaceCapabilityHandlers.js'
 import { WORKSPACE_CAPABILITY_VAULT_KEY } from '../src/main/workspaceCapabilityMigration.js'
+import { APP_MANIFEST_SUFFIX, LEGACY_APP_MANIFEST_SUFFIX } from '../src/main/appManifest.js'
 
 function clone(value) {
     return JSON.parse(JSON.stringify(value))
 }
 
 function createHarness() {
-    const vaultDir = mkdtempSync(join(tmpdir(), 'omnilaunch-phase2d-'))
+    const vaultDir = mkdtempSync(join(tmpdir(), 'wipesnap-phase2d-'))
     const vaultPath = join(vaultDir, 'vault.json')
     const metaPath = join(vaultDir, 'vault.meta.json')
     let activeMasterPassword = 'active-password'
@@ -81,13 +82,15 @@ function createHarness() {
         writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8')
     }
     const manifestResolver = (manifestId) => {
-        const manifestPath = join(vaultDir, 'Apps', `${manifestId}.quickpass-app.json`)
-        if (!existsSync(manifestPath)) return null
+        const manifestPath = [APP_MANIFEST_SUFFIX, LEGACY_APP_MANIFEST_SUFFIX]
+            .map(suffix => join(vaultDir, 'Apps', `${manifestId}${suffix}`))
+            .find(candidate => existsSync(candidate))
+        if (!manifestPath) return null
         return JSON.parse(readFileSync(manifestPath, 'utf-8'))
     }
     const writeManifest = (manifest) => {
         mkdirSync(join(vaultDir, 'Apps', manifest.safeName), { recursive: true })
-        writeFileSync(join(vaultDir, 'Apps', `${manifest.safeName}.quickpass-app.json`), JSON.stringify(manifest, null, 2), 'utf-8')
+        writeFileSync(join(vaultDir, 'Apps', `${manifest.safeName}${APP_MANIFEST_SUFFIX}`), JSON.stringify(manifest, null, 2), 'utf-8')
     }
     const createSaveDeps = (overrides = {}) => ({
         requireActiveSession: () => {

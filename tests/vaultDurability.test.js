@@ -30,7 +30,7 @@ function readJson(filePath) {
 }
 
 function createHarness() {
-    const vaultDir = mkdtempSync(join(tmpdir(), 'omnilaunch-vault-durability-'))
+    const vaultDir = mkdtempSync(join(tmpdir(), 'wipesnap-vault-durability-'))
     return {
         vaultDir,
         paths: {

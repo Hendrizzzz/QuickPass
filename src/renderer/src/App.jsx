@@ -16,20 +16,20 @@ export default function App() {
     useEffect(() => {
         async function boot() {
             try {
-                const info = await window.omnilaunch.getDriveInfo()
+                const info = await window.wipesnap.getDriveInfo()
                 setDriveInfo(info)
 
-                const exists = await window.omnilaunch.vaultExists()
+                const exists = await window.wipesnap.vaultExists()
                 if (!exists) {
                     setScreen('setup')
                     return
                 }
 
-                const meta = await window.omnilaunch.loadVaultMeta()
+                const meta = await window.wipesnap.loadVaultMeta()
                 setVaultMeta(meta)
 
                 if (meta?.fastBoot) {
-                    const result = await window.omnilaunch.tryFastBoot()
+                    const result = await window.wipesnap.tryFastBoot()
                     if (result.success) {
                         setWorkspace(result.workspace)
                         setScreen('launching')
@@ -49,9 +49,9 @@ export default function App() {
     const handleSetupComplete = () => {
         setScreen('loading')
         setTimeout(async () => {
-            const exists = await window.omnilaunch.vaultExists()
+            const exists = await window.wipesnap.vaultExists()
             if (exists) {
-                const meta = await window.omnilaunch.loadVaultMeta()
+                const meta = await window.wipesnap.loadVaultMeta()
                 setVaultMeta(meta)
                 setScreen('unlock')
             }
@@ -92,7 +92,7 @@ export default function App() {
             // Came from unlock — need to re-enter password flow
             setScreen('loading')
             setTimeout(async () => {
-                const meta = await window.omnilaunch.loadVaultMeta()
+                const meta = await window.wipesnap.loadVaultMeta()
                 setVaultMeta(meta)
                 setScreen('unlock')
             }, 100)
@@ -116,7 +116,7 @@ export default function App() {
             {/* Titlebar */}
             <div className="titlebar">
                 <button
-                    onClick={() => window.omnilaunch.minimize()}
+                    onClick={() => window.wipesnap.minimize()}
                     className="btn-icon"
                     style={{ width: 28, height: 28 }}
                     title="Minimize"
@@ -126,7 +126,7 @@ export default function App() {
                     </svg>
                 </button>
                 <button
-                    onClick={() => window.omnilaunch.close()}
+                    onClick={() => window.wipesnap.close()}
                     className="btn-icon"
                     style={{ width: 28, height: 28 }}
                     title="Close"

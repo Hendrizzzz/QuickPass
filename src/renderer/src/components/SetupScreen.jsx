@@ -53,7 +53,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
     }
 
     const browseExe = async () => {
-        const selected = await window.omnilaunch.browseExe()
+        const selected = await window.wipesnap.browseExe()
         if (!selected || handleUnsupportedBrowseSelection(selected)) return
 
         const filePath = typeof selected === 'string' ? selected : selected.path
@@ -67,7 +67,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
     }
 
     const browseFolder = async () => {
-        const selected = await window.omnilaunch.browseFolder()
+        const selected = await window.wipesnap.browseFolder()
         if (!selected || handleUnsupportedBrowseSelection(selected)) return
 
         const folderPath = typeof selected === 'string' ? selected : selected.path
@@ -120,7 +120,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
 
         // Save vault with desktop apps only; web tabs come from session capture.
         const workspace = { webTabs: [], desktopApps: toCapabilityWorkspace(desktopApps) }
-        const result = await window.omnilaunch.saveVault({
+        const result = await window.wipesnap.saveVault({
             masterPassword: supportsConvenienceUnlock ? hiddenMasterPassword : masterPassword,
             pin: supportsConvenienceUnlock && pin ? pin : null,
             fastBoot: supportsConvenienceUnlock ? fastBoot : false,
@@ -144,7 +144,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
     // Listen for browser disconnect (user accidentally closed Chrome)
     // Uses a dedicated polling-based IPC channel and fires within 1 second.
     useEffect(() => {
-        const cleanup = window.omnilaunch.onBrowserDisconnect(() => {
+        const cleanup = window.wipesnap.onBrowserDisconnect(() => {
             setSessionState((prev) => (prev === 'complete' ? prev : 'disconnected'))
             setSessionWarning('')
             setError('Chrome was closed. Click "Reopen Browser" to try again.')
@@ -159,7 +159,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
         setSessionWarning('')
 
         try {
-            const result = await window.omnilaunch.startSessionSetup()
+            const result = await window.wipesnap.startSessionSetup()
             if (!result?.success) {
                 setSessionState('idle')
                 setError(result?.error || 'Failed to open browser')
@@ -178,7 +178,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
                 )
             }
 
-            const sessionCheck = await window.omnilaunch.hasActiveBrowserSession()
+            const sessionCheck = await window.wipesnap.hasActiveBrowserSession()
             if (sessionCheck.success && sessionCheck.active) {
                 setSessionState('open')
                 return
@@ -199,7 +199,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
     const handleSaveAndFinish = async () => {
         setError('')
         setSessionWarning('')
-        const sessionCheck = await window.omnilaunch.hasActiveBrowserSession()
+        const sessionCheck = await window.wipesnap.hasActiveBrowserSession()
 
         if (!sessionCheck.success || !sessionCheck.active) {
             setSessionState('disconnected')
@@ -209,7 +209,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
 
         setSessionState('saving')
 
-        const result = await window.omnilaunch.captureSession({})
+        const result = await window.wipesnap.captureSession({})
         if (result.success) {
             setCapturedCount(result.tabCount)
             setCapturedSkippedCount(result.skippedCount || 0)

@@ -20,7 +20,6 @@ function normalizeUrlForTrust(value) {
         if (parsed.protocol === 'file:') {
             parsed.pathname = normalizeFilePathname(parsed.pathname)
         }
-        parsed.hash = ''
         return parsed.toString()
     } catch (_) {
         return ''

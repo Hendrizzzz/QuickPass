@@ -24,7 +24,7 @@ export default function UnlockScreen({ driveInfo, vaultMeta, onUnlock }) {
         if (pin.length !== 4) return
         setLoading(true)
         setError('')
-        const result = await window.omnilaunch.unlockWithPin(pin)
+        const result = await window.wipesnap.unlockWithPin(pin)
         if (result.success) {
             onUnlock(result.workspace)
         } else if (result.error === 'HARDWARE_MISMATCH') {
@@ -51,7 +51,7 @@ export default function UnlockScreen({ driveInfo, vaultMeta, onUnlock }) {
         if (!password.trim()) return
         setLoading(true)
         setError('')
-        const result = await window.omnilaunch.unlockWithPassword(password)
+        const result = await window.wipesnap.unlockWithPassword(password)
         if (result.success) {
             onUnlock(result.workspace)
         } else {
@@ -74,13 +74,13 @@ export default function UnlockScreen({ driveInfo, vaultMeta, onUnlock }) {
     const handleFactoryReset = async () => {
         setLoading(true)
         setResetConfirming(false)
-        const tokenResult = await window.omnilaunch.beginFactoryReset()
+        const tokenResult = await window.wipesnap.beginFactoryReset()
         if (!tokenResult?.success) {
             setError(tokenResult?.error || 'Factory reset could not start')
             setLoading(false)
             return
         }
-        const resetResult = await window.omnilaunch.factoryReset({ token: tokenResult.token })
+        const resetResult = await window.wipesnap.factoryReset({ token: tokenResult.token })
         if (resetResult?.success) {
             window.location.reload()
         } else {
@@ -99,7 +99,7 @@ export default function UnlockScreen({ driveInfo, vaultMeta, onUnlock }) {
                         <path d="M7 11V7a5 5 0 0110 0v4" />
                     </svg>
                 </div>
-                <h1 className="text-lg font-semibold text-white">OmniLaunch</h1>
+                <h1 className="text-lg font-semibold text-white">Wipesnap</h1>
                 <p className="text-secondary text-xs mt-1">
                     {isRemovable ? 'USB Drive' : 'Local Drive'}
                 </p>

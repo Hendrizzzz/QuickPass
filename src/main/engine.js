@@ -1,5 +1,5 @@
 /**
- * OmniLaunch Automation Engine - Phase 16.2: Local-First Chrome + AppData
+ * Wipesnap Automation Engine - Phase 16.2: Local-First Chrome + AppData
  *
  * Architecture:
  * Chrome profile AND desktop app data are stored on USB but RUN from
@@ -209,7 +209,7 @@ const RUNTIME_DATA_SUPPORT_LEVELS = Object.freeze({
 // - runtime-only isolation support
 // - imported AppData redirection support
 // - adapter identity / argument style
-// This lets QuickPass keep best-effort launch-only adapters without falsely
+// This lets Wipesnap keep best-effort launch-only adapters without falsely
 // advertising imported-data portability.
 function resolveRuntimeDataPlan(appConfig, launchProfile, dataProfile) {
     const normalizedLaunchProfile = String(launchProfile || '').toLowerCase()
@@ -267,9 +267,9 @@ function resolveRuntimeDataPlan(appConfig, launchProfile, dataProfile) {
             runtimeProfileSupported: true,
             importedDataSupported: false,
             argPrefix: '--user-data-dir=',
-            runtimeSupportReason: 'Generic Electron runtime isolation is best-effort until QuickPass has app-specific validation.',
+            runtimeSupportReason: 'Generic Electron runtime isolation is best-effort until Wipesnap has app-specific validation.',
             runtimeSupportWarning: 'Using best-effort Electron runtime isolation. Verify this app stays off host AppData on this PC before relying on zero-footprint guarantees.',
-            unsupportedImportedDataReason: 'QuickPass does not yet have a verified imported AppData adapter for generic Electron apps.'
+            unsupportedImportedDataReason: 'Wipesnap does not yet have a verified imported AppData adapter for generic Electron apps.'
         }
     }
 
@@ -438,7 +438,10 @@ function scheduleStaleAppCacheCleanup(minAgeMs = 30000) {
         try {
             const tempRoot = pathResolve(os.tmpdir())
             const appCacheDirs = readdirSync(tempRoot, { withFileTypes: true })
-                .filter(entry => entry.isDirectory() && entry.name.startsWith('QuickPass-App-'))
+                .filter(entry => entry.isDirectory() && (
+                    entry.name.startsWith(LOCAL_APP_CACHE_PREFIX) ||
+                    entry.name.startsWith(LEGACY_LOCAL_APP_CACHE_PREFIX)
+                ))
 
             const cutoff = Date.now() - minAgeMs
             for (const appCacheDir of appCacheDirs) {
@@ -900,7 +903,16 @@ const DEFAULT_READINESS_TIMEOUT_MS = 15000
 const READINESS_POLL_INTERVAL_MS = 750
 const READINESS_PROCESS_TREE_DEPTH = 3
 const READINESS_EMPTY_TREE_GRACE_MS = 3000
-const RUNTIME_APP_PROFILE_PREFIX = 'QuickPass-AppRuntime-'
+const RUNTIME_APP_PROFILE_PREFIX = 'Wipesnap-AppRuntime-'
+const LEGACY_RUNTIME_APP_PROFILE_PREFIX = 'QuickPass-AppRuntime-'
+const LOCAL_BROWSER_PROFILE_PREFIX = 'Wipesnap-Profile-'
+const LEGACY_LOCAL_BROWSER_PROFILE_PREFIX = 'QuickPass-Profile-'
+const LOCAL_APPDATA_PREFIX = 'Wipesnap-AppData-'
+const LEGACY_LOCAL_APPDATA_PREFIX = 'QuickPass-AppData-'
+const LOCAL_APP_CACHE_PREFIX = 'Wipesnap-App-'
+const LEGACY_LOCAL_APP_CACHE_PREFIX = 'QuickPass-App-'
+const MACHINE_MARKER_FILE = '.wipesnap-machine-id'
+const LEGACY_MACHINE_MARKER_FILE = '.quickpass-machine-id'
 const EARLY_EXIT_OUTPUT_LIMIT = 8192
 const LAUNCHER_UPDATER_WINDOW_PATTERNS = [
     { pattern: /\b(updater?|updating|update available)\b/i, classification: 'updater-window' },
@@ -970,7 +982,7 @@ function resolveLaunchReadinessPolicy(appConfig = {}, diagRef = {}) {
             closeManaged: false,
             allowLauncherWindowAsReady: false,
             partialReadyAllowed: true,
-            readinessDescription: 'Windows shell activation was sent; OmniLaunch cannot prove process ownership for this source.'
+            readinessDescription: 'Windows shell activation was sent; Wipesnap cannot prove process ownership for this source.'
         }
     }
 
@@ -984,7 +996,7 @@ function resolveLaunchReadinessPolicy(appConfig = {}, diagRef = {}) {
         partialReadyAllowed: false,
         readinessDescription: closeManaged
             ? 'Readiness requires owned process/window evidence.'
-            : 'Readiness can observe launch state, but OmniLaunch will not close this app automatically.'
+            : 'Readiness can observe launch state, but Wipesnap will not close this app automatically.'
     }
 }
 
@@ -1123,7 +1135,7 @@ function ensureExtractorPreflight() {
         return result
     }
 
-    const probeDir = join(os.tmpdir(), `QuickPass-TarProbe-${Date.now()}-${Math.random().toString(16).slice(2)}`)
+    const probeDir = join(os.tmpdir(), `Wipesnap-TarProbe-${Date.now()}-${Math.random().toString(16).slice(2)}`)
     try {
         const probeFile = join(probeDir, 'probe.txt')
         const probeArchive = join(probeDir, 'probe.tar.zst')
@@ -1419,7 +1431,7 @@ function enqueueSync(usbPath, localPath) {
             // ALWAYS wipe local copy  security trumps data integrity
             try { rmSync(localPath, { recursive: true, force: true }) } catch (_) { }
         }
-    }).catch(err => console.error('[QuickPass] Sync Queue error:', err))
+    }).catch(err => console.error('[Wipesnap] Sync Queue error:', err))
 
     return globalSyncQueue
 }
@@ -1443,7 +1455,8 @@ function isOwnedRuntimeProfilePath(profilePath) {
         const resolved = pathResolve(profilePath)
         const tempDir = pathResolve(os.tmpdir())
         const baseName = pathParse(resolved).base
-        return baseName.startsWith(RUNTIME_APP_PROFILE_PREFIX) &&
+        return (baseName.startsWith(RUNTIME_APP_PROFILE_PREFIX) ||
+            baseName.startsWith(LEGACY_RUNTIME_APP_PROFILE_PREFIX)) &&
             pathParse(resolved).dir === tempDir &&
             isPathWithinDirectory(tempDir, resolved)
     } catch (_) {
@@ -1453,7 +1466,7 @@ function isOwnedRuntimeProfilePath(profilePath) {
 
 function findRuntimeProfileUsersSync(profilePath) {
     if (!isOwnedRuntimeProfilePath(profilePath)) {
-        return { ok: false, pids: [], error: 'runtime profile path is not QuickPass-owned' }
+        return { ok: false, pids: [], error: 'runtime profile path is not Wipesnap-owned' }
     }
 
     const escaped = escapeWqlLike(profilePath)
@@ -1558,7 +1571,8 @@ export function wipeAllRuntimeAppProfiles({ staleOnly = true } = {}) {
     try {
         const tempDir = os.tmpdir()
         for (const dir of readdirSync(tempDir)) {
-            if (!dir.startsWith(RUNTIME_APP_PROFILE_PREFIX)) continue
+            if (!dir.startsWith(RUNTIME_APP_PROFILE_PREFIX) &&
+                !dir.startsWith(LEGACY_RUNTIME_APP_PROFILE_PREFIX)) continue
 
             const profilePath = join(tempDir, dir)
             if (!isOwnedRuntimeProfilePath(profilePath)) {
@@ -1655,7 +1669,7 @@ function patchProfileLocale(profileDir) {
  */
 function getLocalProfileDir(vaultDir) {
     const hash = crypto.createHash('md5').update(vaultDir).digest('hex').slice(0, 8)
-    return join(os.tmpdir(), `QuickPass-Profile-${hash}`)
+    return join(os.tmpdir(), `${LOCAL_BROWSER_PROFILE_PREFIX}${hash}`)
 }
 
 function warnOnEmbeddedHostPaths(localPath, appConfig, onStatus) {
@@ -1718,14 +1732,16 @@ export function wipeLocalTraces(vaultDir) {
 }
 
 /**
- * Wipes ALL QuickPass Chrome profile directories from temp.
+ * Wipes all Wipesnap browser profile directories from temp.
  * Used as belt-and-suspenders fallback  no dependency on knowing vaultDir.
+ * Legacy QuickPass temp names are also removed so old runs do not leave host residue.
  */
 export function wipeAllLocalProfiles() {
     try {
         const tempDir = os.tmpdir()
         for (const dir of readdirSync(tempDir)) {
-            if (dir.startsWith('QuickPass-Profile-')) {
+            if (dir.startsWith(LOCAL_BROWSER_PROFILE_PREFIX) ||
+                dir.startsWith(LEGACY_LOCAL_BROWSER_PROFILE_PREFIX)) {
                 try { rmSync(join(tempDir, dir), { recursive: true, force: true }) } catch (_) { }
             }
         }
@@ -1733,15 +1749,17 @@ export function wipeAllLocalProfiles() {
 }
 
 /**
- * Wipes ALL QuickPass desktop app AUTH DATA directories from temp.
+ * Wipes all Wipesnap desktop app auth-data directories from temp.
  * ALWAYS runs on exit  auth tokens must never persist on host PCs.
  * Belt-and-suspenders: called on process exit and kill cord.
+ * Legacy QuickPass temp names are also removed so old runs do not leave host residue.
  */
 export function wipeAllLocalAppData() {
     try {
         const tempDir = os.tmpdir()
         for (const dir of readdirSync(tempDir)) {
-            if (dir.startsWith('QuickPass-AppData-')) {
+            if (dir.startsWith(LOCAL_APPDATA_PREFIX) ||
+                dir.startsWith(LEGACY_LOCAL_APPDATA_PREFIX)) {
                 try { rmSync(join(tempDir, dir), { recursive: true, force: true }) } catch (_) { }
             }
         }
@@ -1749,16 +1767,18 @@ export function wipeAllLocalAppData() {
 }
 
 /**
- * Wipes extracted app BINARIES (QuickPass-App-*) from temp.
+ * Wipes extracted app binaries from temp.
  * Conditionally called based on clearCacheOnExit toggle.
  * When OFF: apps persist for instant <10s launches on home PC.
  * When ON:  zero-footprint mode for public/school PCs.
+ * Legacy QuickPass temp names are also removed when cache clearing is enabled.
  */
 export function wipeLocalAppCache() {
     try {
         const tempDir = os.tmpdir()
         for (const dir of readdirSync(tempDir)) {
-            if (dir.startsWith('QuickPass-App-')) {
+            if (dir.startsWith(LOCAL_APP_CACHE_PREFIX) ||
+                dir.startsWith(LEGACY_LOCAL_APP_CACHE_PREFIX)) {
                 try { rmSync(join(tempDir, dir), { recursive: true, force: true }) } catch (_) { }
             }
         }
@@ -1860,11 +1880,15 @@ function handleProfileMigration(profileDir) {
 
     const rawId = `${os.hostname()}:${os.userInfo().username}`
     const machineHash = crypto.createHash('sha256').update(rawId).digest('hex').slice(0, 16)
-    const markerPath = join(profileDir, '.quickpass-machine-id')
+    const markerPath = join(profileDir, MACHINE_MARKER_FILE)
+    const legacyMarkerPath = join(profileDir, LEGACY_MACHINE_MARKER_FILE)
     const localStatePath = join(profileDir, 'Local State')
 
     let lastHash = null
     try { lastHash = fs.readFileSync(markerPath, 'utf8').trim() } catch (_) { }
+    if (!lastHash) {
+        try { lastHash = fs.readFileSync(legacyMarkerPath, 'utf8').trim() } catch (_) { }
+    }
 
     // Same machine or first run  no migration needed
     if (!lastHash || lastHash === machineHash) {
@@ -1873,7 +1897,7 @@ function handleProfileMigration(profileDir) {
     }
 
     // --- Migration Detected ---
-    console.log(`[QuickPass] Machine migration detected (${lastHash} -> ${machineHash})`)
+    console.log(`[Wipesnap] Machine migration detected (${lastHash} -> ${machineHash})`)
     diagPhaseStart('profile-migration-scrub')
     diagError('profile-migration', `Profile moved from machine ${lastHash} to ${machineHash}`)
 
@@ -1893,7 +1917,7 @@ function handleProfileMigration(profileDir) {
             }
             if (modified) {
                 fs.writeFileSync(localStatePath, JSON.stringify(state), 'utf8')
-                console.log('[QuickPass] Scrubbed DPAPI key from Local State')
+                console.log('[Wipesnap] Scrubbed DPAPI key from Local State')
             }
         }
     } catch (err) {
@@ -1910,7 +1934,7 @@ function handleProfileMigration(profileDir) {
         if (existsSync(fp)) {
             try {
                 require('fs').unlinkSync(fp)
-                console.log(`[QuickPass] Deleted DPAPI-encrypted: ${fp}`)
+                console.log(`[Wipesnap] Deleted DPAPI-encrypted: ${fp}`)
             } catch (_) { }
         }
     }
@@ -1947,7 +1971,7 @@ async function launchChrome(vaultDir, onStatus = () => { }) {
         try {
             await robocopyAsync(usbProfile, localProfile)
         } catch (err) {
-            console.error('[QuickPass] Failed to sync profile from USB:', err)
+            console.error('[Wipesnap] Failed to sync profile from USB:', err)
             diagError('browser-copy-in', err.message)
         }
     }
@@ -1998,7 +2022,7 @@ async function launchChrome(vaultDir, onStatus = () => { }) {
         context = await chromium.launchPersistentContext(localProfile, launchOptions)
     } catch (launchErr) {
         diagError('browser-launch', `Primary launch failed: ${launchErr.message}`)
-        console.error('[QuickPass] Chrome launch failed, retrying with clean profile:', launchErr.message)
+        console.error('[Wipesnap] Chrome launch failed, retrying with clean profile:', launchErr.message)
 
         // Nuclear fallback: nuke the corrupted local profile and start fresh
         try { rmSync(localProfile, { recursive: true, force: true }) } catch (_) { }
@@ -2008,7 +2032,7 @@ async function launchChrome(vaultDir, onStatus = () => { }) {
         const machineHash = crypto.createHash('sha256')
             .update(`${os.hostname()}:${os.userInfo().username}`)
             .digest('hex').slice(0, 16)
-        try { require('fs').writeFileSync(join(localProfile, '.quickpass-machine-id'), machineHash) } catch (_) { }
+            try { require('fs').writeFileSync(join(localProfile, MACHINE_MARKER_FILE), machineHash) } catch (_) { }
 
         context = await chromium.launchPersistentContext(localProfile, launchOptions)
         onStatus('[WARN] Browser launched with fresh profile - all sessions reset')
@@ -2216,7 +2240,7 @@ export async function closeBrowser() {
             mkdirSync(usbProfile, { recursive: true })
             await robocopyAsync(localProfile, usbProfile)
         } catch (err) {
-            console.error('[QuickPass] Profile sync to USB failed:', err)
+            console.error('[Wipesnap] Profile sync to USB failed:', err)
             diagError('browser-copy-out', err.message)
         } finally {
             runDiagnostics.browserSync.copyOutMs = Date.now() - copyOutStart
@@ -3048,7 +3072,7 @@ function startLauncherMonitor(appObj, realPid, signal = 'known-real-pid') {
             process.kill(realPid, 0)
         } catch (_) {
             clearInterval(checkInterval)
-            console.log(`[QuickPass] ${appObj.diagRef.name} manual close detected. Syncing to USB...`)
+            console.log(`[Wipesnap] ${appObj.diagRef.name} manual close detected. Syncing to USB...`)
             if (appObj.usbPath && appObj.localPath && !appObj.syncPromise && !appObj.abandonSync) {
                 appObj.syncPromise = enqueueSync(appObj.usbPath, appObj.localPath)
             } else {
@@ -3088,7 +3112,7 @@ export async function closeDesktopApps() {
                 updateAppDiagnostic(app, {
                     closeMethod: 'not-owned',
                     cleanupSkippedForSafety: true,
-                    cleanupSafetyReason: 'OmniLaunch did not have ownership proof for this app; quit was skipped.'
+                cleanupSafetyReason: 'Wipesnap did not have ownership proof for this app; quit was skipped.'
                 })
                 continue
             }
@@ -3301,7 +3325,7 @@ export function emergencyKillDesktopAppsSync() {
             updateAppDiagnostic(app, {
                 closeMethod: 'not-owned',
                 cleanupSkippedForSafety: true,
-                cleanupSafetyReason: 'OmniLaunch did not have ownership proof for this app; emergency quit was skipped.'
+                cleanupSafetyReason: 'Wipesnap did not have ownership proof for this app; emergency quit was skipped.'
             })
             continue
         }
@@ -3338,9 +3362,9 @@ function resolveImportedDataUsbPath(appConfig, vaultDir) {
             const bakPath = `${sanitizedPath}.bak-${Date.now()}`
             try {
                 renameSync(sanitizedPath, bakPath)
-                console.log(`[QuickPass] Legacy conflict: backed up ${sanitizedPath} -> ${bakPath}`)
+                console.log(`[Wipesnap] Legacy conflict: backed up ${sanitizedPath} -> ${bakPath}`)
             } catch (err) {
-                console.warn(`[QuickPass] Failed to backup sanitized folder: ${err.message}`)
+                console.warn(`[Wipesnap] Failed to backup sanitized folder: ${err.message}`)
             }
         }
     }
@@ -3350,12 +3374,12 @@ function resolveImportedDataUsbPath(appConfig, vaultDir) {
 
 function getUnsupportedImportedDataMessage(appConfig, effectiveLaunchProfile, runtimeDataPlan = null) {
     const reason = runtimeDataPlan?.unsupportedImportedDataReason ||
-        'QuickPass currently supports imported AppData only for Chromium/Edge and VS Code-family launch profiles.'
+        'Wipesnap currently supports imported AppData only for Chromium/Edge and VS Code-family launch profiles.'
     const runtimeLevel = runtimeDataPlan?.runtimeProfileSupportLevel || RUNTIME_DATA_SUPPORT_LEVELS.UNSUPPORTED
     const levelDetail = runtimeLevel === RUNTIME_DATA_SUPPORT_LEVELS.BEST_EFFORT
-        ? ' QuickPass may still attempt best-effort runtime isolation for launch-only use, but imported AppData requires a verified adapter.'
+        ? ' Wipesnap may still attempt best-effort runtime isolation for launch-only use, but imported AppData requires a verified adapter.'
         : ''
-    return `${appConfig.name} was imported with AppData, but launch profile '${effectiveLaunchProfile}' does not have a verified imported AppData redirection strategy in QuickPass. ${reason}${levelDetail} Reimport without AppData or add an app-specific runtime data adapter before launching it in QuickPass.`
+    return `${appConfig.name} was imported with AppData, but launch profile '${effectiveLaunchProfile}' does not have a verified imported AppData redirection strategy in Wipesnap. ${reason}${levelDetail} Reimport without AppData or add an app-specific runtime data adapter before launching it in Wipesnap.`
 }
 
 // --- Desktop App Launcher ---
@@ -3451,7 +3475,7 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
                 const dirPath = join(vaultDir, 'Apps', appName)
                 const archiveExists = existsSync(archivePath)
                 const directoryExists = existsSync(dirPath)
-                const localAppDir = join(os.tmpdir(), `QuickPass-App-${safeName}`)
+                const localAppDir = join(os.tmpdir(), `${LOCAL_APP_CACHE_PREFIX}${safeName}`)
                 const localAppRoot = join(localAppDir, appName)
                 const localExePath = join(localAppRoot, exeRelative)
                 let validationRoot = null
@@ -3540,7 +3564,7 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
                         return { success: true }
                     } catch (err) {
                         diagPhaseEnd(extractPhase, 'failed', err.message)
-                        console.error(`[QuickPass] Failed to extract ${appName}:`, err)
+                        console.error(`[Wipesnap] Failed to extract ${appName}:`, err)
                         try { removeLocalCachePath(localAppRoot) } catch (_) { }
                         return { success: false, error: err }
                     }
@@ -3760,7 +3784,7 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
             if (syncImportedData) {
                 const importedDataPaths = resolveImportedDataUsbPath(appConfig, vaultDir)
                 usbPath = importedDataPaths.usbPath
-                localPath = join(os.tmpdir(), `QuickPass-AppData-${importedDataPaths.safeName}`)
+                localPath = join(os.tmpdir(), `${LOCAL_APPDATA_PREFIX}${importedDataPaths.safeName}`)
                 mkdirSync(usbPath, { recursive: true })
                 mkdirSync(localPath, { recursive: true })
 
@@ -3769,11 +3793,11 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
                     onStatus(`Syncing ${appConfig.name} data to local...`)
                     await robocopyAsync(usbPath, localPath)
                 } catch (err) {
-                    console.error(`[QuickPass] Failed to sync AppData for ${appConfig.name}:`, err)
+                    console.error(`[Wipesnap] Failed to sync AppData for ${appConfig.name}:`, err)
                     diagError('app-data-sync', `${appConfig.name}: ${err.message}`)
                 }
             } else {
-                localPath = join(os.tmpdir(), `QuickPass-AppRuntime-${safeName}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`)
+                localPath = join(os.tmpdir(), `${RUNTIME_APP_PROFILE_PREFIX}${safeName}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`)
                 mkdirSync(localPath, { recursive: true })
             }
 
@@ -3950,7 +3974,7 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
                     isLauncher: true,
                     launchStage: 'handoff-pending'
                 })
-                console.log(`[QuickPass] ${appConfig.name} exited in ${lifetime}ms - likely a launcher, deferring sync`)
+                console.log(`[Wipesnap] ${appConfig.name} exited in ${lifetime}ms - likely a launcher, deferring sync`)
 
                 ensureLauncherHandoff(appObj).catch(() => { })
 

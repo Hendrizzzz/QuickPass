@@ -6,6 +6,8 @@ import { resolveAppCapability, SUPPORT_TIERS } from './appAdapters.js'
 
 export const APP_MANIFEST_SCHEMA_VERSION = 2
 export const BINARY_ARCHIVE_POLICY_VERSION = 2
+export const APP_MANIFEST_SUFFIX = '.wipesnap-app.json'
+export const LEGACY_APP_MANIFEST_SUFFIX = '.quickpass-app.json'
 
 export const ADAPTER_EVIDENCE_LEVELS = Object.freeze({
     FAMILY_VERIFIED: 'family-verified',
@@ -710,8 +712,8 @@ export function resolveHostExeSupportFields({
         availabilityStatus,
         dataManagement: DATA_MANAGEMENT_LEVELS.UNMANAGED,
         limitations: limitations || [
-            'Data is not copied or synced by OmniLaunch.',
-            'Quit is enabled only after OmniLaunch launches and owns the process.'
+            'Data is not copied or synced by Wipesnap.',
+            'Quit is enabled only after Wipesnap launches and owns the process.'
         ]
     })
 }
@@ -725,7 +727,7 @@ export function resolveHostFolderSupportFields({
         appName,
         launchProfile: 'native-windowed',
         dataProfile: { mode: 'none' },
-        supportSummary: 'Host folder launch reference. OmniLaunch opens it through the Windows shell and does not own a child process.',
+        supportSummary: 'Host folder launch reference. Wipesnap opens it through the Windows shell and does not own a child process.',
         launchSourceType: LAUNCH_SOURCE_TYPES.HOST_FOLDER,
         launchMethod: LAUNCH_METHODS.SHELL_EXECUTE,
         ownershipProofLevel: OWNERSHIP_PROOF_LEVELS.NONE,
@@ -736,7 +738,7 @@ export function resolveHostFolderSupportFields({
         dataManagement: DATA_MANAGEMENT_LEVELS.UNMANAGED,
         limitations: [
             'Folders are opened by the Windows shell.',
-            'OmniLaunch cannot prove process ownership for a folder launch.',
+            'Wipesnap cannot prove process ownership for a folder launch.',
             'Quit and cleanup are disabled for this launch source.'
         ]
     })
@@ -747,7 +749,7 @@ export function resolveRegistryUninstallSupportFields({ appName, availabilitySta
         appName,
         availabilityStatus,
         launchSourceType: LAUNCH_SOURCE_TYPES.REGISTRY_UNINSTALL,
-        supportSummary: 'Registry-discovered host app. OmniLaunch stores a launch reference only; data is unmanaged.',
+        supportSummary: 'Registry-discovered host app. Wipesnap stores a launch reference only; data is unmanaged.',
         limitations: [
             'Availability is rechecked on each PC before launch.',
             'DisplayIcon is used only as a hint, never as the final executable by itself.'
@@ -763,7 +765,7 @@ export function resolveAppPathsSupportFields({ appName, availabilityStatus = 'un
         supportSummary: 'App Paths host launch reference. Data is unmanaged and availability is checked on this PC.',
         limitations: [
             'App Paths are resolved from the current PC registry before launch.',
-            'Data is not copied or synced by OmniLaunch.'
+            'Data is not copied or synced by Wipesnap.'
         ],
         closeManagedAfterSpawn: true
     })
@@ -781,12 +783,12 @@ export function resolveStartMenuShortcutSupportFields({
         launchSourceType: LAUNCH_SOURCE_TYPES.START_MENU_SHORTCUT,
         supportSummary: strongDirectExecutable
             ? 'Start Menu shortcut to a direct executable. Data is unmanaged.'
-            : 'Ambiguous Start Menu shortcut. Data is unmanaged and OmniLaunch will not close it automatically.',
+            : 'Ambiguous Start Menu shortcut. Data is unmanaged and Wipesnap will not close it automatically.',
         limitations: [
             warning || (strongDirectExecutable
                 ? 'Shortcut target is a direct executable; arguments are shown before saving.'
                 : 'Shortcut target or arguments require weak ownership.'),
-            'Data is not copied or synced by OmniLaunch.'
+            'Data is not copied or synced by Wipesnap.'
         ],
         closeManagedAfterSpawn: !!strongDirectExecutable
     })
@@ -802,7 +804,7 @@ export function resolveShellExecuteSupportFields({
         appName,
         launchProfile: 'native-windowed',
         dataProfile: { mode: 'none' },
-        supportSummary: 'ShellExecute launch reference. Data is unmanaged and OmniLaunch will not close it automatically.',
+        supportSummary: 'ShellExecute launch reference. Data is unmanaged and Wipesnap will not close it automatically.',
         launchSourceType: LAUNCH_SOURCE_TYPES.SHELL_EXECUTE,
         launchMethod: LAUNCH_METHODS.SHELL_EXECUTE,
         ownershipProofLevel: OWNERSHIP_PROOF_LEVELS.WEAK,
@@ -813,7 +815,7 @@ export function resolveShellExecuteSupportFields({
         dataManagement: DATA_MANAGEMENT_LEVELS.UNMANAGED,
         limitations: [
             warning || 'ShellExecute can hand off to another process, so ownership is weak.',
-            'Data is not copied or synced by OmniLaunch.',
+            'Data is not copied or synced by Wipesnap.',
             'Quit and cleanup are disabled for this launch source.'
         ]
     })
@@ -825,7 +827,7 @@ export function resolveProtocolUriSupportFields({ appName, availabilityStatus = 
         appName,
         launchProfile: 'native-windowed',
         dataProfile: { mode: 'none' },
-        supportSummary: 'Protocol URI launch reference. Data is unmanaged and OmniLaunch cannot prove process ownership.',
+        supportSummary: 'Protocol URI launch reference. Data is unmanaged and Wipesnap cannot prove process ownership.',
         launchSourceType: LAUNCH_SOURCE_TYPES.PROTOCOL_URI,
         launchMethod: LAUNCH_METHODS.PROTOCOL,
         ownershipProofLevel: OWNERSHIP_PROOF_LEVELS.NONE,
@@ -836,7 +838,7 @@ export function resolveProtocolUriSupportFields({ appName, availabilityStatus = 
         dataManagement: DATA_MANAGEMENT_LEVELS.UNMANAGED,
         limitations: [
             'Protocol handlers are resolved by Windows on this PC.',
-            'Data is not copied or synced by OmniLaunch.',
+            'Data is not copied or synced by Wipesnap.',
             'Quit and cleanup are disabled for protocol launches.'
         ]
     })
@@ -848,7 +850,7 @@ export function resolvePackagedAppSupportFields({ appName, availabilityStatus = 
         appName,
         launchProfile: 'native-windowed',
         dataProfile: { mode: 'none' },
-        supportSummary: 'Packaged/UWP app launch reference. Data is unmanaged and OmniLaunch cannot prove process ownership.',
+        supportSummary: 'Packaged/UWP app launch reference. Data is unmanaged and Wipesnap cannot prove process ownership.',
         launchSourceType: LAUNCH_SOURCE_TYPES.PACKAGED_APP,
         launchMethod: LAUNCH_METHODS.PACKAGED_APP,
         ownershipProofLevel: OWNERSHIP_PROOF_LEVELS.NONE,
@@ -859,7 +861,7 @@ export function resolvePackagedAppSupportFields({ appName, availabilityStatus = 
         dataManagement: DATA_MANAGEMENT_LEVELS.UNMANAGED,
         limitations: [
             'Packaged apps are activated through Windows shell activation.',
-            'Data is not copied or synced by OmniLaunch.',
+            'Data is not copied or synced by Wipesnap.',
             'Quit and cleanup are disabled for packaged apps.'
         ]
     })
@@ -943,7 +945,11 @@ export function validateExtractedAppCache(localAppRoot, manifest, selectedRelati
 }
 
 export function getManifestPath(vaultDir, appNameOrSafeName) {
-    return join(vaultDir, 'Apps', `${safeAppName(appNameOrSafeName)}.quickpass-app.json`)
+    return join(vaultDir, 'Apps', `${safeAppName(appNameOrSafeName)}${APP_MANIFEST_SUFFIX}`)
+}
+
+export function getLegacyManifestPath(vaultDir, appNameOrSafeName) {
+    return join(vaultDir, 'Apps', `${safeAppName(appNameOrSafeName)}${LEGACY_APP_MANIFEST_SUFFIX}`)
 }
 
 function isMicrosoftEdgeManifest(manifest) {
@@ -1047,9 +1053,13 @@ export function normalizeManifestProfiles(manifest) {
 export function readAppManifest(vaultDir, appNameOrSafeName) {
     if (!vaultDir || !appNameOrSafeName) return null
     const manifestPath = getManifestPath(vaultDir, appNameOrSafeName)
-    if (!existsSync(manifestPath)) return null
+    const legacyManifestPath = getLegacyManifestPath(vaultDir, appNameOrSafeName)
+    const readablePath = existsSync(manifestPath)
+        ? manifestPath
+        : (existsSync(legacyManifestPath) ? legacyManifestPath : '')
+    if (!readablePath) return null
     try {
-        return JSON.parse(readFileSync(manifestPath, 'utf8'))
+        return JSON.parse(readFileSync(readablePath, 'utf8'))
     } catch (_) {
         return null
     }

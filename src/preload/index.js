@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
-contextBridge.exposeInMainWorld('omnilaunch', {
+const wipesnapApi = {
     // Drive & Environment
     getDriveInfo: () => ipcRenderer.invoke('get-drive-info'),
 
@@ -73,4 +73,8 @@ contextBridge.exposeInMainWorld('omnilaunch', {
     // Window Controls
     minimize: () => ipcRenderer.invoke('minimize-window'),
     close: () => ipcRenderer.invoke('close-window')
-})
+}
+
+contextBridge.exposeInMainWorld('wipesnap', wipesnapApi)
+// Compatibility alias for older renderer bundles and any saved automation snippets.
+contextBridge.exposeInMainWorld('omnilaunch', wipesnapApi)

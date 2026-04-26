@@ -13,7 +13,7 @@ export default function ImportAppsModal({ onClose, onImportComplete }) {
 
     useEffect(() => {
         let cancelled = false
-        window.omnilaunch.scanApps().then((results) => {
+        window.wipesnap.scanApps().then((results) => {
             if (cancelled) return
             setApps(results)
             setPhase('selection')
@@ -40,7 +40,7 @@ export default function ImportAppsModal({ onClose, onImportComplete }) {
     }, [phase])
 
     useEffect(() => {
-        cleanupRef.current = window.omnilaunch.onImportProgress((data) => {
+        cleanupRef.current = window.wipesnap.onImportProgress((data) => {
             setProgress((prev) => ({ ...prev, [data.name]: data }))
         })
 
@@ -150,7 +150,7 @@ export default function ImportAppsModal({ onClose, onImportComplete }) {
         const completed = []
         const failed = []
 
-        window.omnilaunch.notifyImportStarted()
+        window.wipesnap.notifyImportStarted()
         try {
             for (const app of appsToImport) {
                 const sel = selected[app.name]
@@ -159,7 +159,7 @@ export default function ImportAppsModal({ onClose, onImportComplete }) {
                     [app.name]: { phase: 'binary', percent: 0, copiedMB: 0, totalMB: app.sizeMB }
                 }))
 
-                const result = await window.omnilaunch.importApp({
+                const result = await window.wipesnap.importApp({
                     sourcePath: app.sourcePath,
                     name: app.name,
                     exe: app.exe,
@@ -193,7 +193,7 @@ export default function ImportAppsModal({ onClose, onImportComplete }) {
             setFailedApps([...failed, { name: 'Unexpected', error: err.message || 'Import failed unexpectedly' }])
             setPhase('done')
         } finally {
-            window.omnilaunch.notifyImportFinished()
+            window.wipesnap.notifyImportFinished()
         }
     }
 
@@ -299,7 +299,7 @@ export default function ImportAppsModal({ onClose, onImportComplete }) {
                                                 </label>
                                                 {!canImportAppData(app) && (
                                                     <p className="text-[10px] text-muted mt-1">
-                                                        {app.importedDataSupportReason || 'QuickPass does not have a verified imported AppData adapter for this app.'}
+                                                        {app.importedDataSupportReason || 'Wipesnap does not have a verified imported AppData adapter for this app.'}
                                                     </p>
                                                 )}
                                             </div>

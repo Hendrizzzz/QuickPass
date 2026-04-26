@@ -1,6 +1,7 @@
 import assert from 'assert/strict'
 import { test } from 'node:test'
 import { configureTrustedIpcRenderer, isTrustedIpcSender } from '../src/main/ipcTrust.js'
+import { PACKAGED_RENDERER_URL } from '../src/main/electronShellHardening.js'
 
 function fakeEvent(url, parent = null, senderId = 7) {
     return {
@@ -58,18 +59,26 @@ test('IPC trust rejects unexpected origins and subframes', () => {
     )
 })
 
-test('IPC trust accepts only the exact packaged renderer file URL', () => {
+test('IPC trust accepts only the exact packaged custom protocol renderer URL', () => {
     assert.equal(
-        isTrustedIpcSender(fakeEvent('file:///C:/App/out/renderer/index.html'), {
-            allowedRendererUrls: ['file:///C:/App/out/renderer/index.html'],
+        isTrustedIpcSender(fakeEvent(PACKAGED_RENDERER_URL), {
+            allowedRendererUrls: [PACKAGED_RENDERER_URL],
             webContentsId: 7
         }),
         true
     )
 
     assert.equal(
-        isTrustedIpcSender(fakeEvent('file:///C:/Temp/renderer/index.html'), {
-            allowedRendererUrls: ['file:///C:/App/out/renderer/index.html'],
+        isTrustedIpcSender(fakeEvent(`${PACKAGED_RENDERER_URL}?evil=1`), {
+            allowedRendererUrls: [PACKAGED_RENDERER_URL],
+            webContentsId: 7
+        }),
+        false
+    )
+
+    assert.equal(
+        isTrustedIpcSender(fakeEvent(`${PACKAGED_RENDERER_URL}#evil`), {
+            allowedRendererUrls: [PACKAGED_RENDERER_URL],
             webContentsId: 7
         }),
         false
@@ -78,12 +87,12 @@ test('IPC trust accepts only the exact packaged renderer file URL', () => {
 
 test('IPC trust can use configured process-wide renderer state', () => {
     configureTrustedIpcRenderer({
-        urls: ['file:///C:/App/out/renderer/index.html'],
+        urls: [PACKAGED_RENDERER_URL],
         webContentsId: 42
     })
 
-    assert.equal(isTrustedIpcSender(fakeEvent('file:///C:/App/out/renderer/index.html', null, 42)), true)
-    assert.equal(isTrustedIpcSender(fakeEvent('file:///C:/App/out/renderer/index.html', null, 7)), false)
+    assert.equal(isTrustedIpcSender(fakeEvent(PACKAGED_RENDERER_URL, null, 42)), true)
+    assert.equal(isTrustedIpcSender(fakeEvent(PACKAGED_RENDERER_URL, null, 7)), false)
 })
 
 test('IPC trust fails closed without explicit renderer configuration', () => {

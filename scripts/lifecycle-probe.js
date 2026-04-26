@@ -90,7 +90,7 @@ async function runProbe(name, fn) {
 }
 
 try {
-    console.log('Starting QuickPass lifecycle probes...\n')
+    console.log('Starting Wipesnap lifecycle probes...\n')
 
     await runProbe('app capability resolver keeps golden adapter classifications stable', async () => {
         const edge = resolveAppCapability({
@@ -469,7 +469,7 @@ try {
         assert.match(blocked.cleanupBlockedReason, /symbolic-link|junction/i)
     })
 
-    console.log('\nQuickPass lifecycle probes passed.')
+    console.log('\nWipesnap lifecycle probes passed.')
 } finally {
     rmSync(tempRoot, { recursive: true, force: true })
 }

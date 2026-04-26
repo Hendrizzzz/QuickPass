@@ -1,5 +1,5 @@
 /**
- * OmniLaunch Dev Launcher
+ * Wipesnap Dev Launcher
  * Builds the app using electron-vite, then launches Electron with
  * ELECTRON_RUN_AS_NODE properly unset (required when running inside
  * Electron-based IDEs like Antigravity/Cursor/VS Code).
@@ -10,7 +10,7 @@ const path = require('path')
 const projectRoot = path.join(__dirname, '..')
 
 // Step 1: Build all three targets with electron-vite
-console.log('[OmniLaunch] Building...')
+console.log('[Wipesnap] Building...')
 execSync('npx electron-vite build', {
     cwd: projectRoot,
     stdio: 'inherit',
@@ -21,7 +21,7 @@ execSync('npx electron-vite build', {
 const electronPath = require('electron')
 
 // Step 3: Launch Electron with ELECTRON_RUN_AS_NODE explicitly removed
-console.log('[OmniLaunch] Launching Electron...')
+console.log('[Wipesnap] Launching Electron...')
 const env = { ...process.env }
 delete env.ELECTRON_RUN_AS_NODE
 

@@ -21,7 +21,7 @@ async function runAudit() {
     }
 
     try {
-        console.log('▶ Booting QuickPass (Strict Environment)...')
+        console.log('▶ Booting Wipesnap (Strict Environment)...')
         // Boot Electron app from the built distribution
         electronApp = await electron.launch({
             executablePath: electronPath,
@@ -31,7 +31,7 @@ async function runAudit() {
 
         // Wait for the first window
         const window = await electronApp.firstWindow()
-        console.log('✅ PASS: QuickPass Main Window Initialized.')
+        console.log('✅ PASS: Wipesnap Main Window Initialized.')
 
         // Step 1: Wait for Setup Screen
         await window.waitForSelector('text=Initial Setup', { timeout: 10000 })

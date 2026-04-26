@@ -10,9 +10,10 @@ import {
     createImportedAppLookup,
     reserveAppStorageId
 } from '../src/main/importReservations.js'
+import { APP_MANIFEST_SUFFIX, LEGACY_APP_MANIFEST_SUFFIX } from '../src/main/appManifest.js'
 
 function createTempVault() {
-    const vaultDir = mkdtempSync(join(tmpdir(), 'omnilaunch-import-reservations-'))
+    const vaultDir = mkdtempSync(join(tmpdir(), 'wipesnap-import-reservations-'))
     mkdirSync(join(vaultDir, 'Apps'), { recursive: true })
     return vaultDir
 }
@@ -244,10 +245,10 @@ test('reservation release does not remove a replacement lock without matching ow
     }
 })
 
-test('suffixed imported app is reported already imported from manifests and storage ids', () => {
+test('suffixed imported app is reported already imported from current and legacy manifests', () => {
     const vaultDir = createTempVault()
     try {
-        writeFileSync(join(vaultDir, 'Apps', 'Suffixed_App-2.quickpass-app.json'), `${JSON.stringify({
+        writeFileSync(join(vaultDir, 'Apps', `Suffixed_App-2${APP_MANIFEST_SUFFIX}`), `${JSON.stringify({
             schemaVersion: 2,
             manifestId: 'Suffixed_App-2',
             safeName: 'Suffixed_App-2',
@@ -255,11 +256,20 @@ test('suffixed imported app is reported already imported from manifests and stor
             archiveName: 'Suffixed_App-2.tar.zst',
             selectedExecutable: { relativePath: 'app.exe' }
         }, null, 2)}\n`, 'utf-8')
+        writeFileSync(join(vaultDir, 'Apps', `Legacy_App-2${LEGACY_APP_MANIFEST_SUFFIX}`), `${JSON.stringify({
+            schemaVersion: 2,
+            manifestId: 'Legacy_App-2',
+            safeName: 'Legacy_App-2',
+            displayName: 'Legacy App',
+            archiveName: 'Legacy_App-2.tar.zst',
+            selectedExecutable: { relativePath: 'legacy.exe' }
+        }, null, 2)}\n`, 'utf-8')
         mkdirSync(join(vaultDir, 'Apps', 'Storage_Only_App-2'), { recursive: true })
 
         const importedApps = createImportedAppLookup(vaultDir)
 
         assert.equal(importedApps.alreadyImported('Suffixed App'), true)
+        assert.equal(importedApps.alreadyImported('Legacy App'), true)
         assert.equal(importedApps.alreadyImported('Storage Only App'), true)
         assert.equal(importedApps.alreadyImported('Not Imported App'), false)
     } finally {
