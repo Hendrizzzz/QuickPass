@@ -31,37 +31,71 @@ export default function SetupScreen({ driveInfo, onComplete }) {
     const browserReady = sessionState === 'open' || sessionState === 'saving'
     const openingBrowser = sessionState === 'opening'
     const savingSession = sessionState === 'saving'
+    const getAppDisplayName = (app) => app?.name || app?.displayName || ''
+    const toCapabilityWorkspaceEntry = (app) => {
+        const displayName = getAppDisplayName(app)
+        return {
+            id: app.id,
+            capabilityId: app.capabilityId,
+            displayName,
+            name: displayName,
+            enabled: app.enabled !== false
+        }
+    }
+    const toCapabilityWorkspace = (apps) => apps.map(toCapabilityWorkspaceEntry)
+
+    const handleUnsupportedBrowseSelection = (selected) => {
+        if (selected?.success !== false) return false
+        setError(selected.error || 'Selected app cannot be added.')
+        return true
+    }
 
     const browseExe = async () => {
-        const filePath = await window.omnilaunch.browseExe()
-        if (filePath) {
-            const name = filePath.split('\\').pop().replace('.exe', '')
-            setAppForm({ ...appForm, path: filePath, name })
+        const selected = await window.omnilaunch.browseExe()
+        if (!selected || handleUnsupportedBrowseSelection(selected)) return
+
+        const filePath = typeof selected === 'string' ? selected : selected.path
+        if (!filePath) {
+            setError('Selected executable did not include a launch capability.')
+            return
         }
+        const name = selected.displayName || selected.name || filePath.split('\\').pop().replace('.exe', '')
+        setError('')
+        setAppForm({ ...appForm, ...(typeof selected === 'object' ? selected : {}), path: filePath, name })
     }
 
     const browseFolder = async () => {
-        const folderPath = await window.omnilaunch.browseFolder()
-        if (folderPath) {
-            const name = folderPath.split('\\').pop()
-            setAppForm({
-                ...appForm,
-                path: folderPath,
-                name,
-                portableData: false,
-                launchSourceType: 'host-folder',
-                launchMethod: 'shell-execute'
-            })
+        const selected = await window.omnilaunch.browseFolder()
+        if (!selected || handleUnsupportedBrowseSelection(selected)) return
+
+        const folderPath = typeof selected === 'string' ? selected : selected.path
+        if (!folderPath) {
+            setError('Selected folder did not include a launch capability.')
+            return
         }
+        const name = selected.displayName || selected.name || folderPath.split('\\').pop()
+        setError('')
+        setAppForm({
+            ...appForm,
+            ...(typeof selected === 'object' ? selected : {}),
+            path: folderPath,
+            name,
+            portableData: false,
+            launchSourceType: 'host-folder',
+            launchMethod: 'shell-execute'
+        })
     }
 
     const addDesktopApp = () => {
-        if (!appForm.path.trim()) return
+        if (!appForm.capabilityId) {
+            setError('Select an app or folder from the picker before adding it.')
+            return
+        }
         const path = appForm.path.trim()
         const isAbsoluteHostPath = /^[a-z]:\\/i.test(path)
         const isExecutablePath = /\.(exe|bat|cmd)$/i.test(path)
         const inferredHostFolder = isAbsoluteHostPath && !isExecutablePath && !appForm.launchSourceType
-        setDesktopApps([...desktopApps, {
+        const nextApp = {
             ...appForm,
             ...(inferredHostFolder ? {
                 portableData: false,
@@ -70,7 +104,8 @@ export default function SetupScreen({ driveInfo, onComplete }) {
             } : {}),
             id: Date.now(),
             enabled: true
-        }])
+        }
+        setDesktopApps([...desktopApps, toCapabilityWorkspaceEntry(nextApp)])
         setAppForm({ name: '', path: '', args: '' })
         setShowAppForm(false)
     }
@@ -82,7 +117,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
         setSessionWarning('')
 
         // Save vault with desktop apps only; web tabs come from session capture.
-        const workspace = { webTabs: [], desktopApps }
+        const workspace = { webTabs: [], desktopApps: toCapabilityWorkspace(desktopApps) }
         const result = await window.omnilaunch.saveVault({
             masterPassword: supportsConvenienceUnlock ? hiddenMasterPassword : masterPassword,
             pin: supportsConvenienceUnlock && pin ? pin : null,
@@ -363,8 +398,8 @@ export default function SetupScreen({ driveInfo, onComplete }) {
                         {desktopApps.map((dApp, i) => (
                             <div key={dApp.id} className="list-item flex items-center justify-between mb-2">
                                 <div className="flex-1 min-w-0">
-                                    <p className="text-sm text-white truncate">{dApp.name}</p>
-                                    <p className="text-xs text-muted truncate">{dApp.path}</p>
+                                    <p className="text-sm text-white truncate">{getAppDisplayName(dApp)}</p>
+                                    <p className="text-xs text-muted truncate">{dApp.path || 'Launch capability saved'}</p>
                                 </div>
                                 <button className="btn-danger-text" onClick={() => setDesktopApps(desktopApps.filter((_, j) => j !== i))}>
                                     Remove
@@ -400,7 +435,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
                         <ImportAppsModal
                             onClose={() => setShowImportModal(false)}
                             onImportComplete={(importedApps) => {
-                                setDesktopApps(prev => [...prev, ...importedApps])
+                                setDesktopApps(prev => [...prev, ...toCapabilityWorkspace(importedApps)])
                                 setShowImportModal(false)
                             }}
                         />

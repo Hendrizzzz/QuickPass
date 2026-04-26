@@ -3,9 +3,12 @@ import { test } from 'node:test'
 import { createCapabilityRecord } from '../src/main/capabilityStore.js'
 import {
     WORKSPACE_CAPABILITY_VAULT_KEY,
+    createVaultLocalExecutableCapability,
     migrateWorkspaceLaunchCapabilities,
     migrationReportToMetadataSummary,
+    prepareRendererWorkspaceSave,
     rehydrateWorkspaceLaunchCapabilities,
+    sanitizeWorkspaceForRenderer,
     workspaceEntryHasRawLaunchAuthority
 } from '../src/main/workspaceCapabilityMigration.js'
 
@@ -277,7 +280,195 @@ test('migrated workspace entries store only capability ids and limited UI state'
     })
 
     const [app] = migrated.workspace.desktopApps
-    assert.deepEqual(Object.keys(app).sort(), ['capabilityId', 'displayName', 'enabled', 'id', 'name'].sort())
+    assert.deepEqual(Object.keys(app).sort(), ['capabilityId', 'displayName', 'enabled', 'id'].sort())
     assert.equal(app.capabilityId, `cap_${'0a'.repeat(32)}`)
     assert.equal(workspaceEntryHasRawLaunchAuthority(app), false)
+})
+
+test('renderer-invented raw launch path cannot be saved or launched', () => {
+    assert.throws(() => prepareRendererWorkspaceSave({
+        desktopApps: [{
+            id: 'forged-row',
+            displayName: 'Forged Notepad',
+            path: 'C:\\Windows\\System32\\notepad.exe',
+            launchSourceType: 'host-exe',
+            launchMethod: 'spawn',
+            enabled: true
+        }]
+    }), /path is not accepted from renderer workspace data/)
+
+    assert.throws(() => rehydrateWorkspaceLaunchCapabilities({
+        desktopApps: [{
+            displayName: 'Forged Notepad',
+            path: 'C:\\Windows\\System32\\notepad.exe',
+            launchSourceType: 'host-exe',
+            launchMethod: 'spawn',
+            enabled: true
+        }]
+    }), /missing a capabilityId/)
+})
+
+test('valid renderer capabilityId can be saved and rehydrated for launch', () => {
+    const record = createCapabilityRecord({
+        type: 'host-exe',
+        provenance: 'browse-exe',
+        displayName: 'Verified App',
+        launch: {
+            path: 'C:\\Program Files\\Verified\\Verified.exe'
+        },
+        policy: {
+            allowedArgs: 'none',
+            canCloseFromWipesnap: true,
+            ownership: 'owned-process'
+        }
+    }, {
+        randomBytes: bytesSequence(0x44),
+        now: FIXED_NOW
+    })
+
+    const saved = prepareRendererWorkspaceSave({
+        webTabs: [{ url: 'https://example.com', enabled: true }],
+        desktopApps: [{
+            id: 'verified-row',
+            capabilityId: record.capabilityId,
+            displayName: 'Verified Renamed',
+            enabled: true
+        }]
+    }, {
+        pendingCapabilityRecords: [record]
+    })
+
+    const [storedApp] = saved.workspace.desktopApps
+    assert.deepEqual(Object.keys(storedApp).sort(), ['capabilityId', 'displayName', 'enabled', 'id'].sort())
+    assert.equal(storedApp.displayName, 'Verified Renamed')
+    assert.deepEqual(saved.capabilityVault.records[record.capabilityId], record)
+
+    const rendererWorkspace = sanitizeWorkspaceForRenderer(saved.workspace)
+    assert.equal(WORKSPACE_CAPABILITY_VAULT_KEY in rendererWorkspace, false)
+    assert.equal(rendererWorkspace.desktopApps[0].capabilityId, record.capabilityId)
+
+    const launchWorkspace = rehydrateWorkspaceLaunchCapabilities(saved.workspace, {
+        capabilityVault: saved.capabilityVault
+    })
+    assert.deepEqual(launchWorkspace.desktopApps.map(app => app.path), [
+        'C:\\Program Files\\Verified\\Verified.exe'
+    ])
+    assert.equal(launchWorkspace.desktopApps[0].launchSourceType, 'host-exe')
+    assert.equal(launchWorkspace.desktopApps[0].launchMethod, 'spawn')
+})
+
+test('USB-local executable browse issues a manifest-backed capability that can be saved and launched', () => {
+    const { record, appConfig } = createVaultLocalExecutableCapability({
+        vaultRelativePath: 'Apps\\Imported_App\\Imported.exe',
+        manifest: manifestResolver('Imported_App'),
+        id: 'usb-local-row',
+        randomBytes: bytesSequence(0x77),
+        now: FIXED_NOW
+    })
+
+    assert.equal(record.capabilityId, `cap_${'77'.repeat(32)}`)
+    assert.equal(record.type, 'vault-archive')
+    assert.equal(record.provenance, 'import-manifest')
+    assert.equal(record.launch.storageId, 'Imported_App')
+    assert.equal(record.launch.manifestId, 'Imported_App')
+    assert.equal(appConfig.capabilityId, record.capabilityId)
+    assert.equal(appConfig.path, '[USB]\\Apps\\Imported_App\\Imported.exe')
+
+    const saved = prepareRendererWorkspaceSave({
+        desktopApps: [{
+            id: appConfig.id,
+            capabilityId: appConfig.capabilityId,
+            displayName: appConfig.displayName,
+            enabled: true
+        }]
+    }, {
+        pendingCapabilityRecords: [record]
+    })
+
+    assert.equal(workspaceEntryHasRawLaunchAuthority(saved.workspace.desktopApps[0]), false)
+    const launchWorkspace = rehydrateWorkspaceLaunchCapabilities(saved.workspace, {
+        capabilityVault: saved.capabilityVault,
+        manifestResolver
+    })
+    assert.equal(launchWorkspace.desktopApps[0].path, '[USB]\\Apps\\Imported_App\\Imported.exe')
+    assert.equal(launchWorkspace.desktopApps[0].launchSourceType, 'vault-archive')
+})
+
+test('USB-local browse selections fail closed without matching manifest evidence', () => {
+    assert.throws(() => createVaultLocalExecutableCapability({
+        vaultRelativePath: 'Apps\\Imported_App\\Other.exe',
+        manifest: manifestResolver('Imported_App'),
+        randomBytes: bytesSequence(0x88),
+        now: FIXED_NOW
+    }), /executable does not match/)
+
+    assert.throws(() => createVaultLocalExecutableCapability({
+        vaultRelativePath: 'Apps\\Imported_App',
+        manifest: manifestResolver('Imported_App'),
+        randomBytes: bytesSequence(0x89),
+        now: FIXED_NOW
+    }), /Imported app path must use/)
+
+    assert.throws(() => createVaultLocalExecutableCapability({
+        vaultRelativePath: 'Apps\\Missing_App\\Missing.exe',
+        manifest: null,
+        randomBytes: bytesSequence(0x8a),
+        now: FIXED_NOW
+    }), /requires a verified imported app manifest/)
+})
+
+test('stale renderer capabilityId fails closed during save', () => {
+    assert.throws(() => prepareRendererWorkspaceSave({
+        desktopApps: [{
+            capabilityId: `cap_${'55'.repeat(32)}`,
+            displayName: 'Stale App',
+            enabled: true
+        }]
+    }, {
+        existingCapabilityVault: {
+            version: 1,
+            records: {}
+        }
+    }), /missing, stale, or unavailable/)
+})
+
+test('renderer raw metadata injection is rejected during save', () => {
+    const record = createCapabilityRecord({
+        type: 'host-exe',
+        provenance: 'browse-exe',
+        displayName: 'Verified App',
+        launch: {
+            path: 'C:\\Program Files\\Verified\\Verified.exe'
+        }
+    }, {
+        randomBytes: bytesSequence(0x66),
+        now: FIXED_NOW
+    })
+
+    assert.throws(() => prepareRendererWorkspaceSave({
+        desktopApps: [{
+            capabilityId: record.capabilityId,
+            displayName: 'Injected App',
+            enabled: true,
+            registryKey: 'HKCU\\Software\\Injected',
+            supportTier: 'verified',
+            closePolicy: 'owned-tree'
+        }]
+    }, {
+        pendingCapabilityRecords: [record]
+    }), /registryKey is not accepted from renderer workspace data/)
+
+    assert.throws(() => prepareRendererWorkspaceSave({
+        desktopApps: [{
+            capabilityId: record.capabilityId,
+            displayName: 'Injected Vault App',
+            enabled: true
+        }],
+        [WORKSPACE_CAPABILITY_VAULT_KEY]: {
+            version: 1,
+            records: {
+                [record.capabilityId]: record
+            }
+        }
+    }), /main-owned capability metadata/)
 })

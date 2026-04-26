@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, dialog, session } from 'electron'
-import { join, basename } from 'path'
+import { join, basename, relative, isAbsolute } from 'path'
 import { pathToFileURL } from 'url'
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, rmSync, renameSync, unlinkSync, openSync, closeSync } from 'fs'
 import { execSync, spawn, exec, execFile } from 'child_process'
@@ -9,6 +9,7 @@ const execAsync = util.promisify(exec)
 const execFileAsync = util.promisify(execFile)
 import crypto from 'crypto'
 import { launchWorkspace, launchSessionSetup, captureSession, captureCurrentSession, closeBrowser, closeDesktopApps, emergencyKillDesktopAppsSync, onBrowserAllClosed, hasActiveBrowserSession, wipeLocalTraces, wipeAllLocalProfiles, wipeAllLocalAppData, wipeLocalAppCache, wipeAllRuntimeAppProfiles, runDiagnostics, diagError, beginDiagnosticsCycle } from './engine.js'
+import { createCapabilityRecord } from './capabilityStore.js'
 import {
     APPDATA_SKIP_DIRS,
     BINARY_ARCHIVE_EXCLUDE_DIRS,
@@ -21,6 +22,7 @@ import {
     inferAppType,
     isDangerousExecutablePath,
     pickSupportFields,
+    readAppManifest,
     repairLegacyAppConfig,
     resolveAppPathsSupportFields,
     resolveHostExeSupportFields,
@@ -77,8 +79,11 @@ import {
 } from './processControlHandlers.js'
 import {
     WORKSPACE_CAPABILITY_VAULT_KEY,
+    createVaultLocalExecutableCapability,
     migrateWorkspaceLaunchCapabilities,
     migrationReportToMetadataSummary,
+    prepareRendererWorkspaceSave,
+    sanitizeWorkspaceForRenderer,
     rehydrateWorkspaceLaunchCapabilities
 } from './workspaceCapabilityMigration.js'
 
@@ -270,7 +275,7 @@ async function migrateUnlockedWorkspaceForRenderer(workspace, masterPassword) {
         existingWorkspace: workspace
     })
     await persistMigratedWorkspaceIfChanged(migrated.workspace, masterPassword, migrated)
-    return migrated.workspace
+    return sanitizeWorkspaceForRenderer(migrated.workspace)
 }
 
 // ─── Vault Metadata ────────────────────────────────────────────────────────────
@@ -383,41 +388,153 @@ const HOST_WORKSPACE_LAUNCH_TYPES = new Set([
     'packaged-app'
 ])
 
-const issuedLaunchCapabilities = new Map()
+const pendingLaunchCapabilityRecords = new Map()
 
-function launchCapabilityReference(appConfig) {
-    const reference = {
-        launchSourceType: appConfig.launchSourceType,
-        launchMethod: appConfig.launchMethod,
-        path: appConfig.path
+function launchCapabilityPolicyForType(type) {
+    const ownedProcessTypes = new Set([
+        'host-exe',
+        'registry-uninstall',
+        'app-paths',
+        'start-menu-shortcut'
+    ])
+    return {
+        allowedArgs: 'none',
+        canCloseFromWipesnap: ownedProcessTypes.has(type),
+        ownership: ownedProcessTypes.has(type) ? 'owned-process' : 'external'
     }
-    for (const key of [
-        'registryKey',
-        'appPathsKey',
-        'shortcutPath',
-        'protocolScheme',
-        'packagedAppId'
-    ]) {
-        if (appConfig[key]) reference[key] = appConfig[key]
-    }
-    return reference
 }
 
-function launchCapabilityIdFor(reference) {
-    return `cap_${crypto.createHash('sha256').update(JSON.stringify(reference)).digest('hex').slice(0, 24)}`
+function capabilityInputForHostLaunch(appConfig, provenance) {
+    const type = appConfig?.launchSourceType
+    if (!HOST_WORKSPACE_LAUNCH_TYPES.has(type)) return null
+
+    const launch = {
+        method: appConfig.launchMethod || (type === 'host-folder' || type === 'shell-execute'
+            ? 'shell-execute'
+            : type === 'protocol-uri'
+                ? 'protocol'
+                : type === 'packaged-app'
+                    ? 'packaged-app'
+                    : 'spawn')
+    }
+
+    if (type === 'protocol-uri') {
+        launch.uri = appConfig.path
+    } else {
+        launch.path = appConfig.path
+    }
+
+    const optionalFields = {
+        'registry-uninstall': ['registryKey', 'registryDisplayName', 'registryInstallLocation', 'registryDisplayIcon'],
+        'app-paths': ['appPathsKey', 'appPathsExecutableName', 'appPathsPathValue'],
+        'start-menu-shortcut': ['shortcutPath', 'shortcutTargetPath', 'shortcutArguments', 'shortcutWorkingDirectory', 'shortcutIconLocation'],
+        'shell-execute': ['shortcutPath', 'shortcutTargetPath', 'shortcutArguments', 'shortcutWorkingDirectory', 'shortcutIconLocation'],
+        'protocol-uri': ['protocolScheme', 'protocolCommand', 'protocolRegistryKey'],
+        'packaged-app': ['packagedAppId']
+    }
+
+    for (const key of optionalFields[type] || []) {
+        if (appConfig[key]) launch[key] = appConfig[key]
+    }
+
+    return {
+        type,
+        provenance,
+        displayName: appConfig.displayName || appConfig.name || basename(String(appConfig.path || 'App')),
+        launch,
+        policy: launchCapabilityPolicyForType(type)
+    }
+}
+
+function capabilityInputForImportedApp({ name, safeName, manifestId, launchSourceType = 'vault-archive' }) {
+    return {
+        type: launchSourceType === 'vault-directory' ? 'vault-directory' : 'vault-archive',
+        provenance: 'import-manifest',
+        displayName: name,
+        launch: {
+            method: 'spawn',
+            storageId: safeName,
+            manifestId
+        },
+        policy: {
+            allowedArgs: 'none',
+            canCloseFromWipesnap: true,
+            ownership: 'owned-process'
+        }
+    }
+}
+
+function rendererCapabilityEntry(appConfig, record) {
+    const displayName = appConfig.displayName || appConfig.name || record.displayName
+    return {
+        capabilityId: record.capabilityId,
+        displayName,
+        name: displayName,
+        enabled: appConfig.enabled !== false,
+        ...(appConfig.id ? { id: appConfig.id } : {})
+    }
 }
 
 function registerLaunchCapability(appConfig, provenance = 'main') {
-    if (!HOST_WORKSPACE_LAUNCH_TYPES.has(appConfig?.launchSourceType)) return appConfig
-    const reference = launchCapabilityReference(appConfig)
-    const capability = {
-        id: launchCapabilityIdFor(reference),
-        ...reference,
-        provenance,
-        issuedAt: new Date().toISOString()
+    const input = capabilityInputForHostLaunch(appConfig, provenance)
+    if (!input) return appConfig
+    const record = createCapabilityRecord(input)
+    pendingLaunchCapabilityRecords.set(record.capabilityId, record)
+    return {
+        ...appConfig,
+        ...rendererCapabilityEntry(appConfig, record)
     }
-    issuedLaunchCapabilities.set(capability.id, capability)
-    return { ...appConfig, launchCapabilityId: capability.id }
+}
+
+function registerImportedLaunchCapability(appConfig) {
+    const record = createCapabilityRecord(capabilityInputForImportedApp(appConfig))
+    pendingLaunchCapabilityRecords.set(record.capabilityId, record)
+    return rendererCapabilityEntry(appConfig, record)
+}
+
+function unsupportedBrowseResult(error) {
+    return { success: false, error }
+}
+
+function vaultRelativeSelectionPath(selectedPath, vaultDir) {
+    const relativePath = relative(vaultDir, selectedPath)
+    if (relativePath === '..' || relativePath.startsWith('..\\') || relativePath.startsWith('../') || isAbsolute(relativePath)) return null
+    return relativePath.replace(/\//g, '\\')
+}
+
+function storageIdFromVaultRelativePath(vaultRelativePath) {
+    const parts = String(vaultRelativePath || '').split(/[\\/]+/)
+    if (parts.length < 3 || parts[0].toLowerCase() !== 'apps' || !parts[1]) return ''
+    return parts[1]
+}
+
+function registerVaultLocalExecutableSelection(selectedPath, vaultDir) {
+    const vaultRelativePath = vaultRelativeSelectionPath(selectedPath, vaultDir)
+    if (vaultRelativePath == null) return null
+
+    const storageId = storageIdFromVaultRelativePath(vaultRelativePath)
+    if (!storageId) {
+        return unsupportedBrowseResult('USB-local executable selections must be inside Apps\\<imported-app> and match an imported app manifest.')
+    }
+
+    try {
+        const manifest = readAppManifest(vaultDir, storageId)
+        const { record, appConfig } = createVaultLocalExecutableCapability({
+            vaultRelativePath,
+            manifest,
+            id: Date.now()
+        })
+        pendingLaunchCapabilityRecords.set(record.capabilityId, record)
+        return appConfig
+    } catch (err) {
+        return unsupportedBrowseResult(err?.message || 'USB-local executable selection could not be verified.')
+    }
+}
+
+function unsupportedVaultLocalFolderSelection(selectedPath, vaultDir) {
+    const vaultRelativePath = vaultRelativeSelectionPath(selectedPath, vaultDir)
+    if (vaultRelativePath == null) return null
+    return unsupportedBrowseResult('USB-local folders cannot be added through the folder picker. Import the app or select its verified executable under Apps so a launch capability can be issued.')
 }
 
 function readStoredLaunchCapabilities(meta = loadVaultMeta()) {
@@ -438,8 +555,7 @@ function readMigrationManifest(manifestId, context = {}) {
 
 function legacyLaunchCapabilitiesForMigration(existingMeta = loadVaultMeta()) {
     return new Map([
-        ...readStoredLaunchCapabilities(existingMeta),
-        ...issuedLaunchCapabilities
+        ...readStoredLaunchCapabilities(existingMeta)
     ])
 }
 
@@ -460,6 +576,23 @@ function authorizeWorkspaceLaunchCapabilities(workspace, {
         changed: migrated.changed,
         capabilities: {}
     }
+}
+
+function authorizeRendererWorkspaceSave(workspace, {
+    existingWorkspace = null
+} = {}) {
+    return prepareRendererWorkspaceSave(workspace, {
+        existingCapabilityVault: existingWorkspace?.[WORKSPACE_CAPABILITY_VAULT_KEY] || null,
+        pendingCapabilityRecords: pendingLaunchCapabilityRecords
+    })
+}
+
+function rehydrateWorkspaceForMain(workspace, options = {}) {
+    return rehydrateWorkspaceLaunchCapabilities(workspace, {
+        capabilityVault: workspace?.[WORKSPACE_CAPABILITY_VAULT_KEY] || null,
+        manifestResolver: readMigrationManifest,
+        ...options
+    })
 }
 
 function mergeLaunchCapabilitiesIntoMeta(meta, migration = null) {
@@ -663,15 +796,16 @@ function registerIpcHandlers() {
 
             const existingMeta = loadVaultMeta()
             const existingWorkspace = loadActiveVaultWorkspace()
-            const authorized = authorizeWorkspaceLaunchCapabilities(workspace, { existingMeta, existingWorkspace })
+            const authorized = authorizeRendererWorkspaceSave(workspace, { existingWorkspace })
             const payload = { ...authorized.workspace, _honeyToken: HONEY_TOKEN }
             const driveInfo = await getDriveInfo()
             const encryptedVault = encrypt(payload, activeMasterPasswordBuffer.toString('utf-8'), driveInfo.driveType === 3)
 
             writeJsonFileAtomic(getVaultPath(), encryptedVault)
             saveVaultMeta(mergeLaunchCapabilitiesIntoMeta(existingMeta || { version: '1.0.0' }, authorized))
+            pendingLaunchCapabilityRecords.clear()
 
-            return { success: true }
+            return { success: true, workspace: sanitizeWorkspaceForRenderer(authorized.workspace) }
         } catch (e) {
             return { success: false, error: e.message }
         }
@@ -698,7 +832,7 @@ function registerIpcHandlers() {
             })
 
             const existingMeta = loadVaultMeta()
-            const authorized = authorizeWorkspaceLaunchCapabilities(workspace, { existingMeta, existingWorkspace })
+            const authorized = authorizeRendererWorkspaceSave(workspace, { existingWorkspace })
             const payload = { ...authorized.workspace, _honeyToken: HONEY_TOKEN }
             const encryptedVault = encrypt(payload, masterPassword, driveInfo.driveType === 3)
 
@@ -729,6 +863,7 @@ function registerIpcHandlers() {
 
             meta = mergeLaunchCapabilitiesIntoMeta(meta, authorized)
             saveVaultMeta(meta)
+            pendingLaunchCapabilityRecords.clear()
 
             // Cache the active master password so that subsequent actions 
             // (like secondary PIN/FastBoot toggles or Workspace edits) process correctly without requiring restart
@@ -919,16 +1054,16 @@ function registerIpcHandlers() {
 
         const vaultDir = getVaultDir()
         const selectedPath = result.filePaths[0]
-        if (selectedPath.startsWith(vaultDir)) {
-            return selectedPath.replace(vaultDir, '[USB]')
+        const vaultLocalSelection = registerVaultLocalExecutableSelection(selectedPath, vaultDir)
+        if (vaultLocalSelection) {
+            return vaultLocalSelection
         }
-        registerLaunchCapability({
+        return registerLaunchCapability({
             name: basename(selectedPath).replace(/\.(exe|bat|cmd)$/i, ''),
             path: selectedPath,
             launchSourceType: 'host-exe',
             launchMethod: 'spawn'
         }, 'browse-exe')
-        return selectedPath
     })
 
     trustedHandle('browse-folder', async () => {
@@ -940,16 +1075,16 @@ function registerIpcHandlers() {
 
         const vaultDir = getVaultDir()
         const selectedPath = result.filePaths[0]
-        if (selectedPath.startsWith(vaultDir)) {
-            return selectedPath.replace(vaultDir, '[USB]')
+        const vaultLocalSelection = unsupportedVaultLocalFolderSelection(selectedPath, vaultDir)
+        if (vaultLocalSelection) {
+            return vaultLocalSelection
         }
-        registerLaunchCapability({
+        return registerLaunchCapability({
             name: basename(selectedPath),
             path: selectedPath,
             launchSourceType: 'host-folder',
             launchMethod: 'shell-execute'
         }, 'browse-folder')
-        return selectedPath
     })
 
     // ─── App Scanner & Importer ────────────────────────────────────────────
@@ -1770,6 +1905,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
     trustedHandle('scan-stale-appdata', async () => {
         try {
             const workspace = loadActiveVaultWorkspace()
+            Object.assign(workspace, rehydrateWorkspaceForMain(workspace, { includeDisabled: true }))
             const payloads = await findStaleUnsupportedAppDataPayloads(workspace, getVaultDir(), {
                 onError: (desktopApp, err) => diagError('unsupported-appdata-scan', `${desktopApp?.name || desktopApp?.path || 'unknown'}: ${err.message}`)
             })
@@ -1784,6 +1920,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
             const { payloadIds } = validatePayloadIdsInput(input)
 
             const workspace = loadActiveVaultWorkspace()
+            Object.assign(workspace, rehydrateWorkspaceForMain(workspace, { includeDisabled: true }))
             const appDataRoot = join(getVaultDir(), 'AppData')
             const payloads = await findStaleUnsupportedAppDataPayloads(workspace, getVaultDir(), {
                 onError: (desktopApp, err) => diagError('unsupported-appdata-scan', `${desktopApp?.name || desktopApp?.path || 'unknown'}: ${err.message}`)
@@ -2331,23 +2468,20 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
             return {
                 success: true,
                 appConfig: {
-                    name,
-                    // Store the ORIGINAL relative exe path — launch flow will handle extraction
-                    path: `[USB]\\Apps\\${safeName}\\${exePathInApp}`,
-                    args: '',
+                    ...registerImportedLaunchCapability({
+                        name,
+                        safeName,
+                        manifestId: manifest.manifestId,
+                        id: Date.now(),
+                        enabled: true
+                    }),
                     portableData: !!effectiveImportData,
-                    manifestId: manifest.manifestId,
-                    launchProfile: manifest.launchProfile,
-                    dataProfile: manifest.dataProfile,
-                    readinessProfile: manifest.readinessProfile,
                     ...pickSupportFields(manifest),
                     importedDataSupported: importedDataCapability.importedDataSupported,
                     importedDataSupportLevel: importedDataCapability.importedDataSupportLevel,
                     importedDataAdapterId: importedDataCapability.importedDataAdapterId,
                     importedDataSupportReason: importedDataCapability.importedDataSupportReason,
-                    binaryArchivePolicyVersion: BINARY_ARCHIVE_POLICY_VERSION,
-                    id: Date.now(),
-                    enabled: true
+                    binaryArchivePolicyVersion: BINARY_ARCHIVE_POLICY_VERSION
                 }
             }
         } catch (err) {

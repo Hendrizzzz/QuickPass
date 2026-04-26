@@ -2,6 +2,7 @@ import { createHash } from 'crypto'
 import {
     createCapabilityRecord,
     createCapabilityStore,
+    validateCapabilityRecord,
     validateCapabilityId
 } from './capabilityStore.js'
 import {
@@ -64,6 +65,21 @@ const RAW_LAUNCH_AUTHORITY_FIELDS = new Set([
     'portableData',
     'launchAdapter',
     'runtimeAdapter'
+])
+const RENDERER_WORKSPACE_INTERNAL_FIELDS = new Set([
+    WORKSPACE_CAPABILITY_VAULT_KEY,
+    WORKSPACE_CAPABILITY_MIGRATION_REPORT_KEY
+])
+const RENDERER_CAPABILITY_ENTRY_KEYS = new Set([
+    'id',
+    'capabilityId',
+    'enabled',
+    'displayName',
+    'name',
+    'userArgs',
+    'quarantined',
+    'quarantineReason',
+    'quarantineCode'
 ])
 
 function fail(message) {
@@ -189,6 +205,14 @@ function normalizeWorkspaceShell(workspace) {
     }
 }
 
+function rejectRendererSuppliedInternalWorkspaceFields(value) {
+    for (const key of Object.keys(value || {})) {
+        if (RENDERER_WORKSPACE_INTERNAL_FIELDS.has(key)) {
+            fail(`workspace.${key} is main-owned capability metadata and cannot be supplied by the renderer.`)
+        }
+    }
+}
+
 function normalizeCapabilityWorkspaceEntry(appConfig, index) {
     const value = requireObject(appConfig, `workspace.desktopApps[${index}]`)
     const fieldPrefix = `workspace.desktopApps[${index}]`
@@ -216,6 +240,23 @@ function normalizeCapabilityWorkspaceEntry(appConfig, index) {
         }) || 'quarantined'
     }
     return next
+}
+
+function normalizeRendererCapabilityWorkspaceEntry(appConfig, index) {
+    const value = requireObject(appConfig, `workspace.desktopApps[${index}]`)
+    const fieldPrefix = `workspace.desktopApps[${index}]`
+
+    for (const key of Object.keys(value)) {
+        if (!RENDERER_CAPABILITY_ENTRY_KEYS.has(key)) {
+            fail(`${fieldPrefix}.${key} is not accepted from renderer workspace data.`)
+        }
+    }
+
+    const entry = normalizeCapabilityWorkspaceEntry(value, index)
+    if (!entry.quarantined && !entry.capabilityId) {
+        fail(`${fieldPrefix}.capabilityId is required.`)
+    }
+    return entry
 }
 
 function normalizeLegacyWorkspaceEntry(appConfig, index) {
@@ -470,11 +511,59 @@ function buildVaultCapabilityInput(appConfig, { manifestResolver } = {}) {
     }
 }
 
+export function createVaultLocalExecutableCapability({
+    vaultRelativePath,
+    manifest,
+    id,
+    randomBytes,
+    now = Date.now
+} = {}) {
+    const relativePath = normalizePathSeparators(normalizeString(vaultRelativePath, 'vaultRelativePath', {
+        required: true
+    })).replace(/^\\+/, '')
+    const parsed = parseUsbAppPath(`[USB]\\${relativePath}`)
+
+    if (!manifest || typeof manifest !== 'object') {
+        fail('USB-local executable browse requires a verified imported app manifest.')
+    }
+
+    const manifestId = manifest.manifestId || manifest.safeName || parsed.storageId
+    const appConfig = {
+        displayName: manifest.displayName || manifest.safeName || parsed.storageId,
+        name: manifest.displayName || manifest.safeName || parsed.storageId,
+        path: `[USB]\\${relativePath}`,
+        launchSourceType: 'vault-archive',
+        launchMethod: 'spawn',
+        manifestId,
+        enabled: true
+    }
+    includeDefined(appConfig, 'id', id)
+
+    const input = buildVaultCapabilityInput(appConfig, {
+        manifestResolver: () => manifest
+    })
+    const record = createCapabilityRecord(input, { randomBytes, now })
+    const displayName = normalizeDisplayName(input.displayName, record.displayName, 'vaultLocalBrowse.displayName')
+
+    return {
+        record,
+        appConfig: {
+            capabilityId: record.capabilityId,
+            displayName,
+            name: displayName,
+            path: appConfig.path,
+            launchSourceType: 'vault-archive',
+            launchMethod: 'spawn',
+            enabled: true,
+            ...(id !== undefined && id !== null && id !== '' ? { id } : {})
+        }
+    }
+}
+
 function createQuarantinedEntry(appConfig, reason, code = 'unverified-launch-reference') {
     const displayName = normalizeDisplayName(appConfig?.displayName || appConfig?.name, appConfig?.path || 'Quarantined app', 'quarantined.displayName')
     const next = {
         displayName,
-        name: displayName,
         enabled: false,
         quarantined: true,
         quarantineCode: code,
@@ -489,10 +578,12 @@ function createLimitedCapabilityEntry(appConfig, record) {
     const next = {
         capabilityId: record.capabilityId,
         displayName,
-        name: displayName,
         enabled: appConfig.enabled !== false
     }
     includeDefined(next, 'id', appConfig.id)
+    if (Array.isArray(appConfig.userArgs) && appConfig.userArgs.length > 0) {
+        next.userArgs = [...appConfig.userArgs]
+    }
     return next
 }
 
@@ -612,6 +703,58 @@ export function migrateWorkspaceLaunchCapabilities(workspace, {
         capabilityVault: migratedWorkspace[WORKSPACE_CAPABILITY_VAULT_KEY],
         migrationReport: report,
         changed
+    }
+}
+
+function addPendingCapabilityRecords(store, pendingCapabilityRecords) {
+    const values = pendingCapabilityRecords instanceof Map
+        ? [...pendingCapabilityRecords.values()]
+        : Array.isArray(pendingCapabilityRecords)
+            ? pendingCapabilityRecords
+            : isPlainObject(pendingCapabilityRecords)
+                ? Object.values(pendingCapabilityRecords)
+                : []
+
+    for (const record of values) {
+        store.put(validateCapabilityRecord(record))
+    }
+}
+
+export function prepareRendererWorkspaceSave(workspace, {
+    existingCapabilityVault = null,
+    pendingCapabilityRecords = null
+} = {}) {
+    const workspaceInput = requireObject(workspace || {}, 'workspace')
+    rejectRendererSuppliedInternalWorkspaceFields(workspaceInput)
+
+    const shell = normalizeWorkspaceShell(workspaceInput)
+    const sourceStore = createCapabilityStore({ vaultValue: existingCapabilityVault || null })
+    addPendingCapabilityRecords(sourceStore, pendingCapabilityRecords)
+
+    const persistedStore = createCapabilityStore()
+    const desktopApps = shell.desktopApps.map((appConfig, index) => {
+        const entry = normalizeRendererCapabilityWorkspaceEntry(appConfig, index)
+        if (entry.quarantined) {
+            return createQuarantinedEntry(entry, entry.quarantineReason || 'This app entry is quarantined.', entry.quarantineCode || 'quarantined')
+        }
+
+        const record = sourceStore.require(entry.capabilityId)
+        requireAllowedUserArgs(entry, record)
+        persistedStore.put(record)
+        return createLimitedCapabilityEntry(entry, record)
+    })
+
+    return {
+        workspace: {
+            ...('name' in shell ? { name: shell.name } : {}),
+            webTabs: shell.webTabs,
+            desktopApps,
+            [WORKSPACE_CAPABILITY_VAULT_KEY]: persistedStore.toVaultValue()
+        },
+        capabilityVault: persistedStore.toVaultValue(),
+        migrationReport: null,
+        changed: true,
+        capabilities: {}
     }
 }
 
@@ -739,5 +882,27 @@ export function rehydrateWorkspaceLaunchCapabilities(workspace, {
         ...('name' in normalizedWorkspace ? { name: normalizedWorkspace.name } : {}),
         webTabs: normalizedWorkspace.webTabs,
         desktopApps
+    }
+}
+
+export function sanitizeWorkspaceForRenderer(workspace) {
+    const shell = normalizeWorkspaceShell(workspace || {})
+    return {
+        ...('name' in shell ? { name: shell.name } : {}),
+        webTabs: shell.webTabs,
+        desktopApps: shell.desktopApps.map((appConfig, index) => {
+            if (isPlainObject(appConfig) && appConfig.quarantined === true) {
+                const entry = normalizeCapabilityWorkspaceEntry(appConfig, index)
+                return createQuarantinedEntry(entry, entry.quarantineReason || 'This app entry is quarantined.', entry.quarantineCode || 'quarantined')
+            }
+            if (isPlainObject(appConfig) && appConfig.capabilityId && !hasRawLaunchAuthority(appConfig)) {
+                return normalizeCapabilityWorkspaceEntry(appConfig, index)
+            }
+            return createQuarantinedEntry(
+                isPlainObject(appConfig) ? appConfig : {},
+                'Stored app entry still contains raw launch authority and was not exposed to the renderer.',
+                'raw-launch-authority'
+            )
+        })
     }
 }

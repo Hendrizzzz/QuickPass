@@ -61,6 +61,28 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const isManualHostExePath = (path) => /\.exe$/i.test(String(path || '').trim())
     const isManualAbsoluteHostPath = (path) => /^[a-z]:\\/i.test(String(path || '').trim())
     const isHostLaunchForm = (form = appForm) => HOST_LAUNCH_SOURCE_TYPES.has(form.launchSourceType) || isManualHostExePath(form.path)
+    const getAppDisplayName = (app) => app?.name || app?.displayName || ''
+    const toCapabilityWorkspaceEntry = (app) => {
+        if (app?.quarantined) {
+            return {
+                id: app.id,
+                displayName: getAppDisplayName(app) || 'Quarantined app',
+                enabled: false,
+                quarantined: true,
+                quarantineReason: app.quarantineReason,
+                quarantineCode: app.quarantineCode
+            }
+        }
+        const displayName = getAppDisplayName(app)
+        return {
+            id: app.id,
+            capabilityId: app.capabilityId,
+            displayName,
+            name: displayName,
+            enabled: app.enabled !== false
+        }
+    }
+    const toCapabilityWorkspace = (apps) => apps.map(toCapabilityWorkspaceEntry)
 
     const createManualHostExeFields = (name) => ({
         supportTier: 'launch-only',
@@ -120,32 +142,56 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         importedDataSupportReason: 'Folders do not have portable app data management.'
     })
 
+    const handleUnsupportedBrowseSelection = (selected) => {
+        if (selected?.success !== false) return false
+        setError(selected.error || 'Selected app cannot be added.')
+        return true
+    }
+
     const browseExe = async () => {
-        const filePath = await window.omnilaunch.browseExe()
-        if (filePath) {
-            const name = filePath.split('\\').pop().replace('.exe', '')
-            setAppForm({
-                ...appForm,
-                path: filePath,
-                name,
-                portableData: false,
-                ...createManualHostExeFields(name)
-            })
+        const selected = await window.omnilaunch.browseExe()
+        if (!selected || handleUnsupportedBrowseSelection(selected)) return
+
+        const filePath = typeof selected === 'string' ? selected : selected.path
+        if (!filePath) {
+            setError('Selected executable did not include a launch capability.')
+            return
         }
+        const name = selected.displayName || selected.name || filePath.split('\\').pop().replace('.exe', '')
+        const selectedFields = typeof selected === 'object' ? selected : {}
+        const hostSupportFields = selectedFields.launchSourceType === 'vault-archive' || selectedFields.launchSourceType === 'vault-directory'
+            ? {}
+            : createManualHostExeFields(name)
+        setError('')
+        setAppForm({
+            ...appForm,
+            ...hostSupportFields,
+            ...selectedFields,
+            path: filePath,
+            name,
+            portableData: false
+        })
     }
 
     const browseFolder = async () => {
-        const folderPath = await window.omnilaunch.browseFolder()
-        if (folderPath) {
-            const name = folderPath.split('\\').pop()
-            setAppForm({
-                name,
-                path: folderPath,
-                args: appForm.args || '',
-                portableData: false,
-                ...createManualHostFolderFields()
-            })
+        const selected = await window.omnilaunch.browseFolder()
+        if (!selected || handleUnsupportedBrowseSelection(selected)) return
+
+        const folderPath = typeof selected === 'string' ? selected : selected.path
+        if (!folderPath) {
+            setError('Selected folder did not include a launch capability.')
+            return
         }
+        const name = selected.displayName || selected.name || folderPath.split('\\').pop()
+        setError('')
+        setAppForm({
+            ...(typeof selected === 'object' ? selected : {}),
+            name,
+            path: folderPath,
+            args: appForm.args || '',
+            portableData: false,
+            ...createManualHostFolderFields()
+        })
     }
 
     const scanInstalledApps = async () => {
@@ -185,7 +231,10 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     }
 
     const addDesktopApp = () => {
-        if (!appForm.path.trim()) return
+        if (!appForm.capabilityId) {
+            setError('Select an app or folder from the picker before adding it.')
+            return
+        }
         const isKnownHostLaunch = HOST_LAUNCH_SOURCE_TYPES.has(appForm.launchSourceType)
         const isHostExe = isManualHostExePath(appForm.path) && !isKnownHostLaunch
         const isHostFolder = isManualAbsoluteHostPath(appForm.path) && !isHostExe && !isKnownHostLaunch
@@ -198,7 +247,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
             id: Date.now(),
             enabled: true
         }
-        setDesktopApps([...desktopApps, nextApp])
+        setDesktopApps([...desktopApps, toCapabilityWorkspaceEntry(nextApp)])
         setAppForm({ name: '', path: '', args: '', portableData: false })
         setShowAppForm(false)
     }
@@ -239,9 +288,10 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const handleSaveClick = async () => {
         setSaving(true)
         setError('')
-        const result = await window.omnilaunch.saveWorkspace({ webTabs, desktopApps })
+        const workspacePayload = { webTabs, desktopApps: toCapabilityWorkspace(desktopApps) }
+        const result = await window.omnilaunch.saveWorkspace(workspacePayload)
         if (result.success) {
-            onSave(false, { webTabs, desktopApps })
+            onSave(false, result.workspace || workspacePayload)
         } else {
             setError(result.error || 'Save failed')
             setSaving(false)
@@ -260,7 +310,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
             currentPassword: currentMasterPassword,
             pin: null, // Wipe PIN securely when password changes
             fastBoot: false, // Wipe FastBoot securely when password changes
-            workspace: { webTabs, desktopApps }
+            workspace: { webTabs, desktopApps: toCapabilityWorkspace(desktopApps) }
         })
 
         if (result.success) {
@@ -675,7 +725,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                 </div>
                                 <div className="flex-1 min-w-0">
                                     <div className="flex items-center gap-1.5">
-                                        <p className="text-sm text-white truncate">{dApp.name}</p>
+                                        <p className="text-sm text-white truncate">{getAppDisplayName(dApp)}</p>
                                         {dApp.portableData && (
                                             <span className="px-1.5 py-0.5 rounded text-[10px] bg-blue-900/40 text-blue-400 border border-blue-800/40 flex-shrink-0">Portable</span>
                                         )}
@@ -685,7 +735,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                             </span>
                                         )}
                                     </div>
-                                    <p className="text-xs text-muted truncate">{dApp.path}</p>
+                                    <p className="text-xs text-muted truncate">{dApp.path || dApp.quarantineReason || 'Launch capability saved'}</p>
                                     {dApp.args && (
                                         <p className="text-[10px] text-[#b8c7ff] truncate">Args: {dApp.args}</p>
                                     )}
@@ -890,7 +940,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                 <ImportAppsModal
                     onClose={() => setShowImportModal(false)}
                     onImportComplete={(importedApps) => {
-                        setDesktopApps(prev => [...prev, ...importedApps])
+                        setDesktopApps(prev => [...prev, ...toCapabilityWorkspace(importedApps)])
                         setShowImportModal(false)
                     }}
                 />
