@@ -31,7 +31,8 @@ export default function UnlockScreen({ driveInfo, vaultMeta, onUnlock }) {
             setError(result.message)
             setPin('')
         } else if (result.error === 'PIN_LOCKED') {
-            setError('Too many PIN attempts. Try again in about a minute.')
+            const retrySeconds = Math.max(1, Math.ceil((result.retryAfterMs || 60_000) / 1000))
+            setError(`Too many PIN attempts. Try again in about ${retrySeconds} seconds.`)
             setPin('')
             setLoading(false)
         } else {

@@ -71,6 +71,7 @@ test('sanitized metadata contains no capability authority or summaries', () => {
         'fastBoot',
         'hardwareMismatch',
         'hasPIN',
+        'hiddenMaster',
         'isRemovable',
         'supportsConvenienceUnlock',
         'version'

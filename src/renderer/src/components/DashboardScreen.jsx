@@ -29,19 +29,23 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const [usePin, setUsePin] = useState(false)
     const [pin, setPin] = useState('')
     const [confirmPin, setConfirmPin] = useState('')
+    const [securityPinProof, setSecurityPinProof] = useState('')
     const [fastBoot, setFastBoot] = useState(false)
     const [clearCacheOnExit, setClearCacheOnExit] = useState(true) // default ON = zero footprint
+    const [securityMeta, setSecurityMeta] = useState(vaultMeta || null)
 
     // Read the freshest meta from disk on mount to perfectly sync security UI toggles
     useEffect(() => {
         const fetchMeta = async () => {
             const latestMeta = await window.omnilaunch.loadVaultMeta()
             if (latestMeta) {
+                setSecurityMeta(latestMeta)
                 setUsePin(latestMeta.hasPIN || false)
                 setFastBoot(latestMeta.fastBoot || false)
                 setClearCacheOnExit(latestMeta.clearCacheOnExit !== false) // default ON
             } else if (vaultMeta) {
                 // Fallback to prop if fetch fails
+                setSecurityMeta(vaultMeta)
                 setUsePin(vaultMeta.hasPIN || false)
                 setFastBoot(vaultMeta.fastBoot || false)
                 setClearCacheOnExit(vaultMeta.clearCacheOnExit !== false)
@@ -56,6 +60,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const [captureSuccess, setCaptureSuccess] = useState(false)
     const isInSessionMode = sessionMode !== null
     const hasUnsavedAppChanges = JSON.stringify(desktopApps) !== JSON.stringify(workspace?.desktopApps || [])
+    const hiddenMasterRequiresPinProof = !!securityMeta?.hiddenMaster && usePin
 
     const HOST_LAUNCH_SOURCE_TYPES = new Set(['host-exe', 'host-folder', 'registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app'])
     const isManualHostExePath = (path) => /\.exe$/i.test(String(path || '').trim())
@@ -330,23 +335,35 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         setSaving(false)
     }
 
+    const requireSecurityPinProof = () => {
+        if (!hiddenMasterRequiresPinProof) return null
+        if (securityPinProof.length !== 4) {
+            setError('Current PIN is required')
+            return false
+        }
+        return securityPinProof
+    }
+
     const handleUpdatePin = async () => {
         if (pin.length !== 4) return setError('PIN must be exactly 4 digits')
         if (pin !== confirmPin) return setError('PINs do not match')
+        const freshPin = requireSecurityPinProof()
+        if (freshPin === false) return
 
         setSaving(true)
         setError('')
-        const result = await window.omnilaunch.updatePin(pin)
+        const result = await window.omnilaunch.updatePin(pin, freshPin)
 
         if (result.success) {
             setUsePin(true)
             setPin('')
             setConfirmPin('')
+            setSecurityPinProof('')
             setExpandedSecurityOption(null)
             setError('PIN updated successfully!')
             setTimeout(() => setError(''), 3000)
         } else {
-            setError(result.error || 'PIN update failed')
+            setError(result.error === 'PIN_LOCKED' ? 'Too many PIN attempts. Try again later.' : result.error || 'PIN update failed')
         }
         setSaving(false)
     }
@@ -357,19 +374,22 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
             setError('Enable Fast Boot first - PIN is your only unlock method on USB drives')
             return
         }
+        const freshPin = requireSecurityPinProof()
+        if (freshPin === false) return
         setSaving(true)
         setError('')
-        const result = await window.omnilaunch.updatePin(null)
+        const result = await window.omnilaunch.updatePin(null, freshPin)
 
         if (result.success) {
             setUsePin(false)
             setPin('')
             setConfirmPin('')
+            setSecurityPinProof('')
             setExpandedSecurityOption(null)
             setError('PIN disabled.')
             setTimeout(() => setError(''), 3000)
         } else {
-            setError(result.error || 'Failed to disable PIN')
+            setError(result.error === 'PIN_LOCKED' ? 'Too many PIN attempts. Try again later.' : result.error || 'Failed to disable PIN')
         }
         setSaving(false)
     }
@@ -381,12 +401,15 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
             setError('Enable PIN first - Fast Boot is your only unlock method on USB drives')
             return
         }
+        const freshPin = requireSecurityPinProof()
+        if (freshPin === false) return
         setError('')
-        const result = await window.omnilaunch.updateFastBoot(newState)
+        const result = await window.omnilaunch.updateFastBoot(newState, freshPin)
         if (result.success) {
             setFastBoot(newState)
+            setSecurityPinProof('')
         } else {
-            setError('Failed to update FastBoot')
+            setError(result.error === 'PIN_LOCKED' ? 'Too many PIN attempts. Try again later.' : result.error || 'Failed to update FastBoot')
         }
     }
 
@@ -797,6 +820,21 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                     </div>
 
                     <div className="flex flex-col gap-2">
+
+                        {hiddenMasterRequiresPinProof && (
+                            <div className="border border-[#2a2a3a] rounded-md bg-[#14141c] p-3">
+                                <p className="text-xs text-muted mb-2">Current PIN</p>
+                                <input
+                                    type="password"
+                                    className={`form-input text-center tracking-[0.2em] ${error && error.includes('PIN') ? 'error' : ''}`}
+                                    placeholder="Current PIN"
+                                    maxLength={4}
+                                    inputMode="numeric"
+                                    value={securityPinProof}
+                                    onChange={(e) => { setSecurityPinProof(e.target.value.replace(/\D/g, '').slice(0, 4)); setError('') }}
+                                />
+                            </div>
+                        )}
 
                         {/* Master Password Accordion (Local PC Only) */}
                         {!driveInfo?.isRemovable && (

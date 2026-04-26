@@ -98,6 +98,15 @@ import {
     writeJsonFileDurable
 } from './vaultDurability.js'
 import {
+    assertPinAttemptAllowed,
+    clearPinLockout,
+    ensureVaultId,
+    isHiddenMasterVault,
+    isApprovedPinLockoutResetMethod,
+    recordPinAttemptFailure,
+    requireFreshPinProofForMediumRisk
+} from './pinLockout.js'
+import {
     createImportedAppLookup,
     reserveAppStorageId
 } from './importReservations.js'
@@ -266,6 +275,7 @@ function validateSaveVaultSecurityInput(input) {
         currentPassword: input.currentPassword ? validatePasswordInput(input.currentPassword, 'currentPassword') : '',
         pin: validatePinInput(input.pin),
         fastBoot: validateBooleanInput(input.fastBoot, 'fastBoot'),
+        hiddenMaster: validateBooleanInput(input.hiddenMaster, 'hiddenMaster'),
         workspace: input.workspace || {}
     }
 }
@@ -401,12 +411,6 @@ function authorizeWorkspaceLaunchCapabilities(workspace, options = {}) {
 
 // ─── Cryptographic Memory Buffer ───────────────────────────────────────────────
 let activeMasterPasswordBuffer = null
-const PIN_MAX_FAILURES = 5
-const PIN_LOCKOUT_MS = 60_000
-const pinUnlockState = {
-    failedAttempts: 0,
-    lockedUntil: 0
-}
 let factoryResetToken = null
 
 function setActiveMasterPassword(password) {
@@ -449,27 +453,64 @@ function requireConvenienceUnlockDrive(driveInfo, featureName) {
     })
 }
 
-function resetPinUnlockFailures() {
-    pinUnlockState.failedAttempts = 0
-    pinUnlockState.lockedUntil = 0
+function resetPinUnlockFailures(options = {}) {
+    const { driveInfo = null, scope = 'exact', method = '' } = options
+    if (!isApprovedPinLockoutResetMethod(method)) return
+    const meta = options.meta || loadVaultMeta()
+    if (!meta) return
+    clearPinLockout({
+        statePath: getStatePath(),
+        meta,
+        driveInfo: driveInfo || {},
+        scope
+    })
 }
 
-function assertPinUnlockAllowed() {
-    const now = Date.now()
-    if (pinUnlockState.lockedUntil > now) {
-        const retryAfterMs = pinUnlockState.lockedUntil - now
-        const err = new Error('PIN temporarily locked')
-        err.code = 'PIN_LOCKED'
-        err.retryAfterMs = retryAfterMs
-        throw err
-    }
+function assertPinUnlockAllowed(meta, driveInfo) {
+    return assertPinAttemptAllowed({
+        statePath: getStatePath(),
+        meta,
+        driveInfo
+    })
 }
 
-function recordPinUnlockFailure() {
-    pinUnlockState.failedAttempts += 1
-    if (pinUnlockState.failedAttempts >= PIN_MAX_FAILURES) {
-        pinUnlockState.lockedUntil = Date.now() + PIN_LOCKOUT_MS
+function recordPinUnlockFailure(meta, driveInfo) {
+    return recordPinAttemptFailure({
+        statePath: getStatePath(),
+        meta,
+        driveInfo
+    })
+}
+
+function approveFreshPinReauthForMediumRisk({ meta, driveInfo, pin }) {
+    return requireFreshPinProofForMediumRisk({
+        statePath: getStatePath(),
+        meta,
+        driveInfo,
+        pin,
+        activeMasterPassword: getActiveMasterPasswordText(),
+        decryptVault: decrypt
+    })
+}
+
+function normalizePinUpdateRequest(input) {
+    if (input && typeof input === 'object' && !Array.isArray(input)) {
+        return {
+            pin: input.pin,
+            freshPin: input.freshPin || input.currentPin || null
+        }
     }
+    return { pin: input, freshPin: null }
+}
+
+function normalizeFastBootUpdateRequest(input) {
+    if (input && typeof input === 'object' && !Array.isArray(input)) {
+        return {
+            enable: input.enable,
+            freshPin: input.freshPin || input.currentPin || null
+        }
+    }
+    return { enable: input, freshPin: null }
 }
 
 function createFactoryResetToken(webContentsId) {
@@ -630,14 +671,17 @@ function registerIpcHandlers() {
     })
 
     // --- Isolated Security Handlers ---
-    trustedHandle('update-pin', async (_, newPin) => {
+    trustedHandle('update-pin', async (_, input) => {
         try {
-            const safePin = validatePinInput(newPin)
+            const request = normalizePinUpdateRequest(input)
+            const safePin = validatePinInput(request.pin)
             requireActiveSession()
             const driveInfo = await getDriveInfo()
             requireConvenienceUnlockDrive(driveInfo, 'PIN')
 
             let meta = loadVaultMeta() || { version: '1.0.0', createdOn: driveInfo.serialNumber, isRemovable: driveInfo.isRemovable }
+            const hiddenMaster = isHiddenMasterVault(meta)
+            approveFreshPinReauthForMediumRisk({ meta, driveInfo, pin: request.freshPin })
 
             if (safePin) {
                 const pinKey = safePin + ':' + driveInfo.serialNumber
@@ -651,21 +695,29 @@ function registerIpcHandlers() {
                 delete meta.pinVault
                 meta.hasPIN = false
             }
+            meta.vaultId = ensureVaultId(meta)
+            if (hiddenMaster) meta.hiddenMaster = true
             saveVaultMeta(meta, 'update-pin')
             return { success: true }
         } catch (e) {
-            return { success: false, error: e.message }
+            if (e.code === 'PIN_LOCKED') {
+                return { success: false, error: 'PIN_LOCKED', retryAfterMs: e.retryAfterMs }
+            }
+            return { success: false, error: e.message, code: e.code }
         }
     })
 
-    trustedHandle('update-fastboot', async (_, enable) => {
+    trustedHandle('update-fastboot', async (_, input) => {
         try {
-            const safeEnable = validateBooleanInput(enable, 'enable')
+            const request = normalizeFastBootUpdateRequest(input)
+            const safeEnable = validateBooleanInput(request.enable, 'enable')
             requireActiveSession()
             const driveInfo = await getDriveInfo()
             requireConvenienceUnlockDrive(driveInfo, 'FastBoot')
 
             let meta = loadVaultMeta() || { version: '1.0.0', createdOn: driveInfo.serialNumber, isRemovable: driveInfo.isRemovable }
+            const hiddenMaster = isHiddenMasterVault(meta)
+            approveFreshPinReauthForMediumRisk({ meta, driveInfo, pin: request.freshPin })
 
             if (safeEnable) {
                 const serialKey = 'FASTBOOT:' + driveInfo.serialNumber
@@ -679,10 +731,15 @@ function registerIpcHandlers() {
                 delete meta.fastBootVault
                 meta.fastBoot = false
             }
+            meta.vaultId = ensureVaultId(meta)
+            if (hiddenMaster) meta.hiddenMaster = true
             saveVaultMeta(meta, 'update-fastboot')
             return { success: true }
         } catch (e) {
-            return { success: false, error: e.message }
+            if (e.code === 'PIN_LOCKED') {
+                return { success: false, error: 'PIN_LOCKED', retryAfterMs: e.retryAfterMs }
+            }
+            return { success: false, error: e.message, code: e.code }
         }
     })
 
@@ -703,15 +760,16 @@ function registerIpcHandlers() {
     })
 
     trustedHandle('unlock-with-pin', async (_, pin) => {
+        let meta = null
+        let driveInfo = null
         try {
-            assertPinUnlockAllowed()
             const safePin = validatePinInput(pin, { allowNull: false })
-            const meta = loadVaultMeta()
+            meta = loadVaultMeta()
             if (!meta || !meta.hasPIN || !meta.pinVault) {
                 return { success: false, error: 'PIN not configured' }
             }
 
-            const driveInfo = await getDriveInfo()
+            driveInfo = await getDriveInfo()
             requireConvenienceUnlockDrive(driveInfo, 'PIN')
 
             if (meta.createdOn !== driveInfo.serialNumber) {
@@ -722,6 +780,7 @@ function registerIpcHandlers() {
                 }
             }
 
+            assertPinUnlockAllowed(meta, driveInfo)
             const pinKey = safePin + ':' + driveInfo.serialNumber
             const { masterPassword } = decrypt(meta.pinVault, pinKey)
 
@@ -734,14 +793,20 @@ function registerIpcHandlers() {
 
             // Cache the actual master password for future localized state saves / setting updates
             setActiveMasterPassword(masterPassword)
-            resetPinUnlockFailures()
+            resetPinUnlockFailures({ meta, driveInfo, scope: 'exact', method: 'fresh-pin' })
 
             return { success: true, workspace }
         } catch (e) {
             if (e.code === 'PIN_LOCKED') {
                 return { success: false, error: 'PIN_LOCKED', retryAfterMs: e.retryAfterMs }
             }
-            recordPinUnlockFailure()
+            if (meta && driveInfo) {
+                try {
+                    recordPinUnlockFailure(meta, driveInfo)
+                } catch (_) {
+                    return { success: false, error: 'PIN_LOCKOUT_UNAVAILABLE' }
+                }
+            }
             return { success: false, error: 'Invalid PIN' }
         }
     })
@@ -749,6 +814,7 @@ function registerIpcHandlers() {
     trustedHandle('unlock-with-password', async (_, password) => {
         try {
             const safePassword = validatePasswordInput(password)
+            const meta = loadVaultMeta()
             const encryptedVault = readVaultFile()
             let workspace = decrypt(encryptedVault, safePassword)
 
@@ -757,7 +823,8 @@ function registerIpcHandlers() {
 
             // Cache the actual master password for future localized state saves / setting updates
             setActiveMasterPassword(safePassword)
-            resetPinUnlockFailures()
+            const driveInfo = await getDriveInfo()
+            resetPinUnlockFailures({ meta, driveInfo, scope: 'vault', method: 'master-password' })
 
             return { success: true, workspace }
         } catch (e) {
@@ -789,7 +856,6 @@ function registerIpcHandlers() {
 
             // Store the master password for session state encryption
             setActiveMasterPassword(masterPassword)
-            resetPinUnlockFailures()
 
             return { success: true, workspace }
         } catch (e) {

@@ -165,11 +165,13 @@ test('save vault validation normalizes security fields', () => {
         masterPassword: 'correct horse battery staple',
         pin: '1234',
         fastBoot: true,
+        hiddenMaster: true,
         workspace: { webTabs: [], desktopApps: [] }
     })
 
     assert.equal(payload.pin, '1234')
     assert.equal(payload.fastBoot, true)
+    assert.equal(payload.hiddenMaster, true)
     assert.deepEqual(payload.workspace.webTabs, [])
 })
 

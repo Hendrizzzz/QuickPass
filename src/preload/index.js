@@ -13,8 +13,8 @@ contextBridge.exposeInMainWorld('omnilaunch', {
     factoryReset: (data) => ipcRenderer.invoke('factory-reset', data),
 
     // Security Modular Updates
-    updatePin: (newPin) => ipcRenderer.invoke('update-pin', newPin),
-    updateFastBoot: (enable) => ipcRenderer.invoke('update-fastboot', enable),
+    updatePin: (pin, freshPin) => ipcRenderer.invoke('update-pin', { pin, freshPin }),
+    updateFastBoot: (enable, freshPin) => ipcRenderer.invoke('update-fastboot', { enable, freshPin }),
     updateClearCache: (enable) => ipcRenderer.invoke('update-clear-cache', enable),
 
     // Unlock

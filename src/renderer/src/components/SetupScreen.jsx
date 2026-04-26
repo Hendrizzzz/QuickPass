@@ -124,6 +124,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
             masterPassword: supportsConvenienceUnlock ? hiddenMasterPassword : masterPassword,
             pin: supportsConvenienceUnlock && pin ? pin : null,
             fastBoot: supportsConvenienceUnlock ? fastBoot : false,
+            hiddenMaster: !!supportsConvenienceUnlock,
             workspace
         })
 

@@ -2,6 +2,7 @@ import { basename, isAbsolute, relative } from 'path'
 import { createCapabilityRecord, normalizeCapabilityArgsPolicy } from './capabilityStore.js'
 import { readAppManifest } from './appManifest.js'
 import { stripLaunchCapabilityMaterialFromMeta } from './vaultMetadata.js'
+import { ensureVaultId, isHiddenMasterVault } from './pinLockout.js'
 import {
     WORKSPACE_CAPABILITY_VAULT_KEY,
     createVaultLocalExecutableCapability,
@@ -332,9 +333,10 @@ export async function saveWorkspaceHandlerCore({ workspace, state, deps }) {
 
 export async function saveVaultHandlerCore({ input, state, deps }) {
     try {
-        const { masterPassword, currentPassword, pin, fastBoot, workspace } = deps.validateSaveVaultSecurityInput(input)
+        const { masterPassword, currentPassword, pin, fastBoot, hiddenMaster, workspace } = deps.validateSaveVaultSecurityInput(input)
         const driveInfo = await deps.getDriveInfo()
         const vaultExists = deps.vaultExists()
+        const existingMeta = deps.loadVaultMeta ? deps.loadVaultMeta() : null
         let existingWorkspace = null
 
         if (vaultExists) {
@@ -355,9 +357,13 @@ export async function saveVaultHandlerCore({ input, state, deps }) {
 
         let meta = {
             version: '1.0.0',
+            vaultId: ensureVaultId(existingMeta || {}),
             createdOn: driveInfo.serialNumber,
             isRemovable: driveInfo.isRemovable,
-            fastBoot: false
+            fastBoot: false,
+            hiddenMaster: vaultExists
+                ? isHiddenMasterVault(existingMeta)
+                : !!(driveInfo.isRemovable && driveInfo.serialNumber && driveInfo.serialNumber !== 'UNKNOWN' && (hiddenMaster || pin || fastBoot))
         }
 
         if (pin) {
@@ -382,7 +388,7 @@ export async function saveVaultHandlerCore({ input, state, deps }) {
         })
         pendingRecordsForState(state).clear()
         deps.setActiveMasterPassword(masterPassword)
-        deps.resetPinUnlockFailures()
+        deps.resetPinUnlockFailures({ meta, driveInfo, scope: 'vault', method: 'master-password' })
 
         return { success: true }
     } catch (e) {

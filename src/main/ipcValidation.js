@@ -446,6 +446,7 @@ export function validateSaveVaultInput(value) {
         currentPassword: payload.currentPassword ? validatePasswordInput(payload.currentPassword, 'currentPassword') : '',
         pin: validatePinInput(payload.pin),
         fastBoot: normalizeBoolean(payload.fastBoot, 'fastBoot', false),
+        hiddenMaster: normalizeBoolean(payload.hiddenMaster, 'hiddenMaster', false),
         workspace: validateWorkspaceInput(payload.workspace || {})
     }
 }

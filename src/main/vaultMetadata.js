@@ -1,3 +1,5 @@
+import { isHiddenMasterVault } from './pinLockout.js'
+
 const LAUNCH_CAPABILITY_META_KEYS = [
     'launchCapabilityVault',
     'capabilityVault',
@@ -29,6 +31,7 @@ export function sanitizeVaultMetaForRenderer(meta, driveInfo) {
         version: meta.version || '1.0.0',
         hasPIN: !!meta.hasPIN,
         fastBoot: !!meta.fastBoot,
+        hiddenMaster: isHiddenMasterVault(meta),
         clearCacheOnExit: meta.clearCacheOnExit !== false,
         isRemovable: !!meta.isRemovable,
         createdOnMatchesCurrentDrive,
