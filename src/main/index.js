@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, dialog, session } from 'electron'
-import { join, basename, relative, isAbsolute } from 'path'
+import { join, basename } from 'path'
 import { pathToFileURL } from 'url'
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, rmSync, renameSync, unlinkSync, openSync, closeSync } from 'fs'
 import { execSync, spawn, exec, execFile } from 'child_process'
@@ -9,7 +9,6 @@ const execAsync = util.promisify(exec)
 const execFileAsync = util.promisify(execFile)
 import crypto from 'crypto'
 import { launchWorkspace, launchSessionSetup, captureSession, captureCurrentSession, closeBrowser, closeDesktopApps, emergencyKillDesktopAppsSync, onBrowserAllClosed, hasActiveBrowserSession, wipeLocalTraces, wipeAllLocalProfiles, wipeAllLocalAppData, wipeLocalAppCache, wipeAllRuntimeAppProfiles, runDiagnostics, diagError, beginDiagnosticsCycle } from './engine.js'
-import { createCapabilityRecord } from './capabilityStore.js'
 import {
     APPDATA_SKIP_DIRS,
     BINARY_ARCHIVE_EXCLUDE_DIRS,
@@ -79,13 +78,21 @@ import {
 } from './processControlHandlers.js'
 import {
     WORKSPACE_CAPABILITY_VAULT_KEY,
-    createVaultLocalExecutableCapability,
     migrateWorkspaceLaunchCapabilities,
-    migrationReportToMetadataSummary,
-    prepareRendererWorkspaceSave,
-    sanitizeWorkspaceForRenderer,
-    rehydrateWorkspaceLaunchCapabilities
+    sanitizeWorkspaceForRenderer
 } from './workspaceCapabilityMigration.js'
+import {
+    browseExecutableHandlerCore,
+    browseFolderHandlerCore,
+    createWorkspaceCapabilityHandlerState,
+    launchWorkspaceHandlerCore,
+    mergeLaunchCapabilitiesIntoMeta,
+    registerImportedLaunchCapability,
+    registerLaunchCapability,
+    rehydrateWorkspaceForMain,
+    saveVaultHandlerCore,
+    saveWorkspaceHandlerCore
+} from './workspaceCapabilityHandlers.js'
 
 // Phase 11: The Honey Token
 const HONEY_TOKEN = {
@@ -377,165 +384,7 @@ async function loadVaultMetaForRenderer() {
     return sanitizeVaultMetaForRenderer(meta, await getDriveInfo())
 }
 
-const HOST_WORKSPACE_LAUNCH_TYPES = new Set([
-    'host-exe',
-    'host-folder',
-    'registry-uninstall',
-    'app-paths',
-    'start-menu-shortcut',
-    'shell-execute',
-    'protocol-uri',
-    'packaged-app'
-])
-
-const pendingLaunchCapabilityRecords = new Map()
-
-function launchCapabilityPolicyForType(type) {
-    const ownedProcessTypes = new Set([
-        'host-exe',
-        'registry-uninstall',
-        'app-paths',
-        'start-menu-shortcut'
-    ])
-    return {
-        allowedArgs: 'none',
-        canCloseFromWipesnap: ownedProcessTypes.has(type),
-        ownership: ownedProcessTypes.has(type) ? 'owned-process' : 'external'
-    }
-}
-
-function capabilityInputForHostLaunch(appConfig, provenance) {
-    const type = appConfig?.launchSourceType
-    if (!HOST_WORKSPACE_LAUNCH_TYPES.has(type)) return null
-
-    const launch = {
-        method: appConfig.launchMethod || (type === 'host-folder' || type === 'shell-execute'
-            ? 'shell-execute'
-            : type === 'protocol-uri'
-                ? 'protocol'
-                : type === 'packaged-app'
-                    ? 'packaged-app'
-                    : 'spawn')
-    }
-
-    if (type === 'protocol-uri') {
-        launch.uri = appConfig.path
-    } else {
-        launch.path = appConfig.path
-    }
-
-    const optionalFields = {
-        'registry-uninstall': ['registryKey', 'registryDisplayName', 'registryInstallLocation', 'registryDisplayIcon'],
-        'app-paths': ['appPathsKey', 'appPathsExecutableName', 'appPathsPathValue'],
-        'start-menu-shortcut': ['shortcutPath', 'shortcutTargetPath', 'shortcutArguments', 'shortcutWorkingDirectory', 'shortcutIconLocation'],
-        'shell-execute': ['shortcutPath', 'shortcutTargetPath', 'shortcutArguments', 'shortcutWorkingDirectory', 'shortcutIconLocation'],
-        'protocol-uri': ['protocolScheme', 'protocolCommand', 'protocolRegistryKey'],
-        'packaged-app': ['packagedAppId']
-    }
-
-    for (const key of optionalFields[type] || []) {
-        if (appConfig[key]) launch[key] = appConfig[key]
-    }
-
-    return {
-        type,
-        provenance,
-        displayName: appConfig.displayName || appConfig.name || basename(String(appConfig.path || 'App')),
-        launch,
-        policy: launchCapabilityPolicyForType(type)
-    }
-}
-
-function capabilityInputForImportedApp({ name, safeName, manifestId, launchSourceType = 'vault-archive' }) {
-    return {
-        type: launchSourceType === 'vault-directory' ? 'vault-directory' : 'vault-archive',
-        provenance: 'import-manifest',
-        displayName: name,
-        launch: {
-            method: 'spawn',
-            storageId: safeName,
-            manifestId
-        },
-        policy: {
-            allowedArgs: 'none',
-            canCloseFromWipesnap: true,
-            ownership: 'owned-process'
-        }
-    }
-}
-
-function rendererCapabilityEntry(appConfig, record) {
-    const displayName = appConfig.displayName || appConfig.name || record.displayName
-    return {
-        capabilityId: record.capabilityId,
-        displayName,
-        name: displayName,
-        enabled: appConfig.enabled !== false,
-        ...(appConfig.id ? { id: appConfig.id } : {})
-    }
-}
-
-function registerLaunchCapability(appConfig, provenance = 'main') {
-    const input = capabilityInputForHostLaunch(appConfig, provenance)
-    if (!input) return appConfig
-    const record = createCapabilityRecord(input)
-    pendingLaunchCapabilityRecords.set(record.capabilityId, record)
-    return {
-        ...appConfig,
-        ...rendererCapabilityEntry(appConfig, record)
-    }
-}
-
-function registerImportedLaunchCapability(appConfig) {
-    const record = createCapabilityRecord(capabilityInputForImportedApp(appConfig))
-    pendingLaunchCapabilityRecords.set(record.capabilityId, record)
-    return rendererCapabilityEntry(appConfig, record)
-}
-
-function unsupportedBrowseResult(error) {
-    return { success: false, error }
-}
-
-function vaultRelativeSelectionPath(selectedPath, vaultDir) {
-    const relativePath = relative(vaultDir, selectedPath)
-    if (relativePath === '..' || relativePath.startsWith('..\\') || relativePath.startsWith('../') || isAbsolute(relativePath)) return null
-    return relativePath.replace(/\//g, '\\')
-}
-
-function storageIdFromVaultRelativePath(vaultRelativePath) {
-    const parts = String(vaultRelativePath || '').split(/[\\/]+/)
-    if (parts.length < 3 || parts[0].toLowerCase() !== 'apps' || !parts[1]) return ''
-    return parts[1]
-}
-
-function registerVaultLocalExecutableSelection(selectedPath, vaultDir) {
-    const vaultRelativePath = vaultRelativeSelectionPath(selectedPath, vaultDir)
-    if (vaultRelativePath == null) return null
-
-    const storageId = storageIdFromVaultRelativePath(vaultRelativePath)
-    if (!storageId) {
-        return unsupportedBrowseResult('USB-local executable selections must be inside Apps\\<imported-app> and match an imported app manifest.')
-    }
-
-    try {
-        const manifest = readAppManifest(vaultDir, storageId)
-        const { record, appConfig } = createVaultLocalExecutableCapability({
-            vaultRelativePath,
-            manifest,
-            id: Date.now()
-        })
-        pendingLaunchCapabilityRecords.set(record.capabilityId, record)
-        return appConfig
-    } catch (err) {
-        return unsupportedBrowseResult(err?.message || 'USB-local executable selection could not be verified.')
-    }
-}
-
-function unsupportedVaultLocalFolderSelection(selectedPath, vaultDir) {
-    const vaultRelativePath = vaultRelativeSelectionPath(selectedPath, vaultDir)
-    if (vaultRelativePath == null) return null
-    return unsupportedBrowseResult('USB-local folders cannot be added through the folder picker. Import the app or select its verified executable under Apps so a launch capability can be issued.')
-}
+const workspaceCapabilityState = createWorkspaceCapabilityHandlerState()
 
 function readStoredLaunchCapabilities(meta = loadVaultMeta()) {
     const records = meta?.launchCapabilities
@@ -576,33 +425,6 @@ function authorizeWorkspaceLaunchCapabilities(workspace, {
         changed: migrated.changed,
         capabilities: {}
     }
-}
-
-function authorizeRendererWorkspaceSave(workspace, {
-    existingWorkspace = null
-} = {}) {
-    return prepareRendererWorkspaceSave(workspace, {
-        existingCapabilityVault: existingWorkspace?.[WORKSPACE_CAPABILITY_VAULT_KEY] || null,
-        pendingCapabilityRecords: pendingLaunchCapabilityRecords
-    })
-}
-
-function rehydrateWorkspaceForMain(workspace, options = {}) {
-    return rehydrateWorkspaceLaunchCapabilities(workspace, {
-        capabilityVault: workspace?.[WORKSPACE_CAPABILITY_VAULT_KEY] || null,
-        manifestResolver: readMigrationManifest,
-        ...options
-    })
-}
-
-function mergeLaunchCapabilitiesIntoMeta(meta, migration = null) {
-    const next = { ...(meta || { version: '1.0.0' }) }
-    delete next.launchCapabilities
-
-    const report = migration?.migrationReport || null
-    const summary = migrationReportToMetadataSummary(report)
-    if (summary) next.launchCapabilityMigration = summary
-    return next
 }
 
 // ─── Cryptographic Memory Buffer ───────────────────────────────────────────────
@@ -744,6 +566,31 @@ function createProcessControlHandlerDeps() {
     }
 }
 
+function createWorkspaceCapabilityHandlerDeps() {
+    return {
+        requireActiveSession,
+        requireUnlockedOrNoVault,
+        showOpenDialog: (options) => dialog.showOpenDialog(options),
+        getVaultDir,
+        readAppManifest,
+        loadVaultMeta,
+        saveVaultMeta,
+        loadActiveVaultWorkspace,
+        getDriveInfo,
+        getActiveMasterPassword: getActiveMasterPasswordText,
+        encryptVault: encrypt,
+        decryptVault: decrypt,
+        readVault: () => JSON.parse(readFileSync(getVaultPath(), 'utf-8')),
+        writeVault: (encryptedVault) => writeJsonFileAtomic(getVaultPath(), encryptedVault),
+        validateSaveVaultSecurityInput,
+        vaultExists: () => existsSync(getVaultPath()),
+        requireConvenienceUnlockRequestSupported,
+        setActiveMasterPassword,
+        resetPinUnlockFailures,
+        honeyToken: HONEY_TOKEN
+    }
+}
+
 function trustedHandle(channel, handler) {
     ipcMain.handle(channel, async (event, ...args) => {
         try {
@@ -791,89 +638,19 @@ function registerIpcHandlers() {
     })
 
     trustedHandle('save-workspace', async (_, workspace) => {
-        try {
-            requireActiveSession()
-
-            const existingMeta = loadVaultMeta()
-            const existingWorkspace = loadActiveVaultWorkspace()
-            const authorized = authorizeRendererWorkspaceSave(workspace, { existingWorkspace })
-            const payload = { ...authorized.workspace, _honeyToken: HONEY_TOKEN }
-            const driveInfo = await getDriveInfo()
-            const encryptedVault = encrypt(payload, activeMasterPasswordBuffer.toString('utf-8'), driveInfo.driveType === 3)
-
-            writeJsonFileAtomic(getVaultPath(), encryptedVault)
-            saveVaultMeta(mergeLaunchCapabilitiesIntoMeta(existingMeta || { version: '1.0.0' }, authorized))
-            pendingLaunchCapabilityRecords.clear()
-
-            return { success: true, workspace: sanitizeWorkspaceForRenderer(authorized.workspace) }
-        } catch (e) {
-            return { success: false, error: e.message }
-        }
+        return saveWorkspaceHandlerCore({
+            workspace,
+            state: workspaceCapabilityState,
+            deps: createWorkspaceCapabilityHandlerDeps()
+        })
     })
 
     trustedHandle('save-vault', async (_, input) => {
-        try {
-            const { masterPassword, currentPassword, pin, fastBoot, workspace } = validateSaveVaultSecurityInput(input)
-            const driveInfo = await getDriveInfo()
-            const vaultExists = existsSync(getVaultPath())
-            let existingWorkspace = null
-
-            if (vaultExists) {
-                requireActiveSession()
-                if (!currentPassword) throw new Error('Current password is required to change the vault password.')
-                const existingVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
-                decrypt(existingVault, currentPassword)
-                existingWorkspace = loadActiveVaultWorkspace()
-            }
-            requireConvenienceUnlockRequestSupported({
-                requested: !!(pin || fastBoot),
-                driveInfo,
-                featureName: 'Convenience unlock'
-            })
-
-            const existingMeta = loadVaultMeta()
-            const authorized = authorizeRendererWorkspaceSave(workspace, { existingWorkspace })
-            const payload = { ...authorized.workspace, _honeyToken: HONEY_TOKEN }
-            const encryptedVault = encrypt(payload, masterPassword, driveInfo.driveType === 3)
-
-            writeJsonFileAtomic(getVaultPath(), encryptedVault)
-
-            let meta = {
-                version: '1.0.0',
-                createdOn: driveInfo.serialNumber,
-                isRemovable: driveInfo.isRemovable,
-                fastBoot: false
-            }
-
-            if (pin) {
-                const pinKey = pin + ':' + driveInfo.serialNumber
-                const encryptedMasterPw = encrypt({ masterPassword }, pinKey)
-                meta.pinVault = encryptedMasterPw
-                meta.hasPIN = true
-            } else {
-                meta.hasPIN = false
-            }
-
-            if (fastBoot) {
-                const serialKey = 'FASTBOOT:' + driveInfo.serialNumber
-                const encryptedMasterPw = encrypt({ masterPassword }, serialKey)
-                meta.fastBootVault = encryptedMasterPw
-                meta.fastBoot = true
-            }
-
-            meta = mergeLaunchCapabilitiesIntoMeta(meta, authorized)
-            saveVaultMeta(meta)
-            pendingLaunchCapabilityRecords.clear()
-
-            // Cache the active master password so that subsequent actions 
-            // (like secondary PIN/FastBoot toggles or Workspace edits) process correctly without requiring restart
-            setActiveMasterPassword(masterPassword)
-            resetPinUnlockFailures()
-
-            return { success: true }
-        } catch (e) {
-            return { success: false, error: e.message }
-        }
+        return saveVaultHandlerCore({
+            input,
+            state: workspaceCapabilityState,
+            deps: createWorkspaceCapabilityHandlerDeps()
+        })
     })
 
     // --- Isolated Security Handlers ---
@@ -1045,46 +822,17 @@ function registerIpcHandlers() {
     })
 
     trustedHandle('browse-exe', async () => {
-        requireUnlockedOrNoVault()
-        const result = await dialog.showOpenDialog({
-            properties: ['openFile'],
-            filters: [{ name: 'Executables', extensions: ['exe', 'bat', 'cmd'] }]
+        return browseExecutableHandlerCore({
+            state: workspaceCapabilityState,
+            deps: createWorkspaceCapabilityHandlerDeps()
         })
-        if (result.canceled) return null
-
-        const vaultDir = getVaultDir()
-        const selectedPath = result.filePaths[0]
-        const vaultLocalSelection = registerVaultLocalExecutableSelection(selectedPath, vaultDir)
-        if (vaultLocalSelection) {
-            return vaultLocalSelection
-        }
-        return registerLaunchCapability({
-            name: basename(selectedPath).replace(/\.(exe|bat|cmd)$/i, ''),
-            path: selectedPath,
-            launchSourceType: 'host-exe',
-            launchMethod: 'spawn'
-        }, 'browse-exe')
     })
 
     trustedHandle('browse-folder', async () => {
-        requireUnlockedOrNoVault()
-        const result = await dialog.showOpenDialog({
-            properties: ['openDirectory']
+        return browseFolderHandlerCore({
+            state: workspaceCapabilityState,
+            deps: createWorkspaceCapabilityHandlerDeps()
         })
-        if (result.canceled) return null
-
-        const vaultDir = getVaultDir()
-        const selectedPath = result.filePaths[0]
-        const vaultLocalSelection = unsupportedVaultLocalFolderSelection(selectedPath, vaultDir)
-        if (vaultLocalSelection) {
-            return vaultLocalSelection
-        }
-        return registerLaunchCapability({
-            name: basename(selectedPath),
-            path: selectedPath,
-            launchSourceType: 'host-folder',
-            launchMethod: 'shell-execute'
-        }, 'browse-folder')
     })
 
     // ─── App Scanner & Importer ────────────────────────────────────────────
@@ -1905,7 +1653,10 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
     trustedHandle('scan-stale-appdata', async () => {
         try {
             const workspace = loadActiveVaultWorkspace()
-            Object.assign(workspace, rehydrateWorkspaceForMain(workspace, { includeDisabled: true }))
+            Object.assign(workspace, rehydrateWorkspaceForMain(workspace, {
+                manifestResolver: readMigrationManifest,
+                includeDisabled: true
+            }))
             const payloads = await findStaleUnsupportedAppDataPayloads(workspace, getVaultDir(), {
                 onError: (desktopApp, err) => diagError('unsupported-appdata-scan', `${desktopApp?.name || desktopApp?.path || 'unknown'}: ${err.message}`)
             })
@@ -1920,7 +1671,10 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
             const { payloadIds } = validatePayloadIdsInput(input)
 
             const workspace = loadActiveVaultWorkspace()
-            Object.assign(workspace, rehydrateWorkspaceForMain(workspace, { includeDisabled: true }))
+            Object.assign(workspace, rehydrateWorkspaceForMain(workspace, {
+                manifestResolver: readMigrationManifest,
+                includeDisabled: true
+            }))
             const appDataRoot = join(getVaultDir(), 'AppData')
             const payloads = await findStaleUnsupportedAppDataPayloads(workspace, getVaultDir(), {
                 onError: (desktopApp, err) => diagError('unsupported-appdata-scan', `${desktopApp?.name || desktopApp?.path || 'unknown'}: ${err.message}`)
@@ -1976,7 +1730,10 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                 const key = `${String(result.launchSourceType || '').toLowerCase()}:${String(result.name).toLowerCase()}:${String(result.path).toLowerCase()}`
                 if (seen.has(key)) return
                 seen.add(key)
-                results.push(registerLaunchCapability(result, 'host-scan'))
+                results.push(registerLaunchCapability(result, {
+                    state: workspaceCapabilityState,
+                    provenance: 'host-scan'
+                }))
             }
 
             for (const entry of entries) {
@@ -2474,7 +2231,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                         manifestId: manifest.manifestId,
                         id: Date.now(),
                         enabled: true
-                    }),
+                    }, { state: workspaceCapabilityState }),
                     portableData: !!effectiveImportData,
                     ...pickSupportFields(manifest),
                     importedDataSupported: importedDataCapability.importedDataSupported,
@@ -2695,117 +2452,85 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
     })
 
     // ─── Launch Workspace Engine ─────────────────────────────────────────
-    trustedHandle('launch-workspace', async (event) => {
-        try {
-            const win = BrowserWindow.fromWebContents(event.sender)
-            const vaultWorkspace = loadActiveVaultWorkspace()
-            const authorized = authorizeWorkspaceLaunchCapabilities(vaultWorkspace, {
-                existingMeta: loadVaultMeta(),
-                existingWorkspace: vaultWorkspace
-            })
-            await persistMigratedWorkspaceIfChanged(
-                authorized.workspace,
-                activeMasterPasswordBuffer.toString('utf-8'),
-                authorized
-            )
-            const safeWorkspace = rehydrateWorkspaceLaunchCapabilities(authorized.workspace, {
-                capabilityVault: authorized.capabilityVault,
-                manifestResolver: readMigrationManifest
-            })
-
-            // Phase 12: Dynamically resolve [USB] portable macros back into absolute paths
-            if (safeWorkspace && safeWorkspace.desktopApps) {
-                safeWorkspace.desktopApps = safeWorkspace.desktopApps.map(app => {
-                    if (app.path && app.path.startsWith('[USB]')) {
-                        return { ...app, path: app.path.replace('[USB]', vaultDir) }
+    const hostLaunchTypes = ['host-folder', 'registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app']
+    const prepareLaunchWorkspaceConfigForLaunch = async (safeWorkspace) => {
+        const launchWorkspaceConfig = {
+            ...safeWorkspace,
+            desktopApps: (safeWorkspace.desktopApps || []).map((desktopApp) => {
+                try {
+                    if (hostLaunchTypes.includes(desktopApp?.launchSourceType)) {
+                        return desktopApp
                     }
-                    return app
-                })
-            }
-
-            // Phase 16: Fire-and-forget — the ENTIRE sequence (close previous + launch new)
-            // runs asynchronously so the IPC response is instant and the UI stays responsive.
-            const doLaunch = async () => {
-                beginDiagnosticsCycle('launch')
-                await closeBrowser()
-                await closeDesktopApps()
-                const launchWorkspaceConfig = {
-                    ...safeWorkspace,
-                    desktopApps: (safeWorkspace.desktopApps || []).map((desktopApp) => {
-                        try {
-                            if (['host-folder', 'registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app'].includes(desktopApp?.launchSourceType)) {
-                                return desktopApp
-                            }
-                            const repair = repairLegacyAppConfig(desktopApp, vaultDir)
-                            return {
-                                ...repair.appConfig,
-                                ...(repair.manifest ? { manifest: repair.manifest } : {})
-                            }
-                        } catch (err) {
-                            diagError('app-legacy-repair', `${desktopApp.name || desktopApp.path}: ${err.message}`)
-                            return desktopApp
-                        }
-                    })
-                }
-                launchWorkspaceConfig.desktopApps = await Promise.all((launchWorkspaceConfig.desktopApps || []).map(async (desktopApp) => {
-                    if (!['host-folder', 'registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app'].includes(desktopApp?.launchSourceType)) return desktopApp
-                    try {
-                        if (desktopApp.launchSourceType === 'host-folder') {
-                            return desktopApp
-                        }
-                        if (desktopApp.launchSourceType === 'registry-uninstall') {
-                            return await resolveRegistryUninstallLaunchReference(desktopApp)
-                        }
-                        if (desktopApp.launchSourceType === 'app-paths') {
-                            return await resolveAppPathsLaunchReference(desktopApp)
-                        }
-                        if (desktopApp.launchSourceType === 'start-menu-shortcut') {
-                            return await resolveStartMenuShortcutLaunchReference(desktopApp)
-                        }
-                        if (desktopApp.launchSourceType === 'shell-execute') {
-                            return await resolveShellExecuteLaunchReference(desktopApp)
-                        }
-                        if (desktopApp.launchSourceType === 'protocol-uri') {
-                            return await resolveProtocolUriLaunchReference(desktopApp)
-                        }
-                        return await resolvePackagedAppLaunchReference(desktopApp)
-                    } catch (err) {
-                        diagError('host-launch-resolve', `${desktopApp.name || desktopApp.path}: ${err.message}`)
-                        return {
-                            ...desktopApp,
-                            ...resolveHostLaunchFailureSupportFields(desktopApp, 'missing-on-this-PC'),
-                            hostResolution: {
-                                status: 'missing-on-this-PC',
-                                reason: err.message,
-                                resolvedAt: Date.now()
-                            }
-                        }
+                    const repair = repairLegacyAppConfig(desktopApp, vaultDir)
+                    return {
+                        ...repair.appConfig,
+                        ...(repair.manifest ? { manifest: repair.manifest } : {})
                     }
-                }))
-
-                return launchWorkspace(launchWorkspaceConfig, (statusMsg) => {
-                    if (win && !win.isDestroyed()) {
-                        win.webContents.send('launch-status', statusMsg)
-                    }
-                }, vaultDir, { skipDiagnosticsCycle: true })
-            }
-
-            doLaunch().then((results) => {
-                if (win && !win.isDestroyed()) {
-                    win.webContents.send('launch-complete', { success: true, results })
-                }
-            }).catch((err) => {
-                diagError('launch-workspace', err.message)
-                if (win && !win.isDestroyed()) {
-                    win.webContents.send('launch-complete', { success: false, error: err.message })
+                } catch (err) {
+                    diagError('app-legacy-repair', `${desktopApp.name || desktopApp.path}: ${err.message}`)
+                    return desktopApp
                 }
             })
-
-            // Return immediately — status updates come via 'launch-status' events
-            return { success: true }
-        } catch (err) {
-            return { success: false, error: err.message }
         }
+
+        launchWorkspaceConfig.desktopApps = await Promise.all((launchWorkspaceConfig.desktopApps || []).map(async (desktopApp) => {
+            if (!hostLaunchTypes.includes(desktopApp?.launchSourceType)) return desktopApp
+            try {
+                if (desktopApp.launchSourceType === 'host-folder') {
+                    return desktopApp
+                }
+                if (desktopApp.launchSourceType === 'registry-uninstall') {
+                    return await resolveRegistryUninstallLaunchReference(desktopApp)
+                }
+                if (desktopApp.launchSourceType === 'app-paths') {
+                    return await resolveAppPathsLaunchReference(desktopApp)
+                }
+                if (desktopApp.launchSourceType === 'start-menu-shortcut') {
+                    return await resolveStartMenuShortcutLaunchReference(desktopApp)
+                }
+                if (desktopApp.launchSourceType === 'shell-execute') {
+                    return await resolveShellExecuteLaunchReference(desktopApp)
+                }
+                if (desktopApp.launchSourceType === 'protocol-uri') {
+                    return await resolveProtocolUriLaunchReference(desktopApp)
+                }
+                return await resolvePackagedAppLaunchReference(desktopApp)
+            } catch (err) {
+                diagError('host-launch-resolve', `${desktopApp.name || desktopApp.path}: ${err.message}`)
+                return {
+                    ...desktopApp,
+                    ...resolveHostLaunchFailureSupportFields(desktopApp, 'missing-on-this-PC'),
+                    hostResolution: {
+                        status: 'missing-on-this-PC',
+                        reason: err.message,
+                        resolvedAt: Date.now()
+                    }
+                }
+            }
+        }))
+        return launchWorkspaceConfig
+    }
+
+    trustedHandle('launch-workspace', async (event) => {
+        return launchWorkspaceHandlerCore({
+            event,
+            deps: {
+                getWindowFromSender: (sender) => BrowserWindow.fromWebContents(sender),
+                loadActiveVaultWorkspace,
+                loadVaultMeta,
+                authorizeWorkspaceLaunchCapabilities,
+                persistMigratedWorkspaceIfChanged,
+                getActiveMasterPassword: getActiveMasterPasswordText,
+                manifestResolver: readMigrationManifest,
+                getVaultDir,
+                beginDiagnosticsCycle: () => beginDiagnosticsCycle('launch'),
+                closeBrowser,
+                closeDesktopApps,
+                prepareLaunchWorkspaceConfig: prepareLaunchWorkspaceConfigForLaunch,
+                launchWorkspace,
+                onLaunchError: (err) => diagError('launch-workspace', err.message)
+            }
+        })
     })
 
     // ─── Window Controls ─────────────────────────────────────────────────
