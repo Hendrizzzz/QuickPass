@@ -5,6 +5,7 @@ import {
     createCapabilityStore,
     generateCapabilityId,
     validateCapabilityRecord,
+    validateCapabilityUserArgs,
     validateCapabilityVaultValue
 } from '../src/main/capabilityStore.js'
 
@@ -143,6 +144,69 @@ test('validateCapabilityRecord normalizes a strict vault capability schema', () 
             lastVerifiedAt: FIXED_NOW
         }
     })
+})
+
+test('capability argument policy defaults to none and requires explicit bounded allowlists', () => {
+    const defaultRecord = createCapabilityRecord(hostExeInput({
+        policy: {
+            canCloseFromWipesnap: true,
+            ownership: 'owned-process'
+        }
+    }), {
+        randomBytes: bytes(0x0d),
+        now: FIXED_NOW
+    })
+
+    assert.equal(defaultRecord.policy.allowedArgs, 'none')
+    assert.throws(() => validateCapabilityUserArgs(['--profile=Work'], defaultRecord), /does not allow/)
+
+    const allowlisted = createCapabilityRecord(hostExeInput({
+        policy: {
+            allowedArgs: 'allowlist',
+            allowedPrefixes: ['--profile', '--safe-mode'],
+            maxArgs: 2,
+            maxArgLength: 20,
+            canCloseFromWipesnap: true,
+            ownership: 'owned-process'
+        }
+    }), {
+        randomBytes: bytes(0x0e),
+        now: FIXED_NOW
+    })
+
+    assert.deepEqual(
+        validateCapabilityUserArgs(['--profile=Work', '--safe-mode'], allowlisted),
+        ['--profile=Work', '--safe-mode']
+    )
+    assert.throws(() => validateCapabilityUserArgs(['--profile=Work', '--debug'], allowlisted), /outside its allowlist/)
+    assert.throws(() => validateCapabilityUserArgs(['--profile=Work', '--safe-mode', '--profile=Other'], allowlisted), /too many/)
+    assert.throws(() => validateCapabilityUserArgs([`--profile=${'x'.repeat(32)}`], allowlisted), /overlong/)
+
+    assert.throws(() => createCapabilityRecord(hostExeInput({
+        policy: {
+            allowedArgs: 'allowlist',
+            allowedPrefixes: ['--profile'],
+            maxArgs: 33,
+            canCloseFromWipesnap: true,
+            ownership: 'owned-process'
+        }
+    }), {
+        randomBytes: bytes(0x0f),
+        now: FIXED_NOW
+    }), /maxArgs cannot exceed 32/)
+
+    assert.throws(() => createCapabilityRecord(hostExeInput({
+        policy: {
+            allowedArgs: 'allowlist',
+            allowedPrefixes: ['--profile'],
+            maxArgLength: 1025,
+            canCloseFromWipesnap: true,
+            ownership: 'owned-process'
+        }
+    }), {
+        randomBytes: bytes(0x10),
+        now: FIXED_NOW
+    }), /maxArgLength cannot exceed 1024/)
 })
 
 test('capability store creates, reads, clones, and serializes encrypted-vault-shaped records', () => {

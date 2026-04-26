@@ -1,5 +1,5 @@
 import { basename, isAbsolute, relative } from 'path'
-import { createCapabilityRecord } from './capabilityStore.js'
+import { createCapabilityRecord, normalizeCapabilityArgsPolicy } from './capabilityStore.js'
 import { readAppManifest } from './appManifest.js'
 import {
     WORKSPACE_CAPABILITY_VAULT_KEY,
@@ -90,7 +90,19 @@ function capabilityInputForHostLaunch(appConfig, provenance) {
     }
 }
 
-function capabilityInputForImportedApp({ name, safeName, manifestId, launchSourceType = 'vault-archive' }) {
+function importedManifestArgsPolicy(manifest) {
+    if (manifest?.launchArgsPolicy == null) return {}
+    if (typeof manifest.launchArgsPolicy !== 'object' || Array.isArray(manifest.launchArgsPolicy)) {
+        throw new Error('Imported app manifest launchArgsPolicy must be an object.')
+    }
+    const argsPolicy = normalizeCapabilityArgsPolicy(
+        manifest.launchArgsPolicy,
+        'imported app manifest launchArgsPolicy'
+    )
+    return argsPolicy.allowedArgs === 'none' ? {} : argsPolicy
+}
+
+function capabilityInputForImportedApp({ name, safeName, manifestId, launchSourceType = 'vault-archive', manifest = null }) {
     return {
         type: launchSourceType === 'vault-directory' ? 'vault-directory' : 'vault-archive',
         provenance: 'import-manifest',
@@ -102,6 +114,7 @@ function capabilityInputForImportedApp({ name, safeName, manifestId, launchSourc
         },
         policy: {
             allowedArgs: 'none',
+            ...importedManifestArgsPolicy(manifest),
             canCloseFromWipesnap: true,
             ownership: 'owned-process'
         }

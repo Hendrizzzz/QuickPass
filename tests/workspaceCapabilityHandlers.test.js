@@ -3,6 +3,7 @@ import { test } from 'node:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { createCapabilityRecord } from '../src/main/capabilityStore.js'
 import {
     browseExecutableHandlerCore,
     browseFolderHandlerCore,
@@ -437,6 +438,56 @@ test('launch-workspace fails closed before process side effects when encrypted v
 
         assert.equal(result.success, false)
         assert.match(result.error, /missing, stale, or unavailable/)
+        assert.equal(harness.calls.closeBrowser, 0)
+        assert.equal(harness.calls.closeDesktopApps, 0)
+        assert.equal(harness.calls.launchedWorkspace, null)
+        assert.equal(harness.calls.launchPromise, null)
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('launch-workspace fails closed before process side effects when persisted args violate capability policy', async () => {
+    const harness = createHarness()
+    try {
+        const record = createCapabilityRecord({
+            type: 'host-exe',
+            provenance: 'browse-exe',
+            displayName: 'Verified App',
+            launch: {
+                path: 'C:\\Program Files\\Verified\\Verified.exe'
+            },
+            policy: {
+                allowedArgs: 'allowlist',
+                allowedPrefixes: ['--profile'],
+                maxArgs: 1,
+                maxArgLength: 32,
+                canCloseFromWipesnap: true,
+                ownership: 'owned-process'
+            }
+        })
+        harness.writeWorkspace({
+            desktopApps: [{
+                capabilityId: record.capabilityId,
+                displayName: 'Verified App',
+                enabled: true,
+                userArgs: ['--debug']
+            }],
+            [WORKSPACE_CAPABILITY_VAULT_KEY]: {
+                version: 1,
+                records: {
+                    [record.capabilityId]: record
+                }
+            }
+        })
+
+        const result = await launchWorkspaceHandlerCore({
+            event: { sender: { id: 1 } },
+            deps: harness.createLaunchDeps()
+        })
+
+        assert.equal(result.success, false)
+        assert.match(result.error, /outside its allowlist/)
         assert.equal(harness.calls.closeBrowser, 0)
         assert.equal(harness.calls.closeDesktopApps, 0)
         assert.equal(harness.calls.launchedWorkspace, null)

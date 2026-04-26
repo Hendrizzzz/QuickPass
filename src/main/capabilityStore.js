@@ -41,6 +41,11 @@ export const CAPABILITY_ARGS_POLICIES = Object.freeze([
     'allowlist'
 ])
 
+export const DEFAULT_CAPABILITY_MAX_ARGS = 8
+export const DEFAULT_CAPABILITY_MAX_ARG_LENGTH = 256
+export const MAX_CAPABILITY_ARGS = 32
+export const MAX_CAPABILITY_ARG_LENGTH = 1024
+
 const TYPE_SET = new Set(CAPABILITY_TYPES)
 const METHOD_SET = new Set(CAPABILITY_LAUNCH_METHODS)
 const OWNERSHIP_SET = new Set(CAPABILITY_OWNERSHIP_POLICIES)
@@ -182,6 +187,13 @@ const POLICY_KEYS = new Set([
     'ownership'
 ])
 
+const ARGS_POLICY_KEYS = new Set([
+    'allowedArgs',
+    'allowedPrefixes',
+    'maxArgs',
+    'maxArgLength'
+])
+
 const VERIFICATION_KEYS = new Set([
     'lastVerifiedAt',
     'hostFingerprint'
@@ -251,9 +263,10 @@ function normalizeBoolean(value, fieldName, defaultValue = false) {
     return value
 }
 
-function normalizePositiveInteger(value, fieldName, defaultValue) {
+function normalizeBoundedPositiveInteger(value, fieldName, defaultValue, maxValue) {
     if (value == null) return defaultValue
-    if (!Number.isSafeInteger(value) || value < 0) fail(`${fieldName} must be a non-negative safe integer.`)
+    if (!Number.isSafeInteger(value) || value < 1) fail(`${fieldName} must be a positive safe integer.`)
+    if (value > maxValue) fail(`${fieldName} cannot exceed ${maxValue}.`)
     return value
 }
 
@@ -414,30 +427,92 @@ function normalizeLaunch(launch, type) {
     return next
 }
 
+function normalizeArgsPolicyFields(value, fieldName, { rejectUnknown = true } = {}) {
+    if (rejectUnknown) rejectUnknownKeys(value, ARGS_POLICY_KEYS, fieldName)
+
+    const allowedArgs = normalizeEnum(value.allowedArgs ?? 'none', `${fieldName}.allowedArgs`, ARGS_POLICY_SET)
+    const next = { allowedArgs }
+
+    if (allowedArgs === 'allowlist') {
+        const prefixes = Array.isArray(value.allowedPrefixes) ? value.allowedPrefixes : []
+        if (prefixes.length === 0) fail(`${fieldName}.allowedPrefixes is required when allowedArgs is allowlist.`)
+        if (prefixes.length > MAX_ARG_PREFIXES) fail(`${fieldName}.allowedPrefixes cannot contain more than ${MAX_ARG_PREFIXES} entries.`)
+        next.allowedPrefixes = prefixes.map((prefix, index) => normalizeString(prefix, `${fieldName}.allowedPrefixes[${index}]`, {
+            max: MAX_POLICY_STRING_LENGTH
+        }))
+        next.maxArgs = normalizeBoundedPositiveInteger(
+            value.maxArgs,
+            `${fieldName}.maxArgs`,
+            DEFAULT_CAPABILITY_MAX_ARGS,
+            MAX_CAPABILITY_ARGS
+        )
+        next.maxArgLength = normalizeBoundedPositiveInteger(
+            value.maxArgLength,
+            `${fieldName}.maxArgLength`,
+            DEFAULT_CAPABILITY_MAX_ARG_LENGTH,
+            MAX_CAPABILITY_ARG_LENGTH
+        )
+    } else if (value.allowedPrefixes != null || value.maxArgs != null || value.maxArgLength != null) {
+        fail(`${fieldName} argument allowlist fields require allowedArgs to be allowlist.`)
+    }
+
+    return next
+}
+
+export function normalizeCapabilityArgsPolicy(policy, fieldName = 'capability args policy') {
+    const value = policy == null ? {} : requirePlainObject(policy, fieldName)
+    return normalizeArgsPolicyFields(value, fieldName)
+}
+
+export function normalizeCapabilityUserArgs(value, fieldName = 'userArgs') {
+    if (value == null || value === '') return []
+    if (!Array.isArray(value)) fail(`${fieldName} must be an array.`)
+    if (value.length > MAX_CAPABILITY_ARGS) fail(`${fieldName} cannot contain more than ${MAX_CAPABILITY_ARGS} arguments.`)
+    return value.map((arg, index) => normalizeString(arg, `${fieldName}[${index}]`, {
+        max: MAX_CAPABILITY_ARG_LENGTH
+    }))
+}
+
+export function validateCapabilityUserArgs(value, record, { fieldName = 'userArgs' } = {}) {
+    const userArgs = normalizeCapabilityUserArgs(value, fieldName)
+    if (userArgs.length === 0) return []
+
+    const capabilityId = record?.capabilityId || 'unknown capability'
+    const policy = record?.policy || {}
+    const argsPolicy = normalizeCapabilityArgsPolicy({
+        allowedArgs: policy.allowedArgs,
+        allowedPrefixes: policy.allowedPrefixes,
+        maxArgs: policy.maxArgs,
+        maxArgLength: policy.maxArgLength
+    }, 'capability.policy')
+
+    if (argsPolicy.allowedArgs !== 'allowlist') {
+        fail(`Capability ${capabilityId} does not allow renderer-supplied launch arguments.`)
+    }
+    if (userArgs.length > argsPolicy.maxArgs) {
+        fail(`Capability ${capabilityId} received too many launch arguments.`)
+    }
+    for (const arg of userArgs) {
+        if (arg.length > argsPolicy.maxArgLength) {
+            fail(`Capability ${capabilityId} received an overlong launch argument.`)
+        }
+        if (!argsPolicy.allowedPrefixes.some(prefix => arg.startsWith(prefix))) {
+            fail(`Capability ${capabilityId} received a launch argument outside its allowlist.`)
+        }
+    }
+
+    return userArgs
+}
+
 function normalizePolicy(policy, type) {
     const value = policy == null ? {} : requirePlainObject(policy, 'capability.policy')
     rejectUnknownKeys(value, POLICY_KEYS, 'capability.policy')
 
-    const allowedArgs = normalizeEnum(value.allowedArgs ?? 'none', 'capability.policy.allowedArgs', ARGS_POLICY_SET)
+    const argsPolicy = normalizeArgsPolicyFields(value, 'capability.policy', { rejectUnknown: false })
     const next = {
-        allowedArgs,
+        ...argsPolicy,
         canCloseFromWipesnap: normalizeBoolean(value.canCloseFromWipesnap, 'capability.policy.canCloseFromWipesnap', false),
         ownership: normalizeEnum(value.ownership ?? defaultOwnershipForType(type), 'capability.policy.ownership', OWNERSHIP_SET)
-    }
-
-    if (allowedArgs === 'allowlist') {
-        const prefixes = Array.isArray(value.allowedPrefixes) ? value.allowedPrefixes : []
-        if (prefixes.length === 0) fail('capability.policy.allowedPrefixes is required when allowedArgs is allowlist.')
-        if (prefixes.length > MAX_ARG_PREFIXES) fail(`capability.policy.allowedPrefixes cannot contain more than ${MAX_ARG_PREFIXES} entries.`)
-        next.allowedPrefixes = prefixes.map((prefix, index) => normalizeString(prefix, `capability.policy.allowedPrefixes[${index}]`, {
-            max: MAX_POLICY_STRING_LENGTH
-        }))
-        next.maxArgs = normalizePositiveInteger(value.maxArgs, 'capability.policy.maxArgs', 8)
-        next.maxArgLength = normalizePositiveInteger(value.maxArgLength, 'capability.policy.maxArgLength', 256)
-    } else {
-        if (value.allowedPrefixes != null || value.maxArgs != null || value.maxArgLength != null) {
-            fail('capability.policy argument allowlist fields require allowedArgs to be allowlist.')
-        }
     }
 
     if (!next.canCloseFromWipesnap && ['owned-tree'].includes(next.ownership)) {

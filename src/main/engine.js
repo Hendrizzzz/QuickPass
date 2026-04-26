@@ -1207,22 +1207,22 @@ function queryProcessIds(wqlFilter, timeoutMs = 8000) {
         try {
             const output = execFileSync(
                 'wmic',
-            ['process', 'where', wqlFilter, 'get', 'ProcessId', '/value'],
-            { encoding: 'utf8', timeout: Math.min(timeoutMs, 5000), stdio: ['pipe', 'pipe', 'pipe'] }
-        )
-        return { ok: true, pids: parsePidsFromOutput(output), error: null }
-    } catch (wmicErr) {
-        return {
-            ok: false,
-            pids: [],
-            error: combineProcessQueryErrors(psErr?.message, wmicErr?.message),
-            backendErrors: {
-                powershell: psErr?.message || null,
-                wmic: wmicErr?.message || null
+                ['process', 'where', wqlFilter, 'get', 'ProcessId', '/value'],
+                { encoding: 'utf8', timeout: Math.min(timeoutMs, 5000), stdio: ['pipe', 'pipe', 'pipe'] }
+            )
+            return { ok: true, pids: parsePidsFromOutput(output), error: null }
+        } catch (wmicErr) {
+            return {
+                ok: false,
+                pids: [],
+                error: combineProcessQueryErrors(psErr?.message, wmicErr?.message),
+                backendErrors: {
+                    powershell: psErr?.message || null,
+                    wmic: wmicErr?.message || null
+                }
             }
         }
     }
-}
 }
 
 /**

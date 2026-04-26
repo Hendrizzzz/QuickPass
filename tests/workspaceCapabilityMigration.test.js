@@ -357,6 +357,216 @@ test('valid renderer capabilityId can be saved and rehydrated for launch', () =>
     assert.equal(launchWorkspace.desktopApps[0].launchMethod, 'spawn')
 })
 
+test('host-exe renderer args reject by default at save time', () => {
+    const record = createCapabilityRecord({
+        type: 'host-exe',
+        provenance: 'browse-exe',
+        displayName: 'Verified App',
+        launch: {
+            path: 'C:\\Program Files\\Verified\\Verified.exe'
+        },
+        policy: {
+            canCloseFromWipesnap: true,
+            ownership: 'owned-process'
+        }
+    }, {
+        randomBytes: bytesSequence(0x45),
+        now: FIXED_NOW
+    })
+
+    assert.throws(() => prepareRendererWorkspaceSave({
+        desktopApps: [{
+            capabilityId: record.capabilityId,
+            displayName: 'Verified App',
+            enabled: true,
+            userArgs: ['--profile=Work']
+        }]
+    }, {
+        pendingCapabilityRecords: [record]
+    }), /does not allow renderer-supplied launch arguments/)
+})
+
+test('protocol renderer args reject by default at save time', () => {
+    const record = createCapabilityRecord({
+        type: 'protocol-uri',
+        provenance: 'protocol-scan',
+        displayName: 'Meeting Protocol',
+        launch: {
+            method: 'protocol',
+            uri: 'zoommtg:'
+        },
+        policy: {
+            canCloseFromWipesnap: false,
+            ownership: 'external'
+        }
+    }, {
+        randomBytes: bytesSequence(0x46),
+        now: FIXED_NOW
+    })
+
+    assert.throws(() => prepareRendererWorkspaceSave({
+        desktopApps: [{
+            capabilityId: record.capabilityId,
+            displayName: 'Meeting Protocol',
+            enabled: true,
+            userArgs: ['--url=zoommtg://attend']
+        }]
+    }, {
+        pendingCapabilityRecords: [record]
+    }), /does not allow renderer-supplied launch arguments/)
+})
+
+test('packaged-app renderer args reject by default at save time', () => {
+    const record = createCapabilityRecord({
+        type: 'packaged-app',
+        provenance: 'packaged-app-scan',
+        displayName: 'Calculator',
+        launch: {
+            method: 'packaged-app',
+            path: 'shell:AppsFolder\\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App'
+        },
+        policy: {
+            canCloseFromWipesnap: false,
+            ownership: 'external'
+        }
+    }, {
+        randomBytes: bytesSequence(0x49),
+        now: FIXED_NOW
+    })
+
+    assert.throws(() => prepareRendererWorkspaceSave({
+        desktopApps: [{
+            capabilityId: record.capabilityId,
+            displayName: 'Calculator',
+            enabled: true,
+            userArgs: ['--debug']
+        }]
+    }, {
+        pendingCapabilityRecords: [record]
+    }), /does not allow renderer-supplied launch arguments/)
+})
+
+test('imported app args follow explicit manifest allow policy at save and launch rehydration', () => {
+    const manifest = {
+        manifestId: 'Imported_App',
+        safeName: 'Imported_App',
+        displayName: 'Imported App',
+        selectedExecutable: {
+            relativePath: 'Imported.exe'
+        },
+        launchArgsPolicy: {
+            allowedArgs: 'allowlist',
+            allowedPrefixes: ['--profile', '--safe-mode'],
+            maxArgs: 2,
+            maxArgLength: 32
+        }
+    }
+    const { record, appConfig } = createVaultLocalExecutableCapability({
+        vaultRelativePath: 'Apps\\Imported_App\\Imported.exe',
+        manifest,
+        id: 'imported-args-row',
+        randomBytes: bytesSequence(0x47),
+        now: FIXED_NOW
+    })
+
+    assert.equal(record.policy.allowedArgs, 'allowlist')
+    assert.deepEqual(record.policy.allowedPrefixes, ['--profile', '--safe-mode'])
+
+    const saved = prepareRendererWorkspaceSave({
+        desktopApps: [{
+            id: appConfig.id,
+            capabilityId: appConfig.capabilityId,
+            displayName: appConfig.displayName,
+            enabled: true,
+            userArgs: ['--profile=Work', '--safe-mode']
+        }]
+    }, {
+        pendingCapabilityRecords: [record]
+    })
+
+    assert.deepEqual(saved.workspace.desktopApps[0].userArgs, ['--profile=Work', '--safe-mode'])
+
+    const launchWorkspace = rehydrateWorkspaceLaunchCapabilities(saved.workspace, {
+        capabilityVault: saved.capabilityVault,
+        manifestResolver: () => manifest
+    })
+
+    assert.deepEqual(launchWorkspace.desktopApps[0].args, ['--profile=Work', '--safe-mode'])
+    assert.equal(launchWorkspace.desktopApps[0].path, '[USB]\\Apps\\Imported_App\\Imported.exe')
+
+    assert.throws(() => prepareRendererWorkspaceSave({
+        desktopApps: [{
+            capabilityId: record.capabilityId,
+            displayName: appConfig.displayName,
+            enabled: true,
+            userArgs: ['--debug']
+        }]
+    }, {
+        pendingCapabilityRecords: [record]
+    }), /outside its allowlist/)
+})
+
+test('invalid persisted user args fail closed during launch rehydration', () => {
+    const record = createCapabilityRecord({
+        type: 'host-exe',
+        provenance: 'browse-exe',
+        displayName: 'Verified App',
+        launch: {
+            path: 'C:\\Program Files\\Verified\\Verified.exe'
+        },
+        policy: {
+            allowedArgs: 'allowlist',
+            allowedPrefixes: ['--profile'],
+            maxArgs: 1,
+            maxArgLength: 24,
+            canCloseFromWipesnap: true,
+            ownership: 'owned-process'
+        }
+    }, {
+        randomBytes: bytesSequence(0x48),
+        now: FIXED_NOW
+    })
+    const capabilityVault = {
+        version: 1,
+        records: {
+            [record.capabilityId]: record
+        }
+    }
+
+    assert.throws(() => rehydrateWorkspaceLaunchCapabilities({
+        desktopApps: [{
+            capabilityId: record.capabilityId,
+            displayName: 'Verified App',
+            enabled: true,
+            userArgs: ['--debug']
+        }]
+    }, {
+        capabilityVault
+    }), /outside its allowlist/)
+
+    assert.throws(() => rehydrateWorkspaceLaunchCapabilities({
+        desktopApps: [{
+            capabilityId: record.capabilityId,
+            displayName: 'Verified App',
+            enabled: true,
+            userArgs: ['--profile=Work', '--profile=Other']
+        }]
+    }, {
+        capabilityVault
+    }), /too many launch arguments/)
+
+    assert.throws(() => rehydrateWorkspaceLaunchCapabilities({
+        desktopApps: [{
+            capabilityId: record.capabilityId,
+            displayName: 'Verified App',
+            enabled: true,
+            userArgs: ['--profile=ThisValueIsTooLong']
+        }]
+    }, {
+        capabilityVault
+    }), /overlong launch argument/)
+})
+
 test('USB-local executable browse issues a manifest-backed capability that can be saved and launched', () => {
     const { record, appConfig } = createVaultLocalExecutableCapability({
         vaultRelativePath: 'Apps\\Imported_App\\Imported.exe',
@@ -415,6 +625,16 @@ test('USB-local browse selections fail closed without matching manifest evidence
         randomBytes: bytesSequence(0x8a),
         now: FIXED_NOW
     }), /requires a verified imported app manifest/)
+
+    assert.throws(() => createVaultLocalExecutableCapability({
+        vaultRelativePath: 'Apps\\Imported_App\\Imported.exe',
+        manifest: {
+            ...manifestResolver('Imported_App'),
+            launchArgsPolicy: 'allowlist'
+        },
+        randomBytes: bytesSequence(0x8b),
+        now: FIXED_NOW
+    }), /launchArgsPolicy must be an object/)
 })
 
 test('stale renderer capabilityId fails closed during save', () => {

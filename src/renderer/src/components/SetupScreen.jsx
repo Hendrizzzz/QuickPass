@@ -34,12 +34,14 @@ export default function SetupScreen({ driveInfo, onComplete }) {
     const getAppDisplayName = (app) => app?.name || app?.displayName || ''
     const toCapabilityWorkspaceEntry = (app) => {
         const displayName = getAppDisplayName(app)
+        const userArgs = Array.isArray(app.userArgs) ? app.userArgs.filter(Boolean) : []
         return {
             id: app.id,
             capabilityId: app.capabilityId,
             displayName,
             name: displayName,
-            enabled: app.enabled !== false
+            enabled: app.enabled !== false,
+            ...(userArgs.length > 0 ? { userArgs } : {})
         }
     }
     const toCapabilityWorkspace = (apps) => apps.map(toCapabilityWorkspaceEntry)
@@ -390,7 +392,9 @@ export default function SetupScreen({ driveInfo, onComplete }) {
                                         <button className="btn-secondary text-[10px] whitespace-nowrap px-2 py-0.5" onClick={browseFolder}>Folder</button>
                                     </div>
                                 </div>
-                                <input className="form-input text-sm" placeholder="Launch Arguments (optional)" value={appForm.args} onChange={(e) => setAppForm({ ...appForm, args: e.target.value })} />
+                                <p className="text-[10px] text-muted">
+                                    Launch arguments are disabled unless an imported app manifest explicitly allows them.
+                                </p>
                                 <button className="btn-primary text-sm py-2" onClick={addDesktopApp}>Add Item</button>
                             </div>
                         )}

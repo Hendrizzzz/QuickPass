@@ -2229,6 +2229,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                         name,
                         safeName,
                         manifestId: manifest.manifestId,
+                        manifest,
                         id: Date.now(),
                         enabled: true
                     }, { state: workspaceCapabilityState }),

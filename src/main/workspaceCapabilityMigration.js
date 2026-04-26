@@ -2,7 +2,10 @@ import { createHash } from 'crypto'
 import {
     createCapabilityRecord,
     createCapabilityStore,
+    normalizeCapabilityArgsPolicy,
+    normalizeCapabilityUserArgs,
     validateCapabilityRecord,
+    validateCapabilityUserArgs,
     validateCapabilityId
 } from './capabilityStore.js'
 import {
@@ -184,12 +187,7 @@ function hasLaunchArgs(value) {
 }
 
 function normalizeUserArgs(value, fieldName) {
-    if (value == null || value === '') return []
-    if (!Array.isArray(value)) fail(`${fieldName} must be an array.`)
-    if (value.length > 100) fail(`${fieldName} cannot contain more than 100 arguments.`)
-    return value.map((arg, index) => normalizeString(String(arg ?? ''), `${fieldName}[${index}]`, {
-        max: 2048
-    })).filter(Boolean)
+    return normalizeCapabilityUserArgs(value, fieldName)
 }
 
 function normalizeWorkspaceShell(workspace) {
@@ -383,7 +381,19 @@ function resolveProvenance(value, fallback = 'legacy-migration') {
     return normalized.replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 80) || fallback
 }
 
-function policyForType(type) {
+function manifestArgsPolicy(manifest) {
+    if (manifest?.launchArgsPolicy == null) return {}
+    if (!isPlainObject(manifest.launchArgsPolicy)) {
+        fail('Imported app manifest launchArgsPolicy must be an object.')
+    }
+    const argsPolicy = normalizeCapabilityArgsPolicy(
+        manifest.launchArgsPolicy,
+        'imported app manifest launchArgsPolicy'
+    )
+    return argsPolicy.allowedArgs === 'none' ? {} : argsPolicy
+}
+
+function policyForType(type, { manifest = null } = {}) {
     const ownedProcessTypes = new Set([
         'host-exe',
         'registry-uninstall',
@@ -396,6 +406,7 @@ function policyForType(type) {
     ])
     return {
         allowedArgs: 'none',
+        ...(VAULT_LAUNCH_TYPES.has(type) ? manifestArgsPolicy(manifest) : {}),
         canCloseFromWipesnap: ownedProcessTypes.has(type),
         ownership: ownedProcessTypes.has(type) ? 'owned-process' : 'external'
     }
@@ -507,7 +518,7 @@ function buildVaultCapabilityInput(appConfig, { manifestResolver } = {}) {
             storageId: parsed.storageId,
             manifestId: appConfig.manifestId
         },
-        policy: policyForType(type)
+        policy: policyForType(type, { manifest })
     }
 }
 
@@ -759,24 +770,9 @@ export function prepareRendererWorkspaceSave(workspace, {
 }
 
 function requireAllowedUserArgs(entry, record) {
-    const userArgs = Array.isArray(entry.userArgs) ? entry.userArgs : []
-    if (userArgs.length === 0) return ''
-    const policy = record.policy || {}
-    if (policy.allowedArgs !== 'allowlist') {
-        fail(`Capability ${record.capabilityId} does not allow renderer-supplied launch arguments.`)
-    }
-    if (userArgs.length > policy.maxArgs) {
-        fail(`Capability ${record.capabilityId} received too many launch arguments.`)
-    }
-    for (const arg of userArgs) {
-        if (String(arg).length > policy.maxArgLength) {
-            fail(`Capability ${record.capabilityId} received an overlong launch argument.`)
-        }
-        if (!policy.allowedPrefixes.some(prefix => String(arg).startsWith(prefix))) {
-            fail(`Capability ${record.capabilityId} received a launch argument outside its allowlist.`)
-        }
-    }
-    return userArgs
+    return validateCapabilityUserArgs(entry.userArgs || [], record, {
+        fieldName: 'workspace entry userArgs'
+    })
 }
 
 function manifestPathForCapability(record, manifestResolver) {

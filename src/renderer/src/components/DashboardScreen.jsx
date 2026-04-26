@@ -74,12 +74,14 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
             }
         }
         const displayName = getAppDisplayName(app)
+        const userArgs = Array.isArray(app.userArgs) ? app.userArgs.filter(Boolean) : []
         return {
             id: app.id,
             capabilityId: app.capabilityId,
             displayName,
             name: displayName,
-            enabled: app.enabled !== false
+            enabled: app.enabled !== false,
+            ...(userArgs.length > 0 ? { userArgs } : {})
         }
     }
     const toCapabilityWorkspace = (apps) => apps.map(toCapabilityWorkspaceEntry)
@@ -686,7 +688,9 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                     })}
                                 </div>
                             )}
-                            <input className="form-input text-sm" placeholder="Launch Args (optional)" value={appForm.args} onChange={(e) => setAppForm({ ...appForm, args: e.target.value })} />
+                            <p className="text-[10px] text-muted">
+                                Launch arguments are disabled unless an imported app manifest explicitly allows them.
+                            </p>
                             {appForm.shortcutClassification?.warning && (
                                 <p className="text-[10px] text-[#d4a44a]">{appForm.shortcutClassification.warning}</p>
                             )}
