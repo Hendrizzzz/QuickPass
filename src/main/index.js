@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, session } from 'electron'
 import { join, basename } from 'path'
 import { pathToFileURL } from 'url'
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, rmSync, renameSync, unlinkSync, openSync, closeSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync, rmSync, renameSync, unlinkSync } from 'fs'
 import { execSync, spawn, exec, execFile } from 'child_process'
 import os from 'os'
 import util from 'util'
@@ -33,7 +33,6 @@ import {
     resolveRegistryUninstallSupportFields,
     resolveShellExecuteSupportFields,
     resolveStartMenuShortcutSupportFields,
-    safeAppName,
     selectBestExecutable,
     writeAppManifest
 } from './appManifest.js'
@@ -43,7 +42,6 @@ import {
     selectStaleAppDataPayloads
 } from './staleAppData.js'
 import {
-    createAvailableAppStorageId,
     validateBooleanInput,
     validateCaptureSessionInput,
     validateFactoryResetInput,
@@ -95,6 +93,10 @@ import {
     sanitizeVaultMetaForRenderer,
     stripLaunchCapabilityMaterialFromMeta
 } from './vaultMetadata.js'
+import {
+    createImportedAppLookup,
+    reserveAppStorageId
+} from './importReservations.js'
 
 // Phase 11: The Honey Token
 const HONEY_TOKEN = {
@@ -297,53 +299,6 @@ function writeJsonFileAtomic(filePath, data) {
     writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf-8')
     renameSync(tempPath, filePath)
     try { execSync(`attrib +H "${filePath}"`) } catch (_) { }
-}
-
-function isAppStorageIdTaken(vaultDir, candidate) {
-    return existsSync(join(vaultDir, 'Apps', candidate)) ||
-        existsSync(join(vaultDir, 'Apps', `${candidate}.tar.zst`)) ||
-        existsSync(join(vaultDir, 'Apps', `${candidate}.quickpass-app.json`)) ||
-        existsSync(join(vaultDir, 'AppData', candidate))
-}
-
-function reserveAppStorageId(vaultDir, name) {
-    const reservationsDir = join(vaultDir, 'Apps', '.reservations')
-    mkdirSync(reservationsDir, { recursive: true })
-    const rejected = new Set()
-
-    for (let attempt = 0; attempt < 1000; attempt += 1) {
-        const storageId = createAvailableAppStorageId(name, candidate => (
-            rejected.has(candidate) ||
-            isAppStorageIdTaken(vaultDir, candidate) ||
-            existsSync(join(reservationsDir, `${candidate}.lock`))
-        ))
-        const lockPath = join(reservationsDir, `${storageId}.lock`)
-        let fd = null
-        try {
-            fd = openSync(lockPath, 'wx')
-            writeFileSync(fd, JSON.stringify({
-                storageId,
-                pid: process.pid,
-                createdAt: new Date().toISOString()
-            }), 'utf-8')
-            closeSync(fd)
-            fd = null
-            return {
-                storageId,
-                release() {
-                    try { unlinkSync(lockPath) } catch (_) { }
-                }
-            }
-        } catch (err) {
-            if (fd != null) {
-                try { closeSync(fd) } catch (_) { }
-            }
-            if (err?.code !== 'EEXIST') throw err
-            rejected.add(storageId)
-        }
-    }
-
-    throw new Error('Could not reserve an app storage id.')
 }
 
 function saveVaultMeta(meta) {
@@ -1739,9 +1694,9 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
     trustedHandle('scan-apps', async () => {
         requireUnlockedOrNoVault()
         const vaultDir = getVaultDir()
-        const appsDir = join(vaultDir, 'Apps')
         const results = []
         const seen = new Set()
+        const importedAppLookup = createImportedAppLookup(vaultDir)
 
         // Blacklist: filter out system utilities, runtimes, and drivers
         const BLACKLIST_PATTERNS = [
@@ -1758,7 +1713,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
             return BLACKLIST_PATTERNS.some(pattern => pattern.test(name))
         }
 
-        async function processRegistryEntry(entry, results, seen, appsDir) {
+        async function processRegistryEntry(entry, results, seen, importedAppLookup) {
             const name = entry.displayName
             if (!name) return
             const nameKey = name.toLowerCase()
@@ -1824,12 +1779,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                 launchSourceType: 'vault-archive'
             })
 
-            const storageId = safeAppName(name)
-            const alreadyImported = existsSync(join(appsDir, storageId)) ||
-                existsSync(join(appsDir, `${storageId}.tar.zst`)) ||
-                existsSync(join(appsDir, `${storageId}.quickpass-app.json`)) ||
-                existsSync(join(appsDir, name)) ||
-                existsSync(join(appsDir, `${name}.tar.zst`))
+            const alreadyImported = importedAppLookup.alreadyImported(name)
 
             results.push({
                 name,
@@ -1876,7 +1826,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                     if (line.startsWith('HKEY_')) {
                         // Process previous entry
                         if (currentEntry.displayName && !isBlacklisted(currentEntry.displayName)) {
-                            await processRegistryEntry(currentEntry, results, seen, appsDir)
+                            await processRegistryEntry(currentEntry, results, seen, importedAppLookup)
                         }
                         currentEntry = { displayName: '', installLocation: '', displayIcon: '' }
                         continue
@@ -1893,7 +1843,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                 }
                 // Process last entry
                 if (currentEntry.displayName && !isBlacklisted(currentEntry.displayName)) {
-                    await processRegistryEntry(currentEntry, results, seen, appsDir)
+                    await processRegistryEntry(currentEntry, results, seen, importedAppLookup)
                 }
             } catch (_) { }
         }))
@@ -1964,12 +1914,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                         launchSourceType: 'vault-archive'
                     })
 
-                    const storageId = safeAppName(name)
-                    const alreadyImported = existsSync(join(appsDir, storageId)) ||
-                        existsSync(join(appsDir, `${storageId}.tar.zst`)) ||
-                        existsSync(join(appsDir, `${storageId}.quickpass-app.json`)) ||
-                        existsSync(join(appsDir, name)) ||
-                        existsSync(join(appsDir, `${name}.tar.zst`))
+                    const alreadyImported = importedAppLookup.alreadyImported(name)
 
                     results.push({
                         name,
