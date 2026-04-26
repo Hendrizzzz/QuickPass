@@ -76,12 +76,9 @@ import {
     startSessionEditHandlerCore,
     startSessionSetupHandlerCore
 } from './processControlHandlers.js'
+import { sanitizeWorkspaceForRenderer } from './workspaceCapabilityMigration.js'
 import {
-    WORKSPACE_CAPABILITY_VAULT_KEY,
-    migrateWorkspaceLaunchCapabilities,
-    sanitizeWorkspaceForRenderer
-} from './workspaceCapabilityMigration.js'
-import {
+    authorizeWorkspaceLaunchCapabilitiesForMain,
     browseExecutableHandlerCore,
     browseFolderHandlerCore,
     createWorkspaceCapabilityHandlerState,
@@ -93,6 +90,11 @@ import {
     saveVaultHandlerCore,
     saveWorkspaceHandlerCore
 } from './workspaceCapabilityHandlers.js'
+import {
+    metaHasLaunchCapabilityMaterial,
+    sanitizeVaultMetaForRenderer,
+    stripLaunchCapabilityMaterialFromMeta
+} from './vaultMetadata.js'
 
 // Phase 11: The Honey Token
 const HONEY_TOKEN = {
@@ -264,8 +266,7 @@ function validateSaveVaultSecurityInput(input) {
 
 async function persistMigratedWorkspaceIfChanged(workspace, masterPassword, migrationResult) {
     const existingMeta = loadVaultMeta()
-    const metaHasLegacyLaunchAuthority = !!existingMeta?.launchCapabilities
-    if (!migrationResult?.changed && !metaHasLegacyLaunchAuthority) return
+    if (!migrationResult?.changed && !metaHasLaunchCapabilityMaterial(existingMeta)) return
     if (migrationResult?.changed) {
         const driveInfo = await getDriveInfo()
         const payload = { ...workspace, _honeyToken: HONEY_TOKEN }
@@ -276,9 +277,7 @@ async function persistMigratedWorkspaceIfChanged(workspace, masterPassword, migr
 }
 
 async function migrateUnlockedWorkspaceForRenderer(workspace, masterPassword) {
-    const existingMeta = loadVaultMeta()
     const migrated = authorizeWorkspaceLaunchCapabilities(workspace, {
-        existingMeta,
         existingWorkspace: workspace
     })
     await persistMigratedWorkspaceIfChanged(migrated.workspace, masterPassword, migrated)
@@ -348,7 +347,7 @@ function reserveAppStorageId(vaultDir, name) {
 }
 
 function saveVaultMeta(meta) {
-    writeJsonFileAtomic(getMetaPath(), meta)
+    writeJsonFileAtomic(getMetaPath(), stripLaunchCapabilityMaterialFromMeta(meta))
 }
 
 function loadVaultMeta() {
@@ -361,23 +360,6 @@ function loadVaultMeta() {
     }
 }
 
-function sanitizeVaultMetaForRenderer(meta, driveInfo) {
-    if (!meta) return null
-    const createdOnMatchesCurrentDrive = meta.createdOn && driveInfo.serialKnown
-        ? meta.createdOn === driveInfo.serialNumber
-        : null
-    return {
-        version: meta.version || '1.0.0',
-        hasPIN: !!meta.hasPIN,
-        fastBoot: !!meta.fastBoot,
-        clearCacheOnExit: meta.clearCacheOnExit !== false,
-        isRemovable: !!meta.isRemovable,
-        createdOnMatchesCurrentDrive,
-        hardwareMismatch: createdOnMatchesCurrentDrive === false,
-        supportsConvenienceUnlock: driveInfo.isRemovable && driveInfo.serialKnown
-    }
-}
-
 async function loadVaultMetaForRenderer() {
     const meta = loadVaultMeta()
     if (!meta) return null
@@ -385,14 +367,6 @@ async function loadVaultMetaForRenderer() {
 }
 
 const workspaceCapabilityState = createWorkspaceCapabilityHandlerState()
-
-function readStoredLaunchCapabilities(meta = loadVaultMeta()) {
-    const records = meta?.launchCapabilities
-    if (!records || typeof records !== 'object' || Array.isArray(records)) return new Map()
-    return new Map(Object.values(records)
-        .filter(record => record?.id)
-        .map(record => [record.id, record]))
-}
 
 function readMigrationManifest(manifestId, context = {}) {
     try {
@@ -402,29 +376,11 @@ function readMigrationManifest(manifestId, context = {}) {
     }
 }
 
-function legacyLaunchCapabilitiesForMigration(existingMeta = loadVaultMeta()) {
-    return new Map([
-        ...readStoredLaunchCapabilities(existingMeta)
-    ])
-}
-
-function authorizeWorkspaceLaunchCapabilities(workspace, {
-    existingMeta = loadVaultMeta(),
-    existingWorkspace = null
-} = {}) {
-    const migrated = migrateWorkspaceLaunchCapabilities(workspace, {
-        existingCapabilityVault: existingWorkspace?.[WORKSPACE_CAPABILITY_VAULT_KEY] || null,
-        legacyCapabilities: legacyLaunchCapabilitiesForMigration(existingMeta),
-        manifestResolver: readMigrationManifest
+function authorizeWorkspaceLaunchCapabilities(workspace, options = {}) {
+    return authorizeWorkspaceLaunchCapabilitiesForMain(workspace, {
+        ...options,
+        manifestResolver: options.manifestResolver || readMigrationManifest
     })
-
-    return {
-        workspace: migrated.workspace,
-        capabilityVault: migrated.capabilityVault,
-        migrationReport: migrated.migrationReport,
-        changed: migrated.changed,
-        capabilities: {}
-    }
 }
 
 // ─── Cryptographic Memory Buffer ───────────────────────────────────────────────

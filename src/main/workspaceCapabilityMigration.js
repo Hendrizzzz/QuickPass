@@ -636,6 +636,7 @@ export function migrateWorkspaceLaunchCapabilities(workspace, {
     existingCapabilityVault = null,
     legacyCapabilities = null,
     manifestResolver = null,
+    failClosedOnUnverifiedEnabled = false,
     randomBytes,
     now = Date.now
 } = {}) {
@@ -652,6 +653,9 @@ export function migrateWorkspaceLaunchCapabilities(workspace, {
         if (appConfig.capabilityId && !hasRawLaunchAuthority(appConfig)) {
             const record = store.read(appConfig.capabilityId)
             if (!record) {
+                if (failClosedOnUnverifiedEnabled && appConfig.enabled !== false && appConfig.quarantined !== true) {
+                    fail('Capability is missing, stale, or unavailable.')
+                }
                 changed = true
                 const reason = 'Capability is missing, stale, or unavailable.'
                 reportEntries.push({ index, displayName, status: 'quarantined', reason })
@@ -693,6 +697,9 @@ export function migrateWorkspaceLaunchCapabilities(workspace, {
             })
             return createLimitedCapabilityEntry(appConfig, record)
         } catch (err) {
+            if (failClosedOnUnverifiedEnabled && appConfig.enabled !== false && appConfig.quarantined !== true) {
+                throw err
+            }
             changed = true
             const reason = err?.message || 'Launch reference could not be verified.'
             reportEntries.push({ index, displayName, status: 'quarantined', reason })

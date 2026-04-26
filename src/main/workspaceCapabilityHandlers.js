@@ -1,11 +1,12 @@
 import { basename, isAbsolute, relative } from 'path'
 import { createCapabilityRecord, normalizeCapabilityArgsPolicy } from './capabilityStore.js'
 import { readAppManifest } from './appManifest.js'
+import { stripLaunchCapabilityMaterialFromMeta } from './vaultMetadata.js'
 import {
     WORKSPACE_CAPABILITY_VAULT_KEY,
     createVaultLocalExecutableCapability,
-    migrationReportToMetadataSummary,
     prepareRendererWorkspaceSave,
+    migrateWorkspaceLaunchCapabilities,
     rehydrateWorkspaceLaunchCapabilities,
     sanitizeWorkspaceForRenderer
 } from './workspaceCapabilityMigration.js'
@@ -261,13 +262,31 @@ export function authorizeRendererWorkspaceSave(workspace, {
 }
 
 export function mergeLaunchCapabilitiesIntoMeta(meta, migration = null) {
-    const next = { ...(meta || { version: '1.0.0' }) }
-    delete next.launchCapabilities
+    return stripLaunchCapabilityMaterialFromMeta(meta)
+}
 
-    const report = migration?.migrationReport || null
-    const summary = migrationReportToMetadataSummary(report)
-    if (summary) next.launchCapabilityMigration = summary
-    return next
+export function authorizeWorkspaceLaunchCapabilitiesForMain(workspace, {
+    existingWorkspace = null,
+    manifestResolver = null,
+    failClosedOnUnverifiedEnabled = false,
+    randomBytes,
+    now = Date.now
+} = {}) {
+    const migrated = migrateWorkspaceLaunchCapabilities(workspace, {
+        existingCapabilityVault: existingWorkspace?.[WORKSPACE_CAPABILITY_VAULT_KEY] || workspace?.[WORKSPACE_CAPABILITY_VAULT_KEY] || null,
+        manifestResolver,
+        failClosedOnUnverifiedEnabled,
+        randomBytes,
+        now
+    })
+
+    return {
+        workspace: migrated.workspace,
+        capabilityVault: migrated.capabilityVault,
+        migrationReport: migrated.migrationReport,
+        changed: migrated.changed,
+        capabilities: {}
+    }
 }
 
 export function rehydrateWorkspaceForMain(workspace, options = {}) {
@@ -372,8 +391,9 @@ function resolveUsbMacros(workspace, vaultDir) {
 export async function rehydrateWorkspaceForLaunchCore({ deps }) {
     const vaultWorkspace = deps.loadActiveVaultWorkspace()
     const authorized = deps.authorizeWorkspaceLaunchCapabilities(vaultWorkspace, {
-        existingMeta: deps.loadVaultMeta(),
-        existingWorkspace: vaultWorkspace
+        existingWorkspace: vaultWorkspace,
+        failClosedOnUnverifiedEnabled: true,
+        manifestResolver: deps.manifestResolver
     })
     await deps.persistMigratedWorkspaceIfChanged(
         authorized.workspace,

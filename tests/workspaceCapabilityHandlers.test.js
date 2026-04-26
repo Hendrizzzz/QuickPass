@@ -5,6 +5,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { createCapabilityRecord } from '../src/main/capabilityStore.js'
 import {
+    authorizeWorkspaceLaunchCapabilitiesForMain,
     browseExecutableHandlerCore,
     browseFolderHandlerCore,
     createWorkspaceCapabilityHandlerState,
@@ -138,12 +139,9 @@ function createHarness() {
             getWindowFromSender: () => win,
             loadActiveVaultWorkspace,
             loadVaultMeta,
-            authorizeWorkspaceLaunchCapabilities: (workspace) => ({
-                workspace,
-                capabilityVault: workspace[WORKSPACE_CAPABILITY_VAULT_KEY],
-                migrationReport: null,
-                changed: false,
-                capabilities: {}
+            authorizeWorkspaceLaunchCapabilities: (workspace, options = {}) => authorizeWorkspaceLaunchCapabilitiesForMain(workspace, {
+                ...options,
+                manifestResolver
             }),
             persistMigratedWorkspaceIfChanged: async (workspace, password, migration) => {
                 calls.persistedMigrations.push({ workspace, password, migration })
@@ -353,6 +351,97 @@ test('USB-local executable browse saves and launches through manifest-backed vau
         assert.equal(harness.calls.launchedWorkspace.desktopApps[0].path, join(harness.vaultDir, 'Apps', 'Imported_App', 'Imported.exe'))
         assert.equal(harness.calls.launchedWorkspace.desktopApps[0].launchSourceType, 'vault-archive')
         assert.deepEqual(harness.calls.sent.map(item => item.channel), ['launch-status', 'launch-complete'])
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('metadata-only host capability does not authorize launch or process side effects', async () => {
+    const harness = createHarness()
+    try {
+        const legacyCapability = {
+            id: 'legacy-host-capability',
+            launchSourceType: 'host-exe',
+            launchMethod: 'spawn',
+            path: 'C:\\Program Files\\Legacy\\Legacy.exe',
+            provenance: 'browse-exe'
+        }
+        writeFileSync(harness.metaPath, JSON.stringify({
+            version: '1.0.0',
+            launchCapabilities: {
+                [legacyCapability.id]: legacyCapability
+            }
+        }, null, 2), 'utf-8')
+        harness.writeWorkspace({
+            desktopApps: [{
+                id: 'legacy-row',
+                name: 'Legacy App',
+                path: legacyCapability.path,
+                launchSourceType: 'host-exe',
+                launchMethod: 'spawn',
+                launchCapabilityId: legacyCapability.id,
+                enabled: true
+            }]
+        })
+
+        const result = await launchWorkspaceHandlerCore({
+            event: { sender: { id: 1 } },
+            deps: harness.createLaunchDeps()
+        })
+
+        assert.equal(result.success, false)
+        assert.match(result.error, /No main-issued legacy capability evidence/)
+        assert.equal(harness.calls.closeBrowser, 0)
+        assert.equal(harness.calls.closeDesktopApps, 0)
+        assert.equal(harness.calls.launchedWorkspace, null)
+        assert.equal(harness.calls.launchPromise, null)
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('encrypted-vault capability authorizes launch after unlock', async () => {
+    const harness = createHarness()
+    try {
+        const record = createCapabilityRecord({
+            type: 'host-exe',
+            provenance: 'browse-exe',
+            displayName: 'Verified App',
+            launch: {
+                path: 'C:\\Program Files\\Verified\\Verified.exe'
+            },
+            policy: {
+                allowedArgs: 'none',
+                canCloseFromWipesnap: true,
+                ownership: 'owned-process'
+            }
+        })
+        harness.writeWorkspace({
+            desktopApps: [{
+                id: 'verified-row',
+                capabilityId: record.capabilityId,
+                displayName: 'Verified App',
+                enabled: true
+            }],
+            [WORKSPACE_CAPABILITY_VAULT_KEY]: {
+                version: 1,
+                records: {
+                    [record.capabilityId]: record
+                }
+            }
+        })
+
+        const result = await launchWorkspaceHandlerCore({
+            event: { sender: { id: 1 } },
+            deps: harness.createLaunchDeps()
+        })
+
+        assert.equal(result.success, true)
+        await harness.calls.launchPromise
+        assert.equal(harness.calls.launchedWorkspace.desktopApps[0].path, 'C:\\Program Files\\Verified\\Verified.exe')
+        assert.equal(harness.calls.launchedWorkspace.desktopApps[0].capabilityId, record.capabilityId)
+        assert.equal(harness.calls.closeBrowser, 1)
+        assert.equal(harness.calls.closeDesktopApps, 1)
     } finally {
         harness.cleanup()
     }
