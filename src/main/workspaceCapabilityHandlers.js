@@ -265,6 +265,15 @@ export function mergeLaunchCapabilitiesIntoMeta(meta, migration = null) {
     return stripLaunchCapabilityMaterialFromMeta(meta)
 }
 
+function persistVaultAndMeta(deps, { vault, meta, operation }) {
+    if (deps.commitVaultMeta) {
+        deps.commitVaultMeta({ vault, meta, operation })
+        return
+    }
+    deps.writeVault(vault)
+    deps.saveVaultMeta(meta)
+}
+
 export function authorizeWorkspaceLaunchCapabilitiesForMain(workspace, {
     existingWorkspace = null,
     manifestResolver = null,
@@ -306,9 +315,13 @@ export async function saveWorkspaceHandlerCore({ workspace, state, deps }) {
         const payload = { ...authorized.workspace, _honeyToken: deps.honeyToken }
         const driveInfo = await deps.getDriveInfo()
         const encryptedVault = deps.encryptVault(payload, deps.getActiveMasterPassword(), driveInfo.driveType === 3)
+        const meta = mergeLaunchCapabilitiesIntoMeta(existingMeta || { version: '1.0.0' }, authorized)
 
-        deps.writeVault(encryptedVault)
-        deps.saveVaultMeta(mergeLaunchCapabilitiesIntoMeta(existingMeta || { version: '1.0.0' }, authorized))
+        persistVaultAndMeta(deps, {
+            vault: encryptedVault,
+            meta,
+            operation: 'save-workspace'
+        })
         pendingRecordsForState(state).clear()
 
         return { success: true, workspace: sanitizeWorkspaceForRenderer(authorized.workspace) }
@@ -340,8 +353,6 @@ export async function saveVaultHandlerCore({ input, state, deps }) {
         const payload = { ...authorized.workspace, _honeyToken: deps.honeyToken }
         const encryptedVault = deps.encryptVault(payload, masterPassword, driveInfo.driveType === 3)
 
-        deps.writeVault(encryptedVault)
-
         let meta = {
             version: '1.0.0',
             createdOn: driveInfo.serialNumber,
@@ -364,7 +375,11 @@ export async function saveVaultHandlerCore({ input, state, deps }) {
         }
 
         meta = mergeLaunchCapabilitiesIntoMeta(meta, authorized)
-        deps.saveVaultMeta(meta)
+        persistVaultAndMeta(deps, {
+            vault: encryptedVault,
+            meta,
+            operation: vaultExists ? 'save-vault-password-rotation' : 'save-vault-create'
+        })
         pendingRecordsForState(state).clear()
         deps.setActiveMasterPassword(masterPassword)
         deps.resetPinUnlockFailures()

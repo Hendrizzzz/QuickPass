@@ -27,6 +27,7 @@ function createHarness() {
     const calls = {
         vaultWrites: 0,
         metaWrites: 0,
+        transactionalCommits: [],
         activePasswords: [],
         resetPinUnlockFailures: 0,
         activeSessionChecks: 0,
@@ -88,7 +89,7 @@ function createHarness() {
         mkdirSync(join(vaultDir, 'Apps', manifest.safeName), { recursive: true })
         writeFileSync(join(vaultDir, 'Apps', `${manifest.safeName}.quickpass-app.json`), JSON.stringify(manifest, null, 2), 'utf-8')
     }
-    const createSaveDeps = () => ({
+    const createSaveDeps = (overrides = {}) => ({
         requireActiveSession: () => {
             calls.activeSessionChecks += 1
             if (!activeMasterPassword) throw new Error('Session is locked')
@@ -114,7 +115,8 @@ function createHarness() {
         resetPinUnlockFailures: () => {
             calls.resetPinUnlockFailures += 1
         },
-        honeyToken: { marker: true }
+        honeyToken: { marker: true },
+        ...overrides
     })
     const createBrowseDeps = (selectedPath) => ({
         requireUnlockedOrNoVault: () => {
@@ -500,6 +502,87 @@ test('save-vault persists pending capabilities and clears pending process author
         assert.equal(stored.desktopApps[0].path, undefined)
         assert.equal(stored[WORKSPACE_CAPABILITY_VAULT_KEY].records[selected.capabilityId].launch.path, 'C:\\Program Files\\Verified\\Verified.exe')
         assert.equal(harness.loadVaultMeta().launchCapabilities, undefined)
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('save-vault uses transactional commit without standalone vault write when available', async () => {
+    const harness = createHarness()
+    const state = createWorkspaceCapabilityHandlerState()
+    try {
+        const result = await saveVaultHandlerCore({
+            state,
+            deps: harness.createSaveDeps({
+                commitVaultMeta: ({ vault, meta, operation }) => {
+                    harness.calls.transactionalCommits.push({
+                        vault: clone(vault),
+                        meta: clone(meta),
+                        operation
+                    })
+                }
+            }),
+            input: {
+                masterPassword: 'new-password',
+                currentPassword: '',
+                pin: null,
+                fastBoot: false,
+                workspace: { webTabs: [], desktopApps: [] }
+            }
+        })
+
+        assert.equal(result.success, true)
+        assert.equal(harness.calls.vaultWrites, 0)
+        assert.equal(harness.calls.metaWrites, 0)
+        assert.equal(harness.calls.transactionalCommits.length, 1)
+        assert.equal(harness.calls.transactionalCommits[0].operation, 'save-vault-create')
+        assert.deepEqual(harness.calls.activePasswords, ['new-password'])
+        assert.equal(harness.calls.resetPinUnlockFailures, 1)
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('save-vault transactional commit failure leaves authority and session state untouched', async () => {
+    const harness = createHarness()
+    const state = createWorkspaceCapabilityHandlerState()
+    try {
+        const selected = await browseExecutableHandlerCore({
+            state,
+            deps: harness.createBrowseDeps('C:\\Program Files\\Verified\\Verified.exe')
+        })
+
+        const result = await saveVaultHandlerCore({
+            state,
+            deps: harness.createSaveDeps({
+                commitVaultMeta: () => {
+                    harness.calls.transactionalCommits.push({ operation: 'attempted' })
+                    throw new Error('transaction failed')
+                }
+            }),
+            input: {
+                masterPassword: 'new-password',
+                currentPassword: '',
+                pin: null,
+                fastBoot: false,
+                workspace: {
+                    desktopApps: [{
+                        capabilityId: selected.capabilityId,
+                        displayName: 'Verified',
+                        enabled: true
+                    }]
+                }
+            }
+        })
+
+        assert.equal(result.success, false)
+        assert.match(result.error, /transaction failed/)
+        assert.equal(harness.calls.transactionalCommits.length, 1)
+        assert.equal(harness.calls.vaultWrites, 0)
+        assert.equal(harness.calls.metaWrites, 0)
+        assert.equal(state.pendingLaunchCapabilityRecords.size, 1)
+        assert.deepEqual(harness.calls.activePasswords, [])
+        assert.equal(harness.calls.resetPinUnlockFailures, 0)
     } finally {
         harness.cleanup()
     }

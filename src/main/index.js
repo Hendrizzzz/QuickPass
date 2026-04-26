@@ -94,6 +94,10 @@ import {
     stripLaunchCapabilityMaterialFromMeta
 } from './vaultMetadata.js'
 import {
+    createVaultDurabilityController,
+    writeJsonFileDurable
+} from './vaultDurability.js'
+import {
     createImportedAppLookup,
     reserveAppStorageId
 } from './importReservations.js'
@@ -242,7 +246,7 @@ function loadActiveVaultWorkspace() {
     if (!activeMasterPasswordBuffer) throw new Error('Session is locked')
     if (!existsSync(getVaultPath())) return { webTabs: [], desktopApps: [] }
 
-    const encryptedVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
+    const encryptedVault = readVaultFile()
     const workspace = decrypt(encryptedVault, activeMasterPasswordBuffer.toString('utf-8'))
     if (workspace?._honeyToken) delete workspace._honeyToken
 
@@ -273,9 +277,17 @@ async function persistMigratedWorkspaceIfChanged(workspace, masterPassword, migr
         const driveInfo = await getDriveInfo()
         const payload = { ...workspace, _honeyToken: HONEY_TOKEN }
         const encryptedVault = encrypt(payload, masterPassword, driveInfo.driveType === 3)
-        writeJsonFileAtomic(getVaultPath(), encryptedVault)
+        commitVaultMetaFiles({
+            vault: encryptedVault,
+            meta: mergeLaunchCapabilitiesIntoMeta(existingMeta || { version: '1.0.0' }, migrationResult),
+            operation: 'workspace-capability-migration'
+        })
+        return
     }
-    saveVaultMeta(mergeLaunchCapabilitiesIntoMeta(existingMeta || { version: '1.0.0' }, migrationResult))
+    saveVaultMeta(
+        mergeLaunchCapabilitiesIntoMeta(existingMeta || { version: '1.0.0' }, migrationResult),
+        'strip-launch-capability-metadata'
+    )
 }
 
 async function migrateUnlockedWorkspaceForRenderer(workspace, masterPassword) {
@@ -291,28 +303,77 @@ function getMetaPath() {
     return join(getVaultDir(), 'vault.meta.json')
 }
 
-function writeJsonFileAtomic(filePath, data) {
-    const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`
-    if (existsSync(filePath)) {
-        try { execSync(`attrib -H -R "${filePath}"`) } catch (_) { }
+let vaultDurabilityStatus = { ok: true, status: 'not-started' }
+
+function getVaultDurabilityPaths() {
+    return {
+        vaultPath: getVaultPath(),
+        metaPath: getMetaPath(),
+        statePath: getStatePath()
     }
-    writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf-8')
-    renameSync(tempPath, filePath)
-    try { execSync(`attrib +H "${filePath}"`) } catch (_) { }
 }
 
-function saveVaultMeta(meta) {
-    writeJsonFileAtomic(getMetaPath(), stripLaunchCapabilityMaterialFromMeta(meta))
+const vaultDurability = createVaultDurabilityController({
+    getPaths: getVaultDurabilityPaths,
+    onStatus: (status) => {
+        vaultDurabilityStatus = status
+    }
+})
+
+function recoverVaultDurabilityOnStartup() {
+    vaultDurabilityStatus = vaultDurability.recover()
+    if (!vaultDurabilityStatus.ok) {
+        console.error('[QuickPass] Vault durability check failed:', vaultDurabilityStatus.error)
+        try { diagError('vault-durability', vaultDurabilityStatus.error) } catch (_) { }
+    } else if (vaultDurabilityStatus.recovered) {
+        console.warn('[QuickPass] Recovered incomplete vault transaction:', vaultDurabilityStatus.operation)
+    }
+    return vaultDurabilityStatus
+}
+
+function requireVaultDurabilityReady() {
+    vaultDurability.requireReady()
+}
+
+function verifyVaultDurabilityReady() {
+    return vaultDurability.verifyReady()
+}
+
+function readVaultFile() {
+    verifyVaultDurabilityReady()
+    return JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
+}
+
+function commitVaultMetaFiles({ vault, meta, operation }) {
+    requireVaultDurabilityReady()
+    return vaultDurability.commitVaultMeta({
+        vault,
+        meta: stripLaunchCapabilityMaterialFromMeta(meta),
+        operation
+    })
+}
+
+function commitVaultMetadataFiles(meta, operation) {
+    requireVaultDurabilityReady()
+    return vaultDurability.commitMetadata({
+        meta: stripLaunchCapabilityMaterialFromMeta(meta),
+        operation
+    })
+}
+
+function writeJsonFileAtomic(filePath, data) {
+    writeJsonFileDurable(filePath, data)
+}
+
+function saveVaultMeta(meta, operation = 'vault-metadata-update') {
+    commitVaultMetadataFiles(meta, operation)
 }
 
 function loadVaultMeta() {
+    verifyVaultDurabilityReady()
     const metaPath = getMetaPath()
     if (!existsSync(metaPath)) return null
-    try {
-        return JSON.parse(readFileSync(metaPath, 'utf-8'))
-    } catch (e) {
-        return null
-    }
+    return JSON.parse(readFileSync(metaPath, 'utf-8'))
 }
 
 async function loadVaultMetaForRenderer() {
@@ -449,7 +510,7 @@ function createProcessControlHandlerDeps() {
         getVaultDir,
         onBrowserAllClosed,
         launchSessionSetup,
-        readVault: () => JSON.parse(readFileSync(getVaultPath(), 'utf-8')),
+        readVault: readVaultFile,
         decryptVault: decrypt,
         validateQuitOptions,
         quitApp: () => app.quit(),
@@ -491,8 +552,9 @@ function createWorkspaceCapabilityHandlerDeps() {
         getActiveMasterPassword: getActiveMasterPasswordText,
         encryptVault: encrypt,
         decryptVault: decrypt,
-        readVault: () => JSON.parse(readFileSync(getVaultPath(), 'utf-8')),
+        readVault: readVaultFile,
         writeVault: (encryptedVault) => writeJsonFileAtomic(getVaultPath(), encryptedVault),
+        commitVaultMeta: commitVaultMetaFiles,
         validateSaveVaultSecurityInput,
         vaultExists: () => existsSync(getVaultPath()),
         requireConvenienceUnlockRequestSupported,
@@ -525,7 +587,10 @@ function trustedOn(channel, listener) {
 function registerIpcHandlers() {
 
     trustedHandle('get-drive-info', async () => sanitizeDriveInfoForRenderer(await getDriveInfo()))
-    trustedHandle('vault-exists', () => existsSync(getVaultPath()))
+    trustedHandle('vault-exists', () => {
+        verifyVaultDurabilityReady()
+        return existsSync(getVaultPath())
+    })
     trustedHandle('load-vault-meta', async () => loadVaultMetaForRenderer())
 
     trustedHandle('begin-factory-reset', (event) => {
@@ -586,7 +651,7 @@ function registerIpcHandlers() {
                 delete meta.pinVault
                 meta.hasPIN = false
             }
-            saveVaultMeta(meta)
+            saveVaultMeta(meta, 'update-pin')
             return { success: true }
         } catch (e) {
             return { success: false, error: e.message }
@@ -614,7 +679,7 @@ function registerIpcHandlers() {
                 delete meta.fastBootVault
                 meta.fastBoot = false
             }
-            saveVaultMeta(meta)
+            saveVaultMeta(meta, 'update-fastboot')
             return { success: true }
         } catch (e) {
             return { success: false, error: e.message }
@@ -630,7 +695,7 @@ function registerIpcHandlers() {
             requireActiveSession()
             let meta = loadVaultMeta() || { version: '1.0.0' }
             meta.clearCacheOnExit = safeEnable
-            saveVaultMeta(meta)
+            saveVaultMeta(meta, 'update-clear-cache')
             return { success: true }
         } catch (e) {
             return { success: false, error: e.message }
@@ -660,7 +725,7 @@ function registerIpcHandlers() {
             const pinKey = safePin + ':' + driveInfo.serialNumber
             const { masterPassword } = decrypt(meta.pinVault, pinKey)
 
-            const encryptedVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
+            const encryptedVault = readVaultFile()
             let workspace = decrypt(encryptedVault, masterPassword)
 
             // Remove honey token before sending to frontend
@@ -684,7 +749,7 @@ function registerIpcHandlers() {
     trustedHandle('unlock-with-password', async (_, password) => {
         try {
             const safePassword = validatePasswordInput(password)
-            const encryptedVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
+            const encryptedVault = readVaultFile()
             let workspace = decrypt(encryptedVault, safePassword)
 
             if (workspace._honeyToken) delete workspace._honeyToken
@@ -716,7 +781,7 @@ function registerIpcHandlers() {
             const serialKey = 'FASTBOOT:' + driveInfo.serialNumber
             const { masterPassword } = decrypt(meta.fastBootVault, serialKey)
 
-            const encryptedVault = JSON.parse(readFileSync(getVaultPath(), 'utf-8'))
+            const encryptedVault = readVaultFile()
             let workspace = decrypt(encryptedVault, masterPassword)
 
             if (workspace._honeyToken) delete workspace._honeyToken
@@ -2277,15 +2342,11 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
             capture,
             requireActiveSession,
             allowNewVaultPassword,
-            readVault: () => JSON.parse(readFileSync(vaultPath, 'utf-8')),
+            readVault: readVaultFile,
             decryptVault: decrypt,
             encryptVault: (payload, masterPassword, driveInfo) => encrypt(payload, masterPassword, driveInfo.driveType === 3),
-            writeVault: (encryptedVault) => {
-                if (vaultExists) {
-                    try { execSync(`attrib -H -R "${vaultPath}"`) } catch (_) { }
-                }
-                writeJsonFileAtomic(vaultPath, encryptedVault)
-            },
+            writeVault: (encryptedVault) => writeJsonFileAtomic(vaultPath, encryptedVault),
+            commitVaultMeta: commitVaultMetaFiles,
             getDriveInfo,
             loadMeta: loadVaultMeta,
             saveMeta: saveVaultMeta,
@@ -2598,6 +2659,7 @@ app.whenReady().then(() => {
     runDiagnostics.osVersion = os.release()
     runDiagnostics.startTime = Date.now()
 
+    recoverVaultDurabilityOnStartup()
     installElectronSecurityHandlers()
     registerIpcHandlers()
     createWindow()

@@ -73,6 +73,7 @@ export async function saveCapturedSessionToVault({
     loadMeta,
     saveMeta,
     mergeMeta,
+    commitVaultMeta,
     authorizeWorkspaceLaunchCapabilities,
     honeyToken,
     validateInput = validateCaptureSessionInput,
@@ -111,9 +112,18 @@ export async function saveCapturedSessionToVault({
     const payload = { ...authorized.workspace, _honeyToken: honeyToken }
     const driveInfo = await getDriveInfo()
     const encryptedVault = encryptVault(payload, masterPassword, driveInfo)
+    const meta = mergeMeta(existingMeta || { version: '1.0.0' }, authorized.capabilities)
 
-    writeVault(encryptedVault)
-    saveMeta(mergeMeta(existingMeta || { version: '1.0.0' }, authorized.capabilities))
+    if (commitVaultMeta) {
+        commitVaultMeta({
+            vault: encryptedVault,
+            meta,
+            operation: vaultExists ? 'capture-session-update' : 'capture-session-create'
+        })
+    } else {
+        writeVault(encryptedVault)
+        saveMeta(meta)
+    }
 
     return {
         success: true,
