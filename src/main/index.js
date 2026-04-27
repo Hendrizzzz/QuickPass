@@ -116,6 +116,7 @@ import {
     registerPackagedRendererProtocolHandler,
     registerPackagedRendererProtocolScheme
 } from './electronShellHardening.js'
+import { loadDiagnosticsSummaryHandlerCore } from './diagnosticsView.js'
 
 registerPackagedRendererProtocolScheme(protocol)
 
@@ -641,6 +642,15 @@ function registerIpcHandlers() {
         return existsSync(getVaultPath())
     })
     trustedHandle('load-vault-meta', async () => loadVaultMetaForRenderer())
+    trustedHandle('load-diagnostics-summary', async (_, input) => {
+        return loadDiagnosticsSummaryHandlerCore({
+            input,
+            deps: {
+                requireActiveSession,
+                getVaultDir
+            }
+        })
+    })
 
     trustedHandle('begin-factory-reset', (event) => {
         const reset = createFactoryResetToken(event.sender.id)

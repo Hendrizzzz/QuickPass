@@ -7,6 +7,7 @@ const wipesnapApi = {
     // Vault Operations
     vaultExists: () => ipcRenderer.invoke('vault-exists'),
     loadVaultMeta: () => ipcRenderer.invoke('load-vault-meta'),
+    loadDiagnosticsSummary: () => ipcRenderer.invoke('load-diagnostics-summary'),
     saveVault: (data) => ipcRenderer.invoke('save-vault', data),
     saveWorkspace: (workspace) => ipcRenderer.invoke('save-workspace', workspace),
     beginFactoryReset: () => ipcRenderer.invoke('begin-factory-reset'),

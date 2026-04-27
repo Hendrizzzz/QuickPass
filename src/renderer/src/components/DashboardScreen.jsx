@@ -12,6 +12,8 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const [staleAppDataStatus, setStaleAppDataStatus] = useState('')
     const [showStaleCleanupConfirm, setShowStaleCleanupConfirm] = useState(false)
     const staleAppDataScanRef = useRef(0)
+    const [diagnosticsSummary, setDiagnosticsSummary] = useState(null)
+    const [diagnosticsLoading, setDiagnosticsLoading] = useState(false)
 
     const [showAppForm, setShowAppForm] = useState(false)
     const [appForm, setAppForm] = useState({ name: '', path: '', args: '', portableData: false })
@@ -456,6 +458,35 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         return () => clearTimeout(timer)
     }, [hasUnsavedAppChanges, isInSessionMode])
 
+    useEffect(() => {
+        let cancelled = false
+
+        const loadDiagnostics = async () => {
+            if (!window.wipesnap?.loadDiagnosticsSummary) return
+            setDiagnosticsLoading(true)
+            try {
+                const summary = await window.wipesnap.loadDiagnosticsSummary()
+                if (!cancelled) setDiagnosticsSummary(summary)
+            } catch (err) {
+                if (!cancelled) {
+                    setDiagnosticsSummary({
+                        success: false,
+                        state: 'unavailable',
+                        status: 'failed',
+                        message: err?.message || 'Diagnostics are unavailable.'
+                    })
+                }
+            } finally {
+                if (!cancelled) setDiagnosticsLoading(false)
+            }
+        }
+
+        loadDiagnostics()
+        return () => {
+            cancelled = true
+        }
+    }, [])
+
     const handleCleanupStaleAppData = async () => {
         if (hasUnsavedAppChanges) {
             setError('Save or discard workspace changes before removing unused AppData.')
@@ -550,6 +581,49 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
 
     const staleAppDataTotalMB = staleAppDataPayloads.reduce((total, payload) => total + (payload.sizeMB || 0), 0)
     const removableStaleAppDataPayloads = staleAppDataPayloads.filter(payload => !payload.cleanupBlocked)
+    const diagnosticsRun = diagnosticsSummary?.lastLaunch || diagnosticsSummary?.lastRun
+    const diagnosticsApps = diagnosticsSummary?.apps?.slice(0, 4) || []
+    const diagnosticsWarnings = diagnosticsSummary?.warnings?.slice(0, 3) || []
+    const diagnosticsFailures = diagnosticsSummary?.failures?.slice(0, 3) || []
+    const diagnosticsBrowser = diagnosticsSummary?.browser
+    const diagnosticsCleanup = diagnosticsSummary?.cleanup
+    const diagnosticsImports = diagnosticsSummary?.imports
+
+    const formatDiagnosticsTime = (value) => {
+        if (!value) return 'Not recorded'
+        try {
+            return new Date(value).toLocaleString([], {
+                month: 'short',
+                day: 'numeric',
+                hour: 'numeric',
+                minute: '2-digit'
+            })
+        } catch (_) {
+            return 'Not recorded'
+        }
+    }
+
+    const formatDiagnosticsDuration = (value) => {
+        if (value == null) return 'n/a'
+        if (value < 1000) return `${value} ms`
+        return `${(value / 1000).toFixed(value < 10000 ? 1 : 0)} s`
+    }
+
+    const getDiagnosticsStatusClass = (status) => {
+        if (status === 'ok') return 'text-success'
+        if (status === 'warning' || status === 'skipped') return 'text-warning'
+        if (status === 'failed') return 'text-error'
+        return 'text-muted'
+    }
+
+    const getDiagnosticsStatusLabel = (status) => {
+        if (status === 'ok') return 'OK'
+        if (status === 'warning') return 'Warnings'
+        if (status === 'failed') return 'Failed'
+        if (status === 'missing') return 'No data'
+        if (status === 'empty') return 'Empty'
+        return status || 'Unknown'
+    }
 
     return (
         <div className="card p-6 w-full max-w-sm animate-slide-up flex flex-col" style={{ maxHeight: 540 }}>
@@ -643,6 +717,163 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                             </div>
                         </div>
                     ))}
+                </div>
+            )}
+
+            {/* Diagnostics */}
+            {!isInSessionMode && (
+                <div className="mb-4">
+                    <div className="flex items-center justify-between mb-2">
+                        <span className="section-label">Diagnostics</span>
+                        {diagnosticsSummary?.state && (
+                            <span className={`text-[10px] font-semibold ${getDiagnosticsStatusClass(diagnosticsSummary.status)}`}>
+                                {getDiagnosticsStatusLabel(diagnosticsSummary.status)}
+                            </span>
+                        )}
+                    </div>
+
+                    <div className="rounded-md border border-[#2a2a3a] bg-[#14141c] p-3">
+                        {diagnosticsLoading && (
+                            <div className="flex items-center gap-2 text-xs text-secondary">
+                                <div className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
+                                Loading diagnostics...
+                            </div>
+                        )}
+
+                        {!diagnosticsLoading && !diagnosticsSummary && (
+                            <p className="text-xs text-muted">Diagnostics are unavailable.</p>
+                        )}
+
+                        {!diagnosticsLoading && (diagnosticsSummary?.state === 'missing' || diagnosticsSummary?.state === 'empty') && (
+                            <p className="text-xs text-muted">
+                                {diagnosticsSummary.state === 'missing' ? 'No run diagnostics recorded yet.' : 'Diagnostics do not contain a recorded run.'}
+                            </p>
+                        )}
+
+                        {!diagnosticsLoading && diagnosticsSummary?.success === false && diagnosticsSummary?.state !== 'missing' && (
+                            <div>
+                                <p className="text-xs text-error font-medium">Diagnostics unavailable</p>
+                                <p className="text-[11px] text-muted mt-1">{diagnosticsSummary.message || 'The diagnostics file could not be displayed safely.'}</p>
+                            </div>
+                        )}
+
+                        {!diagnosticsLoading && diagnosticsSummary?.success && diagnosticsSummary?.state === 'ready' && (
+                            <div className="flex flex-col gap-3">
+                                <div>
+                                    <div className="flex items-center justify-between gap-2">
+                                        <p className="text-sm text-white font-medium truncate">
+                                            {diagnosticsSummary.lastLaunch ? 'Last launch' : `Last ${diagnosticsRun?.type || 'run'}`}
+                                        </p>
+                                        <span className={`text-xs font-semibold flex-shrink-0 ${getDiagnosticsStatusClass(diagnosticsSummary.status)}`}>
+                                            {getDiagnosticsStatusLabel(diagnosticsSummary.status)}
+                                        </span>
+                                    </div>
+                                    <p className="text-[11px] text-muted mt-0.5">
+                                        {formatDiagnosticsTime(diagnosticsRun?.startedAt)} - {formatDiagnosticsDuration(diagnosticsRun?.durationMs)}
+                                    </p>
+                                </div>
+
+                                <div className="grid grid-cols-3 gap-2">
+                                    <div className="rounded bg-[#101018] border border-[#242435] p-2">
+                                        <p className="text-[10px] text-muted">Warnings</p>
+                                        <p className="text-sm text-white">{diagnosticsSummary.counts?.warnings || 0}</p>
+                                    </div>
+                                    <div className="rounded bg-[#101018] border border-[#242435] p-2">
+                                        <p className="text-[10px] text-muted">Failures</p>
+                                        <p className="text-sm text-white">{diagnosticsSummary.counts?.failures || 0}</p>
+                                    </div>
+                                    <div className="rounded bg-[#101018] border border-[#242435] p-2">
+                                        <p className="text-[10px] text-muted">Apps</p>
+                                        <p className="text-sm text-white">{diagnosticsSummary.counts?.apps || 0}</p>
+                                    </div>
+                                </div>
+
+                                {diagnosticsBrowser?.present && (
+                                    <div className="rounded bg-[#101018] border border-[#242435] p-2">
+                                        <div className="flex items-center justify-between">
+                                            <p className="text-xs text-white">Browser</p>
+                                            <span className={`text-[10px] font-semibold ${getDiagnosticsStatusClass(diagnosticsBrowser.status)}`}>
+                                                {getDiagnosticsStatusLabel(diagnosticsBrowser.status)}
+                                            </span>
+                                        </div>
+                                        <p className="text-[11px] text-muted mt-1">
+                                            {diagnosticsBrowser.succeeded} loaded, {diagnosticsBrowser.failed} failed, {diagnosticsBrowser.skipped} skipped
+                                        </p>
+                                        {(diagnosticsBrowser.copyInMs != null || diagnosticsBrowser.copyOutMs != null) && (
+                                            <p className="text-[10px] text-muted mt-0.5">
+                                                Sync in {formatDiagnosticsDuration(diagnosticsBrowser.copyInMs)} / out {formatDiagnosticsDuration(diagnosticsBrowser.copyOutMs)}
+                                            </p>
+                                        )}
+                                    </div>
+                                )}
+
+                                {diagnosticsApps.length > 0 && (
+                                    <div className="flex flex-col gap-1.5">
+                                        {diagnosticsApps.map((app, index) => (
+                                            <div key={`${app.name}-${index}`} className="rounded bg-[#101018] border border-[#242435] p-2">
+                                                <div className="flex items-center justify-between gap-2">
+                                                    <p className="text-xs text-white truncate">{app.name}</p>
+                                                    <span className={`text-[10px] font-semibold flex-shrink-0 ${getDiagnosticsStatusClass(app.status)}`}>
+                                                        {getDiagnosticsStatusLabel(app.status)}
+                                                    </span>
+                                                </div>
+                                                <p className="text-[10px] text-muted truncate">
+                                                    {app.launchSourceType} - {app.stage} - readiness {app.readinessStatus}
+                                                </p>
+                                                {(app.error || app.warning) && (
+                                                    <p className={`text-[10px] truncate ${app.error ? 'text-error' : 'text-warning'}`}>
+                                                        {app.error || app.warning}
+                                                    </p>
+                                                )}
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+
+                                {(diagnosticsFailures.length > 0 || diagnosticsWarnings.length > 0) && (
+                                    <div className="flex flex-col gap-1">
+                                        {diagnosticsFailures.map((item, index) => (
+                                            <p key={`failure-${index}`} className="text-[10px] text-error truncate">
+                                                {item.name}: {item.message}
+                                            </p>
+                                        ))}
+                                        {diagnosticsWarnings.map((item, index) => (
+                                            <p key={`warning-${index}`} className="text-[10px] text-warning truncate">
+                                                {item.name}: {item.message}
+                                            </p>
+                                        ))}
+                                    </div>
+                                )}
+
+                                {(diagnosticsCleanup?.present || diagnosticsImports?.present) && (
+                                    <div className="grid grid-cols-2 gap-2">
+                                        {diagnosticsCleanup?.present && (
+                                            <div className="rounded bg-[#101018] border border-[#242435] p-2">
+                                                <p className="text-[10px] text-muted">Cleanup</p>
+                                                <p className="text-xs text-white mt-0.5">
+                                                    {diagnosticsCleanup.skippedForSafety || 0} skipped
+                                                </p>
+                                                <p className="text-[10px] text-muted">
+                                                    {diagnosticsCleanup.runtimeProfilesWiped || 0} profiles wiped
+                                                </p>
+                                            </div>
+                                        )}
+                                        {diagnosticsImports?.present && (
+                                            <div className="rounded bg-[#101018] border border-[#242435] p-2">
+                                                <p className="text-[10px] text-muted">Imports</p>
+                                                <p className="text-xs text-white mt-0.5">
+                                                    {diagnosticsImports.importedDataApps || 0} data-aware
+                                                </p>
+                                                <p className="text-[10px] text-muted">
+                                                    {diagnosticsImports.archiveWarnings || 0} archive warnings
+                                                </p>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                    </div>
                 </div>
             )}
 
