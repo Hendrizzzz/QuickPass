@@ -56,6 +56,12 @@ import {
     configureTrustedIpcRenderer
 } from './ipcTrust.js'
 import {
+    createAccountSlotHandlerCore,
+    deleteAccountSlotHandlerCore,
+    loadAccountSlotsHandlerCore,
+    updateAccountSlotHandlerCore
+} from './accountSlots.js'
+import {
     hasUnlockedSession,
     requireActiveSessionState,
     requireConvenienceUnlockRequestSupported,
@@ -615,6 +621,20 @@ function createWorkspaceCapabilityHandlerDeps() {
     }
 }
 
+function createAccountSlotHandlerDeps() {
+    return {
+        requireActiveSession,
+        loadActiveVaultWorkspace,
+        loadVaultMeta,
+        getDriveInfo,
+        getActiveMasterPassword: getActiveMasterPasswordText,
+        encryptVault: (payload, masterPassword, driveInfo) => encrypt(payload, masterPassword, driveInfo.driveType === 3),
+        commitVaultMeta: commitVaultMetaFiles,
+        honeyToken: HONEY_TOKEN,
+        randomBytes: crypto.randomBytes
+    }
+}
+
 function trustedHandle(channel, handler) {
     ipcMain.handle(channel, async (event, ...args) => {
         try {
@@ -660,6 +680,30 @@ function registerIpcHandlers() {
                 loadActiveVaultWorkspace,
                 getVaultDir
             }
+        })
+    })
+    trustedHandle('load-account-slots', async (_, input) => {
+        return loadAccountSlotsHandlerCore({
+            input,
+            deps: createAccountSlotHandlerDeps()
+        })
+    })
+    trustedHandle('create-account-slot', async (_, input) => {
+        return createAccountSlotHandlerCore({
+            input,
+            deps: createAccountSlotHandlerDeps()
+        })
+    })
+    trustedHandle('update-account-slot', async (_, input) => {
+        return updateAccountSlotHandlerCore({
+            input,
+            deps: createAccountSlotHandlerDeps()
+        })
+    })
+    trustedHandle('delete-account-slot', async (_, input) => {
+        return deleteAccountSlotHandlerCore({
+            input,
+            deps: createAccountSlotHandlerDeps()
         })
     })
 

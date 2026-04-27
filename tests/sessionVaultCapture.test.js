@@ -8,12 +8,23 @@ import {
     saveCapturedSessionToVault
 } from '../src/main/sessionVaultCapture.js'
 
+const ACCOUNT_SLOT = {
+    id: `acct_${'d4'.repeat(24)}`,
+    provider: 'google',
+    label: 'Personal',
+    identifierHint: 'user@example.com',
+    state: 'unknown',
+    lastCheckedAt: 0,
+    notes: ''
+}
+
 function createDeps(overrides = {}) {
     const calls = {
         captured: false,
         read: false,
         decryptedWith: null,
         encryptedWith: null,
+        encryptedPayload: null,
         wrote: false,
         savedMeta: false
     }
@@ -39,11 +50,13 @@ function createDeps(overrides = {}) {
             return {
                 _honeyToken: true,
                 webTabs: [{ url: 'https://old.example', enabled: true }],
-                desktopApps: [{ name: 'USB App', path: '[USB]\\Apps\\USB_App\\app.exe', enabled: true }]
+                desktopApps: [{ name: 'USB App', path: '[USB]\\Apps\\USB_App\\app.exe', enabled: true }],
+                accountSlots: [ACCOUNT_SLOT]
             }
         },
         encryptVault: (payload, password, driveInfo) => {
             calls.encryptedWith = password
+            calls.encryptedPayload = payload
             return { payload, password, driveType: driveInfo.driveType }
         },
         writeVault: () => {
@@ -132,6 +145,7 @@ test('session capture ignores renderer password for existing vault writes', asyn
     assert.equal(calls.captured, true)
     assert.equal(calls.decryptedWith, 'active-password')
     assert.equal(calls.encryptedWith, 'active-password')
+    assert.deepEqual(calls.encryptedPayload.accountSlots, [ACCOUNT_SLOT])
     assert.equal(calls.wrote, true)
     assert.equal(calls.savedMeta, true)
 })

@@ -1,4 +1,5 @@
 import { requireActiveSessionState } from './ipcAuthorization.js'
+import { normalizeAccountSlots } from './accountSlots.js'
 import {
     validateCaptureSessionInput,
     validatePasswordInput,
@@ -96,6 +97,7 @@ export async function saveCapturedSessionToVault({
         decryptVault,
         masterPassword
     })
+    const existingAccountSlots = normalizeAccountSlots(existingWorkspace.accountSlots || [])
 
     const result = await capture()
     if (!result.success) return result
@@ -106,7 +108,10 @@ export async function saveCapturedSessionToVault({
         webTabs: urls.map(url => ({ url, enabled: true }))
     }
 
-    const safeWorkspace = validateWorkspace(workspace)
+    const safeWorkspace = {
+        ...validateWorkspace(workspace),
+        accountSlots: existingAccountSlots
+    }
     const existingMeta = loadMeta()
     const authorized = authorizeWorkspaceLaunchCapabilities(safeWorkspace, { existingMeta, existingWorkspace })
     const payload = { ...authorized.workspace, _honeyToken: honeyToken }

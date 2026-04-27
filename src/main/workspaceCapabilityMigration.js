@@ -8,6 +8,7 @@ import {
     validateCapabilityUserArgs,
     validateCapabilityId
 } from './capabilityStore.js'
+import { normalizeAccountSlots } from './accountSlots.js'
 import {
     describePathKind,
     validateWorkspaceInput
@@ -71,7 +72,8 @@ const RAW_LAUNCH_AUTHORITY_FIELDS = new Set([
 ])
 const RENDERER_WORKSPACE_INTERNAL_FIELDS = new Set([
     WORKSPACE_CAPABILITY_VAULT_KEY,
-    WORKSPACE_CAPABILITY_MIGRATION_REPORT_KEY
+    WORKSPACE_CAPABILITY_MIGRATION_REPORT_KEY,
+    'accountSlots'
 ])
 const RENDERER_CAPABILITY_ENTRY_KEYS = new Set([
     'id',
@@ -203,10 +205,10 @@ function normalizeWorkspaceShell(workspace) {
     }
 }
 
-function rejectRendererSuppliedInternalWorkspaceFields(value) {
+export function rejectRendererSuppliedInternalWorkspaceFields(value) {
     for (const key of Object.keys(value || {})) {
         if (RENDERER_WORKSPACE_INTERNAL_FIELDS.has(key)) {
-            fail(`workspace.${key} is main-owned capability metadata and cannot be supplied by the renderer.`)
+            fail(`workspace.${key} is main-owned workspace metadata and cannot be supplied by the renderer.`)
         }
     }
 }
@@ -641,6 +643,7 @@ export function migrateWorkspaceLaunchCapabilities(workspace, {
     now = Date.now
 } = {}) {
     const normalizedWorkspace = normalizeWorkspaceForMigration(workspace || {})
+    const accountSlots = normalizeAccountSlots(workspace?.accountSlots || [])
     const store = createCapabilityStore({ vaultValue: existingCapabilityVault || null })
     const legacyCapabilityMap = normalizeLegacyCapabilityRecords(legacyCapabilities)
     const migratedAt = typeof now === 'function' ? new Date(now()).toISOString() : new Date(now).toISOString()
@@ -712,6 +715,7 @@ export function migrateWorkspaceLaunchCapabilities(workspace, {
         ...('name' in normalizedWorkspace ? { name: normalizedWorkspace.name } : {}),
         webTabs: normalizedWorkspace.webTabs,
         desktopApps,
+        accountSlots,
         [WORKSPACE_CAPABILITY_VAULT_KEY]: store.toVaultValue(),
         [WORKSPACE_CAPABILITY_MIGRATION_REPORT_KEY]: report
     }

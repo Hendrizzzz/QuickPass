@@ -318,6 +318,35 @@ test('migrated workspace entries store only capability ids and limited UI state'
     assert.equal(workspaceEntryHasRawLaunchAuthority(app), false)
 })
 
+test('workspace capability migration preserves encrypted account slots but renderer saves cannot supply them', () => {
+    const accountSlots = [{
+        id: `acct_${'e5'.repeat(24)}`,
+        provider: 'google',
+        label: 'Personal',
+        identifierHint: 'user@example.com',
+        state: 'unknown',
+        lastCheckedAt: 0,
+        notes: ''
+    }]
+
+    const migrated = migrateWorkspaceLaunchCapabilities({
+        webTabs: [],
+        desktopApps: [],
+        accountSlots
+    }, {
+        now: FIXED_NOW
+    })
+
+    assert.deepEqual(migrated.workspace.accountSlots, accountSlots)
+    assert.equal(sanitizeWorkspaceForRenderer(migrated.workspace).accountSlots, undefined)
+
+    assert.throws(() => prepareRendererWorkspaceSave({
+        webTabs: [],
+        desktopApps: [],
+        accountSlots
+    }), /accountSlots is main-owned/)
+})
+
 test('renderer-invented raw launch path cannot be saved or launched', () => {
     assert.throws(() => prepareRendererWorkspaceSave({
         desktopApps: [{
@@ -723,5 +752,5 @@ test('renderer raw metadata injection is rejected during save', () => {
                 [record.capabilityId]: record
             }
         }
-    }), /main-owned capability metadata/)
+    }), /main-owned workspace metadata/)
 })

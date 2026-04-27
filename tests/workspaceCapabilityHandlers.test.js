@@ -20,6 +20,16 @@ function clone(value) {
     return JSON.parse(JSON.stringify(value))
 }
 
+const ACCOUNT_SLOT = {
+    id: `acct_${'c3'.repeat(24)}`,
+    provider: 'google',
+    label: 'Personal',
+    identifierHint: 'user@example.com',
+    state: 'unknown',
+    lastCheckedAt: 0,
+    notes: ''
+}
+
 function createHarness() {
     const vaultDir = mkdtempSync(join(tmpdir(), 'wipesnap-phase2d-'))
     const vaultPath = join(vaultDir, 'vault.json')
@@ -236,6 +246,35 @@ test('browse-exe plus save-workspace persists only opaque capability rows and en
         assert.equal(record.type, 'host-exe')
         assert.equal(record.launch.path, 'C:\\Program Files\\Verified\\Verified.exe')
         assert.equal(harness.loadVaultMeta().launchCapabilities, undefined)
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('save-workspace preserves existing encrypted account slots without returning them as workspace data', async () => {
+    const harness = createHarness()
+    const state = createWorkspaceCapabilityHandlerState()
+    try {
+        harness.writeWorkspace({
+            webTabs: [{ url: 'https://old.example', enabled: true }],
+            desktopApps: [],
+            accountSlots: [ACCOUNT_SLOT]
+        })
+
+        const result = await saveWorkspaceHandlerCore({
+            state,
+            deps: harness.createSaveDeps(),
+            workspace: {
+                webTabs: [{ url: 'https://example.com', enabled: true }],
+                desktopApps: []
+            }
+        })
+
+        assert.equal(result.success, true)
+        const stored = harness.readVault().payload
+        assert.deepEqual(stored.accountSlots, [ACCOUNT_SLOT])
+        assert.equal(result.workspace.accountSlots, undefined)
+        assert.equal(harness.loadVaultMeta().accountSlots, undefined)
     } finally {
         harness.cleanup()
     }
@@ -526,6 +565,37 @@ test('save-vault persists pending capabilities and clears pending process author
         assert.equal(stored.desktopApps[0].path, undefined)
         assert.equal(stored[WORKSPACE_CAPABILITY_VAULT_KEY].records[selected.capabilityId].launch.path, 'C:\\Program Files\\Verified\\Verified.exe')
         assert.equal(harness.loadVaultMeta().launchCapabilities, undefined)
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('save-vault password rotation preserves existing encrypted account slots', async () => {
+    const harness = createHarness()
+    const state = createWorkspaceCapabilityHandlerState()
+    try {
+        harness.writeWorkspace({
+            webTabs: [],
+            desktopApps: [],
+            accountSlots: [ACCOUNT_SLOT]
+        })
+
+        const result = await saveVaultHandlerCore({
+            state,
+            deps: harness.createSaveDeps(),
+            input: {
+                masterPassword: 'rotated-password',
+                currentPassword: 'active-password',
+                pin: null,
+                fastBoot: false,
+                workspace: { webTabs: [], desktopApps: [] }
+            }
+        })
+
+        assert.equal(result.success, true)
+        const stored = harness.readVault().payload
+        assert.deepEqual(stored.accountSlots, [ACCOUNT_SLOT])
+        assert.equal(harness.loadVaultMeta().accountSlots, undefined)
     } finally {
         harness.cleanup()
     }

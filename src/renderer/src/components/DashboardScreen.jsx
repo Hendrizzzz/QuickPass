@@ -1,6 +1,35 @@
 import { useState, useEffect, useRef } from 'react'
 import ImportAppsModal from './ImportAppsModal'
 
+const ACCOUNT_SLOT_STATES = [
+    'unknown',
+    'signed-in',
+    'needs-recheck',
+    'needs-auth',
+    'needs-phone-approval',
+    'needs-passkey',
+    'blocked-or-suspicious',
+    'user-action-required'
+]
+
+const ACCOUNT_SLOT_STATE_LABELS = {
+    unknown: 'Unknown',
+    'signed-in': 'Signed in',
+    'needs-recheck': 'Needs recheck',
+    'needs-auth': 'Needs auth',
+    'needs-phone-approval': 'Needs phone approval',
+    'needs-passkey': 'Needs passkey',
+    'blocked-or-suspicious': 'Blocked or suspicious',
+    'user-action-required': 'User action required'
+}
+
+const EMPTY_ACCOUNT_SLOT_FORM = {
+    label: '',
+    identifierHint: '',
+    state: 'unknown',
+    notes: ''
+}
+
 export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSave, onCancel }) {
     const [webTabs, setWebTabs] = useState(workspace?.webTabs || [])
     const [desktopApps, setDesktopApps] = useState(workspace?.desktopApps || [])
@@ -16,6 +45,13 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const [healthLoading, setHealthLoading] = useState(false)
     const [diagnosticsSummary, setDiagnosticsSummary] = useState(null)
     const [diagnosticsLoading, setDiagnosticsLoading] = useState(false)
+    const [accountSlots, setAccountSlots] = useState([])
+    const [accountSlotsLoading, setAccountSlotsLoading] = useState(false)
+    const [accountSlotsSaving, setAccountSlotsSaving] = useState(false)
+    const [accountSlotsError, setAccountSlotsError] = useState('')
+    const [showAccountSlotForm, setShowAccountSlotForm] = useState(false)
+    const [editingAccountSlotId, setEditingAccountSlotId] = useState(null)
+    const [accountSlotForm, setAccountSlotForm] = useState(EMPTY_ACCOUNT_SLOT_FORM)
 
     const [showAppForm, setShowAppForm] = useState(false)
     const [appForm, setAppForm] = useState({ name: '', path: '', args: '', portableData: false })
@@ -519,6 +555,30 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         }
     }, [])
 
+    const refreshAccountSlots = async () => {
+        if (!window.wipesnap?.loadAccountSlots) return
+        setAccountSlotsLoading(true)
+        setAccountSlotsError('')
+        try {
+            const result = await window.wipesnap.loadAccountSlots()
+            if (result?.success) {
+                setAccountSlots(result.accountSlots || [])
+            } else {
+                setAccountSlots([])
+                setAccountSlotsError(result?.error || 'Account slots are unavailable.')
+            }
+        } catch (err) {
+            setAccountSlots([])
+            setAccountSlotsError(err?.message || 'Account slots are unavailable.')
+        } finally {
+            setAccountSlotsLoading(false)
+        }
+    }
+
+    useEffect(() => {
+        refreshAccountSlots()
+    }, [])
+
     const handleCleanupStaleAppData = async () => {
         if (hasUnsavedAppChanges) {
             setError('Save or discard workspace changes before removing unused AppData.')
@@ -678,6 +738,94 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         if (status === 'missing') return 'No data'
         if (status === 'empty') return 'Empty'
         return status || 'Unknown'
+    }
+
+    const resetAccountSlotForm = () => {
+        setAccountSlotForm({ ...EMPTY_ACCOUNT_SLOT_FORM })
+        setEditingAccountSlotId(null)
+        setShowAccountSlotForm(false)
+    }
+
+    const startAccountSlotCreate = () => {
+        setAccountSlotsError('')
+        setAccountSlotForm({ ...EMPTY_ACCOUNT_SLOT_FORM })
+        setEditingAccountSlotId(null)
+        setShowAccountSlotForm(true)
+    }
+
+    const startAccountSlotEdit = (slot) => {
+        setAccountSlotsError('')
+        setEditingAccountSlotId(slot.id)
+        setAccountSlotForm({
+            label: slot.label || '',
+            identifierHint: slot.identifierHint || '',
+            state: slot.state || 'unknown',
+            notes: slot.notes || ''
+        })
+        setShowAccountSlotForm(true)
+    }
+
+    const saveAccountSlot = async () => {
+        if (!accountSlotForm.label.trim()) {
+            setAccountSlotsError('Account label is required.')
+            return
+        }
+        setAccountSlotsSaving(true)
+        setAccountSlotsError('')
+        const payload = {
+            provider: 'google',
+            label: accountSlotForm.label,
+            identifierHint: accountSlotForm.identifierHint,
+            state: accountSlotForm.state || 'unknown',
+            notes: accountSlotForm.notes
+        }
+        try {
+            const result = editingAccountSlotId
+                ? await window.wipesnap.updateAccountSlot({ id: editingAccountSlotId, ...payload })
+                : await window.wipesnap.createAccountSlot(payload)
+            if (result?.success) {
+                setAccountSlots(result.accountSlots || [])
+                resetAccountSlotForm()
+            } else {
+                setAccountSlotsError(result?.error || 'Account slot could not be saved.')
+            }
+        } catch (err) {
+            setAccountSlotsError(err?.message || 'Account slot could not be saved.')
+        } finally {
+            setAccountSlotsSaving(false)
+        }
+    }
+
+    const removeAccountSlot = async (id) => {
+        setAccountSlotsSaving(true)
+        setAccountSlotsError('')
+        try {
+            const result = await window.wipesnap.deleteAccountSlot({ id })
+            if (result?.success) {
+                setAccountSlots(result.accountSlots || [])
+                if (editingAccountSlotId === id) resetAccountSlotForm()
+            } else {
+                setAccountSlotsError(result?.error || 'Account slot could not be deleted.')
+            }
+        } catch (err) {
+            setAccountSlotsError(err?.message || 'Account slot could not be deleted.')
+        } finally {
+            setAccountSlotsSaving(false)
+        }
+    }
+
+    const formatAccountSlotCheckedAt = (value) => {
+        if (!value) return 'Not checked'
+        try {
+            return new Date(value).toLocaleString([], {
+                month: 'short',
+                day: 'numeric',
+                hour: 'numeric',
+                minute: '2-digit'
+            })
+        } catch (_) {
+            return 'Not checked'
+        }
     }
 
     return (
@@ -1011,6 +1159,117 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                     </div>
                                 )}
                             </div>
+                        )}
+                    </div>
+                </div>
+            )}
+
+            {/* Account Slots */}
+            {!isInSessionMode && (
+                <div className="mb-4">
+                    <div className="flex items-center justify-between mb-2">
+                        <span className="section-label">Account Slots</span>
+                        <button
+                            className="btn-secondary text-xs py-1 px-3"
+                            disabled={accountSlotsSaving}
+                            onClick={showAccountSlotForm ? resetAccountSlotForm : startAccountSlotCreate}
+                        >
+                            {showAccountSlotForm ? 'Cancel' : '+ Add'}
+                        </button>
+                    </div>
+
+                    <div className="rounded-md border border-[#2a2a3a] bg-[#14141c] p-3">
+                        {accountSlotsLoading && (
+                            <div className="flex items-center gap-2 text-xs text-secondary">
+                                <div className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
+                                Loading account slots...
+                            </div>
+                        )}
+
+                        {!accountSlotsLoading && accountSlots.length === 0 && !showAccountSlotForm && (
+                            <p className="text-xs text-muted text-center py-2">No account slots saved</p>
+                        )}
+
+                        {showAccountSlotForm && (
+                            <div className="flex flex-col gap-2 mb-3">
+                                <div className="grid grid-cols-2 gap-2">
+                                    <input
+                                        className="form-input text-sm"
+                                        placeholder="Label"
+                                        value={accountSlotForm.label}
+                                        onChange={(e) => { setAccountSlotForm({ ...accountSlotForm, label: e.target.value }); setAccountSlotsError('') }}
+                                    />
+                                    <select
+                                        className="form-input text-sm"
+                                        value="google"
+                                        disabled
+                                    >
+                                        <option value="google">Google</option>
+                                    </select>
+                                </div>
+                                <input
+                                    className="form-input text-sm"
+                                    placeholder="Identifier hint"
+                                    value={accountSlotForm.identifierHint}
+                                    onChange={(e) => { setAccountSlotForm({ ...accountSlotForm, identifierHint: e.target.value }); setAccountSlotsError('') }}
+                                />
+                                <label className="text-[10px] text-muted">User-set state</label>
+                                <select
+                                    className="form-input text-sm"
+                                    value={accountSlotForm.state}
+                                    onChange={(e) => { setAccountSlotForm({ ...accountSlotForm, state: e.target.value }); setAccountSlotsError('') }}
+                                >
+                                    {ACCOUNT_SLOT_STATES.map((state) => (
+                                        <option key={state} value={state}>{ACCOUNT_SLOT_STATE_LABELS[state]}</option>
+                                    ))}
+                                </select>
+                                <textarea
+                                    className="form-input text-sm min-h-[72px] resize-none"
+                                    placeholder="Notes, not passwords or recovery codes"
+                                    value={accountSlotForm.notes}
+                                    onChange={(e) => { setAccountSlotForm({ ...accountSlotForm, notes: e.target.value }); setAccountSlotsError('') }}
+                                />
+                                <button
+                                    className="btn-primary text-sm py-2"
+                                    disabled={accountSlotsSaving}
+                                    onClick={saveAccountSlot}
+                                >
+                                    {accountSlotsSaving ? 'Saving...' : editingAccountSlotId ? 'Update Slot' : 'Create Slot'}
+                                </button>
+                            </div>
+                        )}
+
+                        {accountSlots.length > 0 && (
+                            <div className="flex flex-col gap-2">
+                                {accountSlots.map((slot) => (
+                                    <div key={slot.id} className="rounded bg-[#101018] border border-[#242435] p-2">
+                                        <div className="flex items-start justify-between gap-2">
+                                            <div className="min-w-0">
+                                                <p className="text-sm text-white truncate">{slot.label}</p>
+                                                <p className="text-[11px] text-muted truncate">{slot.identifierHint || 'No identifier hint'}</p>
+                                            </div>
+                                            <span className="text-[10px] text-secondary flex-shrink-0">Google</span>
+                                        </div>
+                                        <div className="flex items-center justify-between gap-2 mt-2">
+                                            <div className="min-w-0">
+                                                <p className="text-xs text-white truncate">{ACCOUNT_SLOT_STATE_LABELS[slot.state] || 'Unknown'}</p>
+                                                <p className="text-[10px] text-muted truncate">{formatAccountSlotCheckedAt(slot.lastCheckedAt)}</p>
+                                            </div>
+                                            <div className="flex gap-2 flex-shrink-0">
+                                                <button className="btn-secondary text-[11px] py-1 px-2" disabled={accountSlotsSaving} onClick={() => startAccountSlotEdit(slot)}>Edit</button>
+                                                <button className="btn-danger-text text-[11px]" disabled={accountSlotsSaving} onClick={() => removeAccountSlot(slot.id)}>Delete</button>
+                                            </div>
+                                        </div>
+                                        {slot.notes && (
+                                            <p className="text-[10px] text-muted mt-2 whitespace-pre-wrap break-words">{slot.notes}</p>
+                                        )}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+
+                        {accountSlotsError && (
+                            <p className="text-error text-xs text-center mt-2">{accountSlotsError}</p>
                         )}
                     </div>
                 </div>

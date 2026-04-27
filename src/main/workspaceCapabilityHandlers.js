@@ -1,5 +1,6 @@
 import { basename, isAbsolute, relative } from 'path'
 import { createCapabilityRecord, normalizeCapabilityArgsPolicy } from './capabilityStore.js'
+import { attachAccountSlots } from './accountSlots.js'
 import { readAppManifest } from './appManifest.js'
 import { stripLaunchCapabilityMaterialFromMeta } from './vaultMetadata.js'
 import { ensureVaultId, isHiddenMasterVault } from './pinLockout.js'
@@ -8,6 +9,7 @@ import {
     createVaultLocalExecutableCapability,
     prepareRendererWorkspaceSave,
     migrateWorkspaceLaunchCapabilities,
+    rejectRendererSuppliedInternalWorkspaceFields,
     rehydrateWorkspaceLaunchCapabilities,
     sanitizeWorkspaceForRenderer
 } from './workspaceCapabilityMigration.js'
@@ -324,11 +326,13 @@ export function rehydrateWorkspaceForMain(workspace, options = {}) {
 export async function saveWorkspaceHandlerCore({ workspace, state, deps }) {
     try {
         deps.requireActiveSession()
+        rejectRendererSuppliedInternalWorkspaceFields(workspace || {})
 
         const existingMeta = deps.loadVaultMeta()
         const existingWorkspace = deps.loadActiveVaultWorkspace()
         const authorized = authorizeRendererWorkspaceSave(workspace, { state, existingWorkspace })
-        const payload = { ...authorized.workspace, _honeyToken: deps.honeyToken }
+        const persistedWorkspace = attachAccountSlots(authorized.workspace, existingWorkspace?.accountSlots || [])
+        const payload = { ...persistedWorkspace, _honeyToken: deps.honeyToken }
         const driveInfo = await deps.getDriveInfo()
         const encryptedVault = deps.encryptVault(payload, deps.getActiveMasterPassword(), driveInfo.driveType === 3)
         const meta = mergeLaunchCapabilitiesIntoMeta(existingMeta || { version: '1.0.0' }, authorized)
@@ -340,7 +344,7 @@ export async function saveWorkspaceHandlerCore({ workspace, state, deps }) {
         })
         pendingRecordsForState(state).clear()
 
-        return { success: true, workspace: sanitizeWorkspaceForRenderer(authorized.workspace) }
+        return { success: true, workspace: sanitizeWorkspaceForRenderer(persistedWorkspace) }
     } catch (e) {
         return { success: false, error: e.message }
     }
@@ -349,6 +353,7 @@ export async function saveWorkspaceHandlerCore({ workspace, state, deps }) {
 export async function saveVaultHandlerCore({ input, state, deps }) {
     try {
         const { masterPassword, currentPassword, pin, fastBoot, hiddenMaster, workspace } = deps.validateSaveVaultSecurityInput(input)
+        rejectRendererSuppliedInternalWorkspaceFields(workspace || {})
         const driveInfo = await deps.getDriveInfo()
         const vaultExists = deps.vaultExists()
         const existingMeta = deps.loadVaultMeta ? deps.loadVaultMeta() : null
@@ -367,7 +372,8 @@ export async function saveVaultHandlerCore({ input, state, deps }) {
         })
 
         const authorized = authorizeRendererWorkspaceSave(workspace, { state, existingWorkspace })
-        const payload = { ...authorized.workspace, _honeyToken: deps.honeyToken }
+        const persistedWorkspace = attachAccountSlots(authorized.workspace, existingWorkspace?.accountSlots || [])
+        const payload = { ...persistedWorkspace, _honeyToken: deps.honeyToken }
         const encryptedVault = deps.encryptVault(payload, masterPassword, driveInfo.driveType === 3)
 
         let meta = {
