@@ -290,8 +290,16 @@ function hasTraversalSegment(value) {
         .some(part => part === '..')
 }
 
-function isExecutablePath(value) {
-    return /\.(?:exe|bat|cmd)$/i.test(String(value || '').trim())
+function isDirectExecutablePath(value) {
+    return /\.exe$/i.test(String(value || '').trim())
+}
+
+function isWindowsScriptLaunchPath(value) {
+    return /\.(?:bat|cmd)$/i.test(String(value || '').trim())
+}
+
+function isExecutableLikePath(value) {
+    return isDirectExecutablePath(value) || isWindowsScriptLaunchPath(value)
 }
 
 function isProtocolUri(value) {
@@ -312,8 +320,9 @@ function normalizeLocalPath(value, fieldName, { executable = null } = {}) {
     if (!isAbsoluteFilesystemPath(pathValue)) fail(`${fieldName} must be an absolute local filesystem path.`)
     if (isUncPath(pathValue)) fail(`${fieldName} cannot be a network/UNC path.`)
     if (hasTraversalSegment(pathValue)) fail(`${fieldName} cannot contain parent-directory traversal.`)
-    if (executable === true && !isExecutablePath(pathValue)) fail(`${fieldName} must be a direct executable path.`)
-    if (executable === false && isExecutablePath(pathValue)) fail(`${fieldName} cannot be a direct executable path.`)
+    if (executable === true && isWindowsScriptLaunchPath(pathValue)) fail(`${fieldName} cannot be a .bat/.cmd script launch file in this release candidate.`)
+    if (executable === true && !isDirectExecutablePath(pathValue)) fail(`${fieldName} must be a direct executable path.`)
+    if (executable === false && isExecutableLikePath(pathValue)) fail(`${fieldName} cannot be a direct executable path.`)
     return pathValue
 }
 

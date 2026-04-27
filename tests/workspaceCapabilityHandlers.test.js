@@ -241,6 +241,27 @@ test('browse-exe plus save-workspace persists only opaque capability rows and en
     }
 })
 
+test('browse-exe rejects Windows script launch files without issuing host capability', async () => {
+    const harness = createHarness()
+    const state = createWorkspaceCapabilityHandlerState()
+    try {
+        harness.writeWorkspace({ webTabs: [], desktopApps: [] })
+
+        for (const selectedPath of ['C:\\Scripts\\Launch.cmd', 'C:\\Scripts\\Launch.bat']) {
+            const selected = await browseExecutableHandlerCore({
+                state,
+                deps: harness.createBrowseDeps(selectedPath)
+            })
+
+            assert.equal(selected.success, false)
+            assert.match(selected.error, /Script launch files \(\.bat\/\.cmd\) are not supported/)
+            assert.equal(state.pendingLaunchCapabilityRecords.size, 0)
+        }
+    } finally {
+        harness.cleanup()
+    }
+})
+
 test('pending capability ids are process-memory scoped and stale ids fail closed before vault write', async () => {
     const harness = createHarness()
     const issuingState = createWorkspaceCapabilityHandlerState()

@@ -161,8 +161,16 @@ function normalizeLaunchMethod(value) {
     return method
 }
 
-function isExecutablePath(value) {
-    return /\.(?:exe|bat|cmd)$/i.test(String(value || '').trim())
+function isDirectExecutablePath(value) {
+    return /\.exe$/i.test(String(value || '').trim())
+}
+
+function isWindowsScriptLaunchPath(value) {
+    return /\.(?:bat|cmd)$/i.test(String(value || '').trim())
+}
+
+function isExecutableLikePath(value) {
+    return isDirectExecutablePath(value) || isWindowsScriptLaunchPath(value)
 }
 
 function getUriScheme(value) {
@@ -244,27 +252,29 @@ function validateLaunchContract(pathValue, sourceType, launchMethod, fieldPrefix
 
     if (sourceType === 'host-exe') {
         if (kind !== 'absolute') fail(`${fieldPrefix}.path must be an absolute local executable path for host-exe.`)
-        if (!isExecutablePath(pathValue)) fail(`${fieldPrefix}.path must be a direct executable for host-exe.`)
+        if (isWindowsScriptLaunchPath(pathValue)) fail(`${fieldPrefix}.path cannot be a .bat/.cmd script launch file for host-exe in this release candidate.`)
+        if (!isDirectExecutablePath(pathValue)) fail(`${fieldPrefix}.path must be a direct executable for host-exe.`)
         if (launchMethod !== 'spawn') fail(`${fieldPrefix}.launchMethod must be spawn for host-exe.`)
         return
     }
 
     if (['registry-uninstall', 'app-paths', 'start-menu-shortcut'].includes(sourceType)) {
         if (kind !== 'absolute') fail(`${fieldPrefix}.path must be an absolute local path for ${sourceType}.`)
+        if (isWindowsScriptLaunchPath(pathValue)) fail(`${fieldPrefix}.path cannot be a .bat/.cmd script launch file for ${sourceType} in this release candidate.`)
         if (launchMethod !== 'spawn') fail(`${fieldPrefix}.launchMethod must be spawn for ${sourceType}.`)
         return
     }
 
     if (sourceType === 'host-folder') {
         if (kind !== 'absolute') fail(`${fieldPrefix}.path must be an absolute local folder path for host-folder.`)
-        if (isExecutablePath(pathValue)) fail(`${fieldPrefix}.path cannot be a direct executable for host-folder.`)
+        if (isExecutableLikePath(pathValue)) fail(`${fieldPrefix}.path cannot be a direct executable for host-folder.`)
         if (launchMethod !== 'shell-execute') fail(`${fieldPrefix}.launchMethod must be shell-execute for host-folder.`)
         return
     }
 
     if (sourceType === 'shell-execute') {
         if (kind !== 'absolute') fail(`${fieldPrefix}.path must be an absolute local path for shell-execute.`)
-        if (isExecutablePath(pathValue)) fail(`${fieldPrefix}.path cannot be a direct executable for shell-execute.`)
+        if (isExecutableLikePath(pathValue)) fail(`${fieldPrefix}.path cannot be a direct executable for shell-execute.`)
         if (launchMethod !== 'shell-execute') fail(`${fieldPrefix}.launchMethod must be shell-execute for shell-execute.`)
         return
     }

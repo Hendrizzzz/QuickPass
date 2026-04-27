@@ -283,6 +283,32 @@ test('capability validation rejects malformed, summary-bearing, and overbroad re
     }), /direct executable/)
 })
 
+test('capability validation rejects Windows script launch files as executable authority', () => {
+    const record = createCapabilityRecord(hostExeInput(), {
+        randomBytes: bytes(0x11),
+        now: FIXED_NOW
+    })
+
+    for (const scriptPath of ['C:\\Scripts\\Launch.cmd', 'C:\\Scripts\\Launch.bat']) {
+        assert.throws(() => createCapabilityRecord(hostExeInput({
+            launch: {
+                path: scriptPath
+            }
+        }), {
+            randomBytes: bytes(0x12),
+            now: FIXED_NOW
+        }), /\.bat\/\.cmd script launch file/)
+
+        assert.throws(() => validateCapabilityRecord({
+            ...record,
+            launch: {
+                ...record.launch,
+                path: scriptPath
+            }
+        }), /\.bat\/\.cmd script launch file/)
+    }
+})
+
 test('capability validation rejects cross-type launch authority fields', () => {
     assert.throws(() => createCapabilityRecord(hostExeInput({
         launch: {

@@ -238,6 +238,39 @@ test('protocol capability with mismatched scheme is quarantined', () => {
     assert.equal(workspaceEntryHasRawLaunchAuthority(app), false)
 })
 
+test('legacy Windows script host capabilities are quarantined during migration', () => {
+    const legacyScript = {
+        id: 'legacy-script',
+        launchSourceType: 'host-exe',
+        launchMethod: 'spawn',
+        path: 'C:\\Scripts\\Launch.cmd',
+        provenance: 'browse-exe'
+    }
+
+    const migrated = migrateWorkspaceLaunchCapabilities({
+        desktopApps: [{
+            id: 'script-row',
+            name: 'Legacy Script',
+            path: legacyScript.path,
+            launchSourceType: 'host-exe',
+            launchMethod: 'spawn',
+            launchCapabilityId: legacyScript.id,
+            enabled: true
+        }]
+    }, {
+        legacyCapabilities: [legacyScript],
+        now: FIXED_NOW
+    })
+
+    const [app] = migrated.workspace.desktopApps
+    assert.equal(app.enabled, false)
+    assert.equal(app.quarantined, true)
+    assert.match(app.quarantineReason, /\.bat\/\.cmd script launch file/)
+    assert.equal(workspaceEntryHasRawLaunchAuthority(app), false)
+    assert.deepEqual(Object.keys(migrated.workspace[WORKSPACE_CAPABILITY_VAULT_KEY].records), [])
+    assert.deepEqual(rehydrateWorkspaceLaunchCapabilities(migrated.workspace).desktopApps, [])
+})
+
 test('missing capability fails closed during launch rehydration', () => {
     assert.throws(() => rehydrateWorkspaceLaunchCapabilities({
         desktopApps: [{

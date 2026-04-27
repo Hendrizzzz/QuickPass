@@ -1023,6 +1023,37 @@ function classifyLaunchTarget(appConfig = {}, appPath = '') {
     return { classification: 'direct-launch-target', reason: 'Launch target is treated as a direct app process until readiness proves otherwise.' }
 }
 
+export function isWindowsScriptLaunchPath(value) {
+    return /\.(?:bat|cmd)$/i.test(String(value || '').trim())
+}
+
+function isDirectExecutableLaunchPath(value) {
+    return /\.exe$/i.test(String(value || '').trim())
+}
+
+export function shouldUseWindowsShellActivationForExecutable(appPath, args = []) {
+    if (process.platform !== 'win32') return false
+    if (!Array.isArray(args) || args.length > 0) return false
+    const windowsRoot = pathResolve(process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows')
+    const allowedNotepadPaths = new Set([
+        join(windowsRoot, 'System32', 'notepad.exe').toLowerCase(),
+        join(windowsRoot, 'SysWOW64', 'notepad.exe').toLowerCase()
+    ])
+    return allowedNotepadPaths.has(pathResolve(String(appPath || '')).toLowerCase())
+}
+
+export function createLaunchDiagnosticFields(appConfig = {}, appPath = '', args = [], { isExe = null } = {}) {
+    const launchArgs = Array.isArray(args) ? [...args] : []
+    const executableLaunch = isExe == null ? isDirectExecutableLaunchPath(appPath) : !!isExe
+    const launchTargetClassification = classifyLaunchTarget(appConfig, appPath)
+    return {
+        launchTargetClassification: launchTargetClassification.classification,
+        launchTargetClassificationReason: launchTargetClassification.reason,
+        launchArgs,
+        windowsShellActivation: executableLaunch && shouldUseWindowsShellActivationForExecutable(appPath, launchArgs)
+    }
+}
+
 function createReadinessDiagnostic(readinessProfile) {
     return {
         mode: readinessProfile?.mode || null,
@@ -3818,10 +3849,11 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
 
         warnOnEmbeddedHostPaths(localPath, appConfig, onStatus)
 
-        const isExe = appPath.toLowerCase().endsWith('.exe') || appPath.toLowerCase().endsWith('.bat') || appPath.toLowerCase().endsWith('.cmd')
+        const isScriptLaunch = isWindowsScriptLaunchPath(appPath)
+        const isExe = isDirectExecutableLaunchPath(appPath)
         const targetExists = appPath ? existsSync(appPath) : false
         const readinessPolicy = resolveLaunchReadinessPolicy(appConfig, diagRef)
-        const launchTargetClassification = classifyLaunchTarget(appConfig, appPath)
+        const launchDiagnostics = createLaunchDiagnosticFields(appConfig, appPath, args, { isExe })
 
         Object.assign(diagRef, {
             exePath: appPath,
@@ -3829,10 +3861,19 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
             launchSource: (isHostExeLaunch || isWeakShellHostLaunch) ? appConfig.launchSourceType : launchSource,
             readinessPolicy: readinessPolicy.readinessDescription,
             readinessOwnershipMode: readinessPolicy.ownershipMode,
-            launchTargetClassification: launchTargetClassification.classification,
-            launchTargetClassificationReason: launchTargetClassification.reason,
+            launchTargetClassification: launchDiagnostics.launchTargetClassification,
+            launchTargetClassificationReason: launchDiagnostics.launchTargetClassificationReason,
             launchStage: 'spawning'
         })
+
+        if (isScriptLaunch) {
+            Object.assign(diagRef, {
+                launchArgs: launchDiagnostics.launchArgs,
+                windowsShellActivation: false,
+                unsupportedLaunchTarget: 'windows-script'
+            })
+            return failLaunch('unsupported-script-launch', 'Script launch files (.bat/.cmd) are not supported in this release candidate.', 'resolving')
+        }
 
         const canLaunchWithoutFilesystemTarget = ['protocol-uri', 'packaged-app'].includes(appConfig?.launchSourceType)
         if (!targetExists && !canLaunchWithoutFilesystemTarget) {
@@ -3853,13 +3894,15 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
         let child
         let stdoutCapture = ''
         let stderrCapture = ''
-        const launchArgsSnapshot = [...args]
+        const launchArgsSnapshot = launchDiagnostics.launchArgs
+        const useWindowsShellActivation = launchDiagnostics.windowsShellActivation
         try {
             child = isExe
                 ? spawn(appPath, args, {
                     detached: true,
                     stdio: ['ignore', 'pipe', 'pipe'],
-                    ...(cwd ? { cwd } : {})
+                    ...(cwd ? { cwd } : {}),
+                    ...(useWindowsShellActivation ? { shell: true } : {})
                 })
                 : spawn('explorer.exe', [appPath, ...args], {
                     detached: true,
@@ -3936,7 +3979,8 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
             pid: child.pid,
             status: 'spawning',
             spawnCwd: cwd || null,
-            launchArgs: launchArgsSnapshot
+            launchArgs: launchArgsSnapshot,
+            windowsShellActivation: useWindowsShellActivation
         })
 
         launchedApps.push(appObj)

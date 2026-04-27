@@ -162,6 +162,14 @@ function unsupportedBrowseResult(error) {
     return { success: false, error }
 }
 
+function isWindowsScriptLaunchPath(value) {
+    return /\.(?:bat|cmd)$/i.test(String(value || '').trim())
+}
+
+function isSupportedHostExecutableSelection(value) {
+    return /\.exe$/i.test(String(value || '').trim())
+}
+
 function vaultRelativeSelectionPath(selectedPath, vaultDir) {
     const relativePath = relative(vaultDir, selectedPath)
     if (relativePath === '..' || relativePath.startsWith('..\\') || relativePath.startsWith('../') || isAbsolute(relativePath)) return null
@@ -211,12 +219,19 @@ export async function browseExecutableHandlerCore({ state, deps }) {
     deps.requireUnlockedOrNoVault()
     const result = await deps.showOpenDialog({
         properties: ['openFile'],
-        filters: [{ name: 'Executables', extensions: ['exe', 'bat', 'cmd'] }]
+        filters: [{ name: 'Executables', extensions: ['exe'] }]
     })
     if (result.canceled) return null
 
     const vaultDir = deps.getVaultDir()
     const selectedPath = result.filePaths[0]
+    if (isWindowsScriptLaunchPath(selectedPath)) {
+        return unsupportedBrowseResult('Script launch files (.bat/.cmd) are not supported as host executable picks in this release candidate. Select an .exe instead.')
+    }
+    if (!isSupportedHostExecutableSelection(selectedPath)) {
+        return unsupportedBrowseResult('Host executable selections must be .exe files in this release candidate.')
+    }
+
     const vaultLocalSelection = registerVaultLocalExecutableSelection(selectedPath, vaultDir, {
         state,
         readManifest: deps.readAppManifest || readAppManifest,
@@ -225,7 +240,7 @@ export async function browseExecutableHandlerCore({ state, deps }) {
     if (vaultLocalSelection) return vaultLocalSelection
 
     return registerLaunchCapability({
-        name: basename(selectedPath).replace(/\.(exe|bat|cmd)$/i, ''),
+        name: basename(selectedPath).replace(/\.exe$/i, ''),
         path: selectedPath,
         launchSourceType: 'host-exe',
         launchMethod: 'spawn'

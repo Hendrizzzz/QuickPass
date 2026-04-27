@@ -95,7 +95,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
         }
         const path = appForm.path.trim()
         const isAbsoluteHostPath = /^[a-z]:\\/i.test(path)
-        const isExecutablePath = /\.(exe|bat|cmd)$/i.test(path)
+        const isExecutablePath = /\.exe$/i.test(path)
         const inferredHostFolder = isAbsoluteHostPath && !isExecutablePath && !appForm.launchSourceType
         const nextApp = {
             ...appForm,

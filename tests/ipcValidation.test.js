@@ -142,6 +142,33 @@ test('workspace validation enforces launch source path method consistency', () =
 
     assert.throws(() => validateWorkspaceInput({
         desktopApps: [{
+            name: 'ScriptAsExe',
+            path: 'C:\\Scripts\\Launch.cmd',
+            launchSourceType: 'host-exe',
+            launchMethod: 'spawn'
+        }]
+    }), /\.bat\/\.cmd script launch file/)
+
+    assert.throws(() => validateWorkspaceInput({
+        desktopApps: [{
+            name: 'ScriptAsStartMenu',
+            path: 'C:\\Scripts\\Launch.cmd',
+            launchSourceType: 'start-menu-shortcut',
+            launchMethod: 'spawn'
+        }]
+    }), /\.bat\/\.cmd script launch file/)
+
+    assert.throws(() => validateWorkspaceInput({
+        desktopApps: [{
+            name: 'ScriptAsFolder',
+            path: 'C:\\Scripts\\Launch.cmd',
+            launchSourceType: 'host-folder',
+            launchMethod: 'shell-execute'
+        }]
+    }), /cannot be a direct executable/)
+
+    assert.throws(() => validateWorkspaceInput({
+        desktopApps: [{
             name: 'ExeAsFolder',
             path: 'C:\\Windows\\System32\\notepad.exe',
             launchSourceType: 'host-folder',
