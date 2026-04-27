@@ -12,6 +12,8 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const [staleAppDataStatus, setStaleAppDataStatus] = useState('')
     const [showStaleCleanupConfirm, setShowStaleCleanupConfirm] = useState(false)
     const staleAppDataScanRef = useRef(0)
+    const [healthSummary, setHealthSummary] = useState(null)
+    const [healthLoading, setHealthLoading] = useState(false)
     const [diagnosticsSummary, setDiagnosticsSummary] = useState(null)
     const [diagnosticsLoading, setDiagnosticsLoading] = useState(false)
 
@@ -461,6 +463,36 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     useEffect(() => {
         let cancelled = false
 
+        const loadWorkspaceHealth = async () => {
+            if (!window.wipesnap?.loadWorkspaceHealth) return
+            setHealthLoading(true)
+            try {
+                const summary = await window.wipesnap.loadWorkspaceHealth()
+                if (!cancelled) setHealthSummary(summary)
+            } catch (err) {
+                if (!cancelled) {
+                    setHealthSummary({
+                        success: false,
+                        state: 'unavailable',
+                        status: 'broken',
+                        statusLabel: 'Broken',
+                        message: err?.message || 'Workspace health is unavailable.'
+                    })
+                }
+            } finally {
+                if (!cancelled) setHealthLoading(false)
+            }
+        }
+
+        loadWorkspaceHealth()
+        return () => {
+            cancelled = true
+        }
+    }, [])
+
+    useEffect(() => {
+        let cancelled = false
+
         const loadDiagnostics = async () => {
             if (!window.wipesnap?.loadDiagnosticsSummary) return
             setDiagnosticsLoading(true)
@@ -588,6 +620,29 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const diagnosticsBrowser = diagnosticsSummary?.browser
     const diagnosticsCleanup = diagnosticsSummary?.cleanup
     const diagnosticsImports = diagnosticsSummary?.imports
+    const healthReasons = healthSummary?.reasons?.slice(0, 5) || []
+    const healthBrowserProfile = healthSummary?.browserProfile
+    const healthStatus = healthSummary?.status || 'unknown'
+
+    const getHealthStatusClass = (status) => {
+        if (status === 'ready') return 'text-success'
+        if (status === 'needs-attention') return 'text-warning'
+        if (status === 'broken') return 'text-error'
+        return 'text-muted'
+    }
+
+    const getHealthStatusLabel = (status) => {
+        if (status === 'ready') return 'Ready'
+        if (status === 'needs-attention') return 'Needs attention'
+        if (status === 'broken') return 'Broken'
+        return status || 'Unknown'
+    }
+
+    const getHealthReasonClass = (severity) => {
+        if (severity === 'broken') return 'text-error'
+        if (severity === 'warning') return 'text-warning'
+        return 'text-muted'
+    }
 
     const formatDiagnosticsTime = (value) => {
         if (!value) return 'Not recorded'
@@ -717,6 +772,90 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                             </div>
                         </div>
                     ))}
+                </div>
+            )}
+
+            {/* Workspace Health */}
+            {!isInSessionMode && (
+                <div className="mb-4">
+                    <div className="flex items-center justify-between mb-2">
+                        <span className="section-label">Workspace Health</span>
+                        {healthSummary?.state && (
+                            <span className={`text-[10px] font-semibold ${getHealthStatusClass(healthStatus)}`}>
+                                {healthSummary.statusLabel || getHealthStatusLabel(healthStatus)}
+                            </span>
+                        )}
+                    </div>
+
+                    <div className="rounded-md border border-[#2a2a3a] bg-[#14141c] p-3">
+                        {healthLoading && (
+                            <div className="flex items-center gap-2 text-xs text-secondary">
+                                <div className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
+                                Checking workspace...
+                            </div>
+                        )}
+
+                        {!healthLoading && !healthSummary && (
+                            <p className="text-xs text-muted">Workspace health is unavailable.</p>
+                        )}
+
+                        {!healthLoading && healthSummary?.success === false && (
+                            <div>
+                                <p className="text-xs text-error font-medium">Health check unavailable</p>
+                                <p className="text-[11px] text-muted mt-1">{healthSummary.message || 'Workspace health could not be computed safely.'}</p>
+                            </div>
+                        )}
+
+                        {!healthLoading && healthSummary?.success && (
+                            <div className="flex flex-col gap-3">
+                                <div className="flex items-start justify-between gap-3">
+                                    <div className="min-w-0">
+                                        <p className={`text-sm font-semibold ${getHealthStatusClass(healthStatus)}`}>
+                                            {healthSummary.statusLabel || getHealthStatusLabel(healthStatus)}
+                                        </p>
+                                        <p className="text-[11px] text-muted mt-0.5">{healthSummary.message}</p>
+                                    </div>
+                                    <div className="text-right flex-shrink-0">
+                                        <p className="text-xs text-white">{healthSummary.counts?.enabledApps || 0} apps</p>
+                                        <p className="text-[10px] text-muted">{healthSummary.counts?.browserTabs || 0} tabs</p>
+                                    </div>
+                                </div>
+
+                                <div className="grid grid-cols-3 gap-2">
+                                    <div className="rounded bg-[#101018] border border-[#242435] p-2">
+                                        <p className="text-[10px] text-muted">Broken</p>
+                                        <p className="text-sm text-white">{healthSummary.counts?.broken || 0}</p>
+                                    </div>
+                                    <div className="rounded bg-[#101018] border border-[#242435] p-2">
+                                        <p className="text-[10px] text-muted">Warnings</p>
+                                        <p className="text-sm text-white">{healthSummary.counts?.warnings || 0}</p>
+                                    </div>
+                                    <div className="rounded bg-[#101018] border border-[#242435] p-2">
+                                        <p className="text-[10px] text-muted">Profile</p>
+                                        <p className="text-xs text-white truncate">
+                                            {healthBrowserProfile?.status === 'present'
+                                                ? 'Present'
+                                                : healthBrowserProfile?.status === 'missing'
+                                                    ? 'Missing'
+                                                    : 'None'}
+                                        </p>
+                                    </div>
+                                </div>
+
+                                {healthReasons.length > 0 ? (
+                                    <div className="flex flex-col gap-1">
+                                        {healthReasons.map((reason, index) => (
+                                            <p key={`${reason.code}-${index}`} className={`text-[10px] truncate ${getHealthReasonClass(reason.severity)}`}>
+                                                {reason.name}: {reason.message}
+                                            </p>
+                                        ))}
+                                    </div>
+                                ) : (
+                                    <p className="text-[11px] text-muted">All saved launch references passed preflight.</p>
+                                )}
+                            </div>
+                        )}
+                    </div>
                 </div>
             )}
 

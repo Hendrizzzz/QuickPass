@@ -117,6 +117,7 @@ import {
     registerPackagedRendererProtocolScheme
 } from './electronShellHardening.js'
 import { loadDiagnosticsSummaryHandlerCore } from './diagnosticsView.js'
+import { loadWorkspaceHealthSummaryHandlerCore } from './workspaceHealth.js'
 
 registerPackagedRendererProtocolScheme(protocol)
 
@@ -647,6 +648,16 @@ function registerIpcHandlers() {
             input,
             deps: {
                 requireActiveSession,
+                getVaultDir
+            }
+        })
+    })
+    trustedHandle('load-workspace-health', async (_, input) => {
+        return loadWorkspaceHealthSummaryHandlerCore({
+            input,
+            deps: {
+                requireActiveSession,
+                loadActiveVaultWorkspace,
                 getVaultDir
             }
         })
