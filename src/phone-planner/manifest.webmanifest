@@ -1,0 +1,11 @@
+{
+    "name": "Wipesnap Phone Planner",
+    "short_name": "Wipesnap Plan",
+    "description": "Local/offline Wipesnap draft planner.",
+    "start_url": "./index.html",
+    "scope": "./",
+    "display": "standalone",
+    "background_color": "#101418",
+    "theme_color": "#101418",
+    "orientation": "portrait-primary"
+}
