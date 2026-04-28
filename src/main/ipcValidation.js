@@ -187,7 +187,7 @@ function normalizeId(value, fieldName = 'id') {
     return normalizeString(value, fieldName, { max: 128 })
 }
 
-function validateBrowserUrl(value, fieldName) {
+export function validateBrowserUrl(value, fieldName) {
     const url = normalizeString(value, fieldName, { required: true, max: 2048 })
     if (/\s/.test(url)) fail(`${fieldName} cannot contain whitespace.`)
 
