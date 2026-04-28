@@ -48,6 +48,7 @@ export function savePhonePlannerState(state, {
         storageVersion: PHONE_PLANNER_STORAGE_VERSION,
         selectedDraftId: normalized.selectedDraftId,
         drafts: normalized.drafts,
+        snapshotEditor: normalized.snapshotEditor,
         lastSavedAt: normalized.lastSavedAt
     }))
     return normalized

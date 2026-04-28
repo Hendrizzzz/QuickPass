@@ -1,0 +1,493 @@
+[
+    {
+        "name": "active enrolled phone can read a current snapshot envelope",
+        "path": "/users/user_a/snapshots/srev_phase21_1",
+        "operation": "get",
+        "authUid": "user_a",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_phone_1",
+            "wipesnapDeviceRole": "phone",
+            "wipesnapEnrollmentEpoch": 3,
+            "wipesnapKeyVersion": 2
+        },
+        "deviceRecord": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_phone_1",
+            "role": "phone",
+            "status": "active",
+            "syncScopes": ["read", "patch-upload"],
+            "enrollmentEpoch": 3,
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "resourceData": {
+            "ownerUid": "user_a",
+            "keyVersion": 2
+        },
+        "allowed": true,
+        "reason": "device-bound-read"
+    },
+    {
+        "name": "active enrolled phone can read its own key grant",
+        "path": "/users/user_a/keyGrants/grant_phone_k2",
+        "operation": "get",
+        "authUid": "user_a",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_phone_1",
+            "wipesnapDeviceRole": "phone",
+            "wipesnapEnrollmentEpoch": 3,
+            "wipesnapKeyVersion": 2
+        },
+        "deviceRecord": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_phone_1",
+            "role": "phone",
+            "status": "active",
+            "syncScopes": ["read", "patch-upload"],
+            "enrollmentEpoch": 3,
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "resourceData": {
+            "ownerUid": "user_a",
+            "keyVersion": 2,
+            "recipientDeviceId": "dev_phone_1"
+        },
+        "allowed": true,
+        "reason": "device-bound-read"
+    },
+    {
+        "name": "active enrolled desktop can read a device key grant for recovery inspection",
+        "path": "/users/user_a/keyGrants/grant_phone_k2",
+        "operation": "get",
+        "authUid": "user_a",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_desktop_1",
+            "wipesnapDeviceRole": "desktop",
+            "wipesnapEnrollmentEpoch": 5,
+            "wipesnapKeyVersion": 2
+        },
+        "deviceRecord": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_desktop_1",
+            "role": "desktop",
+            "status": "active",
+            "syncScopes": ["read", "snapshot-upload"],
+            "enrollmentEpoch": 5,
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "resourceData": {
+            "ownerUid": "user_a",
+            "keyVersion": 2,
+            "recipientDeviceId": "dev_phone_1"
+        },
+        "allowed": true,
+        "reason": "device-bound-read"
+    },
+    {
+        "name": "active enrolled device can read only its own device record",
+        "path": "/users/user_a/devices/dev_phone_1",
+        "operation": "get",
+        "authUid": "user_a",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_phone_1",
+            "wipesnapDeviceRole": "phone",
+            "wipesnapEnrollmentEpoch": 3,
+            "wipesnapKeyVersion": 2
+        },
+        "deviceRecord": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_phone_1",
+            "role": "phone",
+            "status": "active",
+            "syncScopes": ["read", "patch-upload"],
+            "enrollmentEpoch": 3,
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "allowed": true,
+        "reason": "device-bound-read"
+    },
+    {
+        "name": "cross-user snapshot read is denied before device claims matter",
+        "path": "/users/user_a/snapshots/srev_phase21_1",
+        "operation": "get",
+        "authUid": "user_b",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_phone_1",
+            "wipesnapDeviceRole": "phone",
+            "wipesnapEnrollmentEpoch": 3,
+            "wipesnapKeyVersion": 2
+        },
+        "deviceRecord": {
+            "ownerUid": "user_b",
+            "deviceId": "dev_phone_1",
+            "role": "phone",
+            "status": "active",
+            "syncScopes": ["read"],
+            "enrollmentEpoch": 3,
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "resourceData": {
+            "ownerUid": "user_a",
+            "keyVersion": 2
+        },
+        "allowed": false,
+        "reason": "cross-user-or-unknown-path-denied"
+    },
+    {
+        "name": "anonymous read is denied",
+        "path": "/users/user_a/devices/dev_phone_1",
+        "operation": "get",
+        "authUid": "",
+        "allowed": false,
+        "reason": "auth-required"
+    },
+    {
+        "name": "same uid without device claims is denied",
+        "path": "/users/user_a/snapshots/srev_phase21_1",
+        "operation": "get",
+        "authUid": "user_a",
+        "deviceRecord": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_phone_1",
+            "role": "phone",
+            "status": "active",
+            "syncScopes": ["read"],
+            "enrollmentEpoch": 3,
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "resourceData": {
+            "ownerUid": "user_a",
+            "keyVersion": 2
+        },
+        "allowed": false,
+        "reason": "device-claims-required"
+    },
+    {
+        "name": "non-enrolled claimed device is denied",
+        "path": "/users/user_a/snapshots/srev_phase21_1",
+        "operation": "get",
+        "authUid": "user_a",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_phone_1",
+            "wipesnapDeviceRole": "phone",
+            "wipesnapEnrollmentEpoch": 3,
+            "wipesnapKeyVersion": 2
+        },
+        "resourceData": {
+            "ownerUid": "user_a",
+            "keyVersion": 2
+        },
+        "allowed": false,
+        "reason": "device-not-enrolled"
+    },
+    {
+        "name": "mismatched device record is denied",
+        "path": "/users/user_a/devices/dev_phone_2",
+        "operation": "get",
+        "authUid": "user_a",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_phone_2",
+            "wipesnapDeviceRole": "phone",
+            "wipesnapEnrollmentEpoch": 3,
+            "wipesnapKeyVersion": 2
+        },
+        "deviceRecord": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_phone_1",
+            "role": "phone",
+            "status": "active",
+            "syncScopes": ["read"],
+            "enrollmentEpoch": 3,
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "allowed": false,
+        "reason": "mismatched-device-denied"
+    },
+    {
+        "name": "mismatched enrollment epoch is denied",
+        "path": "/users/user_a/snapshots/srev_phase21_1",
+        "operation": "get",
+        "authUid": "user_a",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_phone_1",
+            "wipesnapDeviceRole": "phone",
+            "wipesnapEnrollmentEpoch": 4,
+            "wipesnapKeyVersion": 2
+        },
+        "deviceRecord": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_phone_1",
+            "role": "phone",
+            "status": "active",
+            "syncScopes": ["read"],
+            "enrollmentEpoch": 3,
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "resourceData": {
+            "ownerUid": "user_a",
+            "keyVersion": 2
+        },
+        "allowed": false,
+        "reason": "mismatched-enrollment-denied"
+    },
+    {
+        "name": "mismatched key version is denied",
+        "path": "/users/user_a/patches/patchrev_phase21_1",
+        "operation": "get",
+        "authUid": "user_a",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_phone_1",
+            "wipesnapDeviceRole": "phone",
+            "wipesnapEnrollmentEpoch": 3,
+            "wipesnapKeyVersion": 1
+        },
+        "deviceRecord": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_phone_1",
+            "role": "phone",
+            "status": "active",
+            "syncScopes": ["read"],
+            "enrollmentEpoch": 3,
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "resourceData": {
+            "ownerUid": "user_a",
+            "keyVersion": 2
+        },
+        "allowed": false,
+        "reason": "mismatched-key-version-denied"
+    },
+    {
+        "name": "mismatched role claim is denied",
+        "path": "/users/user_a/snapshots/srev_phase21_1",
+        "operation": "get",
+        "authUid": "user_a",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_phone_1",
+            "wipesnapDeviceRole": "desktop",
+            "wipesnapEnrollmentEpoch": 3,
+            "wipesnapKeyVersion": 2
+        },
+        "deviceRecord": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_phone_1",
+            "role": "phone",
+            "status": "active",
+            "syncScopes": ["read"],
+            "enrollmentEpoch": 3,
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "resourceData": {
+            "ownerUid": "user_a",
+            "keyVersion": 2
+        },
+        "allowed": false,
+        "reason": "mismatched-role-denied"
+    },
+    {
+        "name": "revoked device status is denied",
+        "path": "/users/user_a/snapshots/srev_phase21_1",
+        "operation": "get",
+        "authUid": "user_a",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_phone_1",
+            "wipesnapDeviceRole": "phone",
+            "wipesnapEnrollmentEpoch": 3,
+            "wipesnapKeyVersion": 2
+        },
+        "deviceRecord": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_phone_1",
+            "role": "phone",
+            "status": "revoked",
+            "syncScopes": ["read"],
+            "enrollmentEpoch": 3,
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "resourceData": {
+            "ownerUid": "user_a",
+            "keyVersion": 2
+        },
+        "allowed": false,
+        "reason": "revoked-device-denied"
+    },
+    {
+        "name": "device with revokedAt set is denied",
+        "path": "/users/user_a/snapshots/srev_phase21_1",
+        "operation": "get",
+        "authUid": "user_a",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_phone_1",
+            "wipesnapDeviceRole": "phone",
+            "wipesnapEnrollmentEpoch": 3,
+            "wipesnapKeyVersion": 2
+        },
+        "deviceRecord": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_phone_1",
+            "role": "phone",
+            "status": "active",
+            "syncScopes": ["read"],
+            "enrollmentEpoch": 3,
+            "keyVersion": 2,
+            "revokedAt": 1770000000000
+        },
+        "resourceData": {
+            "ownerUid": "user_a",
+            "keyVersion": 2
+        },
+        "allowed": false,
+        "reason": "revoked-device-denied"
+    },
+    {
+        "name": "device without read scope is denied",
+        "path": "/users/user_a/snapshots/srev_phase21_1",
+        "operation": "get",
+        "authUid": "user_a",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_phone_1",
+            "wipesnapDeviceRole": "phone",
+            "wipesnapEnrollmentEpoch": 3,
+            "wipesnapKeyVersion": 2
+        },
+        "deviceRecord": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_phone_1",
+            "role": "phone",
+            "status": "active",
+            "syncScopes": ["patch-upload"],
+            "enrollmentEpoch": 3,
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "resourceData": {
+            "ownerUid": "user_a",
+            "keyVersion": 2
+        },
+        "allowed": false,
+        "reason": "read-scope-required"
+    },
+    {
+        "name": "phone cannot read another device key grant",
+        "path": "/users/user_a/keyGrants/grant_desktop_k2",
+        "operation": "get",
+        "authUid": "user_a",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_phone_1",
+            "wipesnapDeviceRole": "phone",
+            "wipesnapEnrollmentEpoch": 3,
+            "wipesnapKeyVersion": 2
+        },
+        "deviceRecord": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_phone_1",
+            "role": "phone",
+            "status": "active",
+            "syncScopes": ["read"],
+            "enrollmentEpoch": 3,
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "resourceData": {
+            "ownerUid": "user_a",
+            "keyVersion": 2,
+            "recipientDeviceId": "dev_desktop_1"
+        },
+        "allowed": false,
+        "reason": "key-grant-recipient-denied"
+    },
+    {
+        "name": "resource with old key version is denied",
+        "path": "/users/user_a/snapshots/srev_phase21_1",
+        "operation": "get",
+        "authUid": "user_a",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_phone_1",
+            "wipesnapDeviceRole": "phone",
+            "wipesnapEnrollmentEpoch": 3,
+            "wipesnapKeyVersion": 2
+        },
+        "deviceRecord": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_phone_1",
+            "role": "phone",
+            "status": "active",
+            "syncScopes": ["read"],
+            "enrollmentEpoch": 3,
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "resourceData": {
+            "ownerUid": "user_a",
+            "keyVersion": 1
+        },
+        "allowed": false,
+        "reason": "resource-key-version-denied"
+    },
+    {
+        "name": "direct client state write is denied",
+        "path": "/users/user_a/state/sync",
+        "operation": "update",
+        "authUid": "user_a",
+        "allowed": false,
+        "reason": "direct-client-writes-denied"
+    },
+    {
+        "name": "direct client key grant write is denied",
+        "path": "/users/user_a/keyGrants/grant_phone_k2",
+        "operation": "create",
+        "authUid": "user_a",
+        "allowed": false,
+        "reason": "direct-client-writes-denied"
+    },
+    {
+        "name": "direct client snapshot write is denied",
+        "path": "/users/user_a/snapshots/srev_phase21_1",
+        "operation": "create",
+        "authUid": "user_a",
+        "allowed": false,
+        "reason": "direct-client-writes-denied"
+    },
+    {
+        "name": "direct client patch write is denied",
+        "path": "/users/user_a/patches/patchrev_phase21_1",
+        "operation": "create",
+        "authUid": "user_a",
+        "allowed": false,
+        "reason": "direct-client-writes-denied"
+    },
+    {
+        "name": "unknown paths default deny",
+        "path": "/users/user_a/rawVault/vault_json",
+        "operation": "get",
+        "authUid": "user_a",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_phone_1",
+            "wipesnapDeviceRole": "phone",
+            "wipesnapEnrollmentEpoch": 3,
+            "wipesnapKeyVersion": 2
+        },
+        "deviceRecord": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_phone_1",
+            "role": "phone",
+            "status": "active",
+            "syncScopes": ["read"],
+            "enrollmentEpoch": 3,
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "allowed": false,
+        "reason": "default-deny"
+    }
+]

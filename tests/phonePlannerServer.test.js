@@ -5,6 +5,7 @@ import { test } from 'node:test'
 import path from 'path'
 
 const require = createRequire(import.meta.url)
+const packageJson = require('../package.json')
 const {
     PHONE_PLANNER_STATIC_ROOT,
     parseArgs,
@@ -37,6 +38,7 @@ async function closeServer(server) {
 }
 
 test('phone planner server defaults to loopback and rejects non-loopback binds', () => {
+    assert.equal(packageJson.scripts['phone-planner'], 'node scripts/phone-planner-server.cjs')
     assert.deepEqual(parseArgs([], {}), {
         help: false,
         host: '127.0.0.1',

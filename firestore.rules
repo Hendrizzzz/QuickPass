@@ -1,0 +1,102 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function owns(userId) {
+      return signedIn() && request.auth.uid == userId;
+    }
+
+    function hasDeviceClaims() {
+      return signedIn()
+        && request.auth.token.wipesnapDeviceId is string
+        && request.auth.token.wipesnapDeviceRole is string
+        && request.auth.token.wipesnapEnrollmentEpoch is int
+        && request.auth.token.wipesnapKeyVersion is int
+        && request.auth.token.wipesnapEnrollmentEpoch > 0
+        && request.auth.token.wipesnapKeyVersion > 0
+        && (
+          request.auth.token.wipesnapDeviceRole == 'desktop'
+          || request.auth.token.wipesnapDeviceRole == 'phone'
+          || request.auth.token.wipesnapDeviceRole == 'web-planner'
+        );
+    }
+
+    function enrolledDeviceExists(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId)/devices/$(request.auth.token.wipesnapDeviceId));
+    }
+
+    function enrolledDeviceData(userId) {
+      return get(/databases/$(database)/documents/users/$(userId)/devices/$(request.auth.token.wipesnapDeviceId)).data;
+    }
+
+    function hasActiveDevice(userId) {
+      return owns(userId)
+        && hasDeviceClaims()
+        && enrolledDeviceExists(userId)
+        && enrolledDeviceData(userId).ownerUid == userId
+        && enrolledDeviceData(userId).deviceId == request.auth.token.wipesnapDeviceId
+        && enrolledDeviceData(userId).status == 'active'
+        && enrolledDeviceData(userId).revokedAt == null
+        && enrolledDeviceData(userId).enrollmentEpoch == request.auth.token.wipesnapEnrollmentEpoch
+        && enrolledDeviceData(userId).keyVersion == request.auth.token.wipesnapKeyVersion
+        && enrolledDeviceData(userId).role == request.auth.token.wipesnapDeviceRole
+        && enrolledDeviceData(userId).syncScopes.hasAny(['read']);
+    }
+
+    function readableCloudResource(userId) {
+      return hasActiveDevice(userId)
+        && resource.data.ownerUid == userId
+        && resource.data.keyVersion == request.auth.token.wipesnapKeyVersion;
+    }
+
+    function readableOwnDevice(userId, deviceId) {
+      return hasActiveDevice(userId)
+        && deviceId == request.auth.token.wipesnapDeviceId
+        && resource.data.deviceId == request.auth.token.wipesnapDeviceId;
+    }
+
+    function readableKeyGrant(userId) {
+      return readableCloudResource(userId)
+        && (
+          resource.data.recipientDeviceId == request.auth.token.wipesnapDeviceId
+          || request.auth.token.wipesnapDeviceRole == 'desktop'
+        );
+    }
+
+    // Phase 21.1 is read-only for clients. Cloud writes are reserved for
+    // approved Functions ingestion that verifies device signatures, sequence
+    // counters, rate limits, and replay protection before using Admin SDK.
+    match /users/{userId}/devices/{deviceId} {
+      allow get, list: if readableOwnDevice(userId, deviceId);
+      allow create, update, delete: if false;
+    }
+
+    match /users/{userId}/keyGrants/{grantId} {
+      allow get, list: if readableKeyGrant(userId);
+      allow create, update, delete: if false;
+    }
+
+    match /users/{userId}/state/{stateId} {
+      allow get, list: if readableCloudResource(userId);
+      allow create, update, delete: if false;
+    }
+
+    match /users/{userId}/snapshots/{revisionId} {
+      allow get, list: if readableCloudResource(userId);
+      allow create, update, delete: if false;
+    }
+
+    match /users/{userId}/patches/{patchRevisionId} {
+      allow get, list: if readableCloudResource(userId);
+      allow create, update, delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

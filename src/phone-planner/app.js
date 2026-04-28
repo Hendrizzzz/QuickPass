@@ -1,6 +1,11 @@
 import {
     PHONE_ACCOUNT_STATES,
     PHONE_DRAFT_LIMITS,
+    SAFE_PRESET_PATCH_LIMITS,
+    SANITIZED_PRESET_SNAPSHOT_LIMITS,
+    addExistingSnapshotItemToPreset,
+    addSnapshotBrowserTabToPreset,
+    clearSnapshotEditorFromState,
     createAccountIntention,
     createBrowserProfileSlot,
     createBrowserTab,
@@ -9,8 +14,19 @@ import {
     createPhonePlannerState,
     deleteDraftFromState,
     duplicateDraftInState,
+    exportSafePresetPatchJson,
+    importSnapshotIntoPlannerState,
+    moveSnapshotPresetInState,
+    moveSnapshotPresetItemInState,
+    removeSnapshotItemFromPreset,
+    selectSnapshotPresetInState,
+    updateSnapshotEditorSelection,
+    updateSnapshotNewBrowserItem,
+    updateSnapshotPresetFields,
+    updateSnapshotPresetItem,
     exportCloudDraftJson,
-    validateDraftForExport
+    validateDraftForExport,
+    validateSafePresetPatchForExport
 } from './phonePlannerCore.js'
 import {
     loadPhonePlannerState,
@@ -21,6 +37,15 @@ let state = loadPhonePlannerState()
 let statusMessage = state.loadError || 'Saved locally on this browser.'
 let errorMessage = ''
 let lastExportJson = ''
+let snapshotImportText = ''
+let newSnapshotTabDraft = {
+    url: 'https://aistudio.google.com/',
+    label: 'AI Studio',
+    notes: '',
+    enabled: true,
+    accountIntentionId: '',
+    profileIntentionId: ''
+}
 
 const root = document.getElementById('app')
 
@@ -30,6 +55,18 @@ if ('serviceWorker' in navigator) {
 
 function selectedDraft() {
     return state.drafts.find(draft => draft.draftId === state.selectedDraftId) || null
+}
+
+function snapshotEditor() {
+    return state.snapshotEditor || null
+}
+
+function selectedSnapshotPreset() {
+    const editor = snapshotEditor()
+    if (!editor) return null
+    return editor.presets.find(preset => preset.id === editor.selectedPresetId) ||
+        [...editor.presets].sort((a, b) => Number(a.order || 0) - Number(b.order || 0))[0] ||
+        null
 }
 
 function createElement(tag, attrs = {}, children = []) {
@@ -124,6 +161,87 @@ function button(text, className, onClick, disabled = false) {
     return createElement('button', { className, onClick, disabled, text })
 }
 
+function commitSnapshotOperation(operation, message) {
+    try {
+        commitState(operation(state), message)
+    } catch (err) {
+        errorMessage = err?.message || 'Snapshot edit failed.'
+        renderStatus()
+    }
+}
+
+function sortedByOrder(items) {
+    return [...items].map((item, index) => ({ item, index }))
+        .sort((a, b) => Number(a.item.order || 0) - Number(b.item.order || 0) || a.index - b.index)
+        .map(({ item }) => item)
+}
+
+function snapshotItemLookup(editor, itemId) {
+    const snapshotItem = editor.snapshot.availableItems.find(item => item.id === itemId)
+    if (snapshotItem) return snapshotItem
+    const newItem = editor.newBrowserItems.find(item => item.id === itemId)
+    if (!newItem) return null
+    return {
+        id: newItem.id,
+        type: 'browser-tab',
+        label: newItem.label || newItem.url,
+        status: newItem.enabled === false ? 'disabled' : 'available',
+        source: 'phone-patch',
+        url: newItem.url,
+        metadataOnly: true
+    }
+}
+
+function snapshotAccounts(editor) {
+    return editor.snapshot.availableItems.filter(item => item.type === 'account-intention')
+}
+
+function snapshotProfiles(editor) {
+    return editor.snapshot.availableItems.filter(item => item.type === 'profile-intention')
+}
+
+function optionsForSnapshotAccounts(editor) {
+    return [
+        { value: '', label: 'No account intention' },
+        ...snapshotAccounts(editor).map(item => ({ value: item.id, label: item.label || item.id }))
+    ]
+}
+
+function optionsForSnapshotProfiles(editor) {
+    return [
+        { value: '', label: 'No profile intention' },
+        ...snapshotProfiles(editor).map(item => ({ value: item.id, label: item.label || item.id }))
+    ]
+}
+
+function optionsForSnapshotPresets(editor) {
+    return [
+        { value: '', label: 'No preset selected' },
+        ...sortedByOrder(editor.presets).map(preset => ({ value: preset.id, label: preset.name || preset.id }))
+    ]
+}
+
+function itemTypeLabel(type) {
+    return {
+        'browser-tab': 'Browser tab',
+        'desktop-app': 'Desktop app',
+        'host-folder': 'Folder',
+        'account-intention': 'Account',
+        'profile-intention': 'Profile'
+    }[type] || type
+}
+
+function itemStatusClass(status) {
+    if (status === 'available') return 'tag ok'
+    if (status === 'disabled') return 'tag muted'
+    if (status === 'redacted' || status === 'broken') return 'tag warn'
+    return 'tag'
+}
+
+function safeIdNode(id) {
+    return createElement('code', { text: id || '' })
+}
+
 function saveCurrent(message = 'Saved locally on this browser.', options = {}) {
     try {
         state = savePhonePlannerState(state, options)
@@ -176,6 +294,47 @@ function optionsForAccounts(draft) {
     ]
 }
 
+function loadSnapshotJsonText(text) {
+    try {
+        const nextState = importSnapshotIntoPlannerState(state, text)
+        snapshotImportText = ''
+        commitState(nextState, 'Loaded sanitized snapshot.')
+    } catch (err) {
+        errorMessage = err?.message || 'Snapshot JSON could not be loaded.'
+        renderStatus()
+    }
+}
+
+function readSnapshotFile(file) {
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = () => {
+        snapshotImportText = String(reader.result || '')
+        loadSnapshotJsonText(snapshotImportText)
+    }
+    reader.onerror = () => {
+        errorMessage = 'Snapshot file could not be read.'
+        renderStatus()
+    }
+    reader.readAsText(file)
+}
+
+function exportSnapshotPatch({ download = true } = {}) {
+    const editor = snapshotEditor()
+    if (!editor) return
+    try {
+        const json = exportSafePresetPatchJson(editor)
+        state.snapshotEditor.lastExportJson = json
+        state = savePhonePlannerState(state)
+        statusMessage = 'Exported validated safe preset patch JSON.'
+        errorMessage = ''
+        if (download) downloadPatchJson(editor, json)
+    } catch (err) {
+        errorMessage = err?.message || 'Safe preset patch cannot be exported.'
+    }
+    render()
+}
+
 function renderStatus() {
     const node = document.getElementById('status-line')
     if (!node) return
@@ -187,13 +346,371 @@ function renderHeader() {
     return createElement('header', { className: 'app-header' }, [
         createElement('div', {}, [
             createElement('p', { className: 'eyebrow', text: 'Wipesnap Phone Planner' }),
-            createElement('h1', { text: 'Local Draft Planner' }),
+            createElement('h1', { text: 'Phone Preset Editor' }),
             createElement('p', {
                 className: 'subhead',
-                text: 'Drafts stay in this browser until you export JSON. Account slots are intentions only, not Google credentials or copied login sessions.'
+                text: 'Snapshot edits stay in this browser until you export a safe patch. Account and profile choices are intentions only, not credentials or copied sessions.'
             })
         ]),
         createElement('div', { className: 'offline-pill', text: 'Offline local' })
+    ])
+}
+
+function renderSnapshotImportPanel(editor) {
+    return createElement('section', { className: 'panel wide snapshot-import' }, [
+        createElement('div', { className: 'section-head' }, [
+            createElement('h2', { text: 'Sanitized Snapshot' }),
+            createElement('span', {
+                text: editor ? `revision ${editor.snapshot.revisionId}` : `${SANITIZED_PRESET_SNAPSHOT_LIMITS.maxSnapshotJsonBytes / 1024} KB max`
+            })
+        ]),
+        createElement('div', { className: 'grid two' }, [
+            textArea({
+                label: 'Paste snapshot JSON',
+                value: snapshotImportText,
+                maxLength: SANITIZED_PRESET_SNAPSHOT_LIMITS.maxSnapshotJsonBytes,
+                rows: 6,
+                placeholder: 'Paste a Phase 18 sanitized snapshot JSON export.',
+                onInput: value => { snapshotImportText = value }
+            }),
+            fieldLabel('Load snapshot file', createElement('input', {
+                type: 'file',
+                accept: 'application/json,.json',
+                onChange: event => readSnapshotFile(event.target.files?.[0] || null)
+            }), editor ? `Loaded ${editor.snapshot.presets.length} presets and ${editor.snapshot.availableItems.length} safe items.` : '')
+        ]),
+        createElement('div', { className: 'toolbar-actions' }, [
+            button('Load Snapshot JSON', 'btn primary', () => loadSnapshotJsonText(snapshotImportText), !snapshotImportText.trim()),
+            button('Clear Snapshot', 'btn danger', () => {
+                if (!editor) return
+                if (!window.confirm('Clear the loaded sanitized snapshot from this browser?')) return
+                commitSnapshotOperation(next => clearSnapshotEditorFromState(next), 'Cleared sanitized snapshot.')
+            }, !editor)
+        ])
+    ])
+}
+
+function renderSnapshotPresetPicker(editor, preset) {
+    const ordered = sortedByOrder(editor.presets)
+    const select = createElement('select', {
+        value: editor.selectedPresetId,
+        onChange: event => {
+            commitSnapshotOperation(
+                next => selectSnapshotPresetInState(next, event.target.value),
+                'Selected snapshot preset.'
+            )
+        }
+    }, ordered.map(item => createElement('option', {
+        value: item.id,
+        text: item.name || item.id
+    })))
+    select.value = editor.selectedPresetId
+
+    return createElement('section', { className: 'toolbar-panel snapshot-toolbar' }, [
+        createElement('div', { className: 'draft-select' }, [
+            createElement('span', { className: 'field-label', text: 'Preset' }),
+            select,
+            createElement('div', { className: 'safe-id-line' }, [safeIdNode(preset?.id || '')])
+        ]),
+        createElement('div', { className: 'toolbar-actions' }, [
+            button('Up', 'btn', () => {
+                if (!preset) return
+                commitSnapshotOperation(next => moveSnapshotPresetInState(next, preset.id, -1), 'Updated preset order.')
+            }, !preset || ordered[0]?.id === preset.id),
+            button('Down', 'btn', () => {
+                if (!preset) return
+                commitSnapshotOperation(next => moveSnapshotPresetInState(next, preset.id, 1), 'Updated preset order.')
+            }, !preset || ordered[ordered.length - 1]?.id === preset.id)
+        ])
+    ])
+}
+
+function renderSnapshotPresetDetails(editor, preset) {
+    if (!preset) {
+        return createElement('section', { className: 'panel' }, [
+            createElement('h2', { text: 'No Preset Loaded' })
+        ])
+    }
+    return createElement('section', { className: 'panel' }, [
+        createElement('div', { className: 'section-head' }, [
+            createElement('h2', { text: 'Preset Metadata' }),
+            createElement('span', { text: preset.enabled === false ? 'disabled' : 'enabled' })
+        ]),
+        createElement('div', { className: 'grid two' }, [
+            textInput({
+                label: 'Preset name',
+                value: preset.name,
+                maxLength: SAFE_PRESET_PATCH_LIMITS.maxPresetNameLength,
+                onInput: value => commitSnapshotOperation(
+                    next => updateSnapshotPresetFields(next, preset.id, { name: value }),
+                    'Updated preset name.'
+                )
+            }),
+            checkboxInput({
+                label: 'Enabled preset',
+                checked: preset.enabled !== false,
+                onChange: value => commitSnapshotOperation(
+                    next => updateSnapshotPresetFields(next, preset.id, { enabled: value }),
+                    'Updated preset enabled state.'
+                )
+            })
+        ]),
+        createElement('div', { className: 'grid two' }, [
+            selectInput({
+                label: 'Default preset',
+                value: editor.selection.defaultPresetId || '',
+                options: optionsForSnapshotPresets(editor),
+                onChange: value => commitSnapshotOperation(
+                    next => updateSnapshotEditorSelection(next, { defaultPresetId: value || null }),
+                    'Updated default preset metadata.'
+                )
+            }),
+            selectInput({
+                label: 'Next preset',
+                value: editor.selection.nextPresetId || '',
+                options: optionsForSnapshotPresets(editor),
+                onChange: value => commitSnapshotOperation(
+                    next => updateSnapshotEditorSelection(next, { nextPresetId: value || null }),
+                    'Updated next preset metadata.'
+                )
+            })
+        ])
+    ])
+}
+
+function renderSnapshotPresetItems(editor, preset) {
+    const orderedRefs = preset ? sortedByOrder(preset.itemRefs) : []
+    return createElement('section', { className: 'panel wide' }, [
+        createElement('div', { className: 'section-head' }, [
+            createElement('h2', { text: 'Preset Items' }),
+            createElement('span', { text: `${orderedRefs.length}/${SAFE_PRESET_PATCH_LIMITS.maxPresetItemRefs}` })
+        ]),
+        createElement('div', { className: 'item-list' }, orderedRefs.map((ref, index) => renderSnapshotPresetItem(editor, preset, ref, index, orderedRefs)))
+    ])
+}
+
+function renderSnapshotPresetItem(editor, preset, ref, index, orderedRefs) {
+    const item = snapshotItemLookup(editor, ref.itemId)
+    const isBrowser = item?.type === 'browser-tab'
+    const newBrowserItem = editor.newBrowserItems.find(candidate => candidate.id === ref.itemId) || null
+    return createElement('article', { className: 'item snapshot-item' }, [
+        createElement('div', { className: 'item-topline' }, [
+            createElement('div', {}, [
+                createElement('strong', { text: item?.label || ref.itemId }),
+                createElement('div', { className: 'item-meta' }, [
+                    createElement('span', { className: 'tag', text: itemTypeLabel(item?.type || 'unknown') }),
+                    createElement('span', { className: itemStatusClass(item?.status || 'available'), text: item?.status || 'available' }),
+                    safeIdNode(ref.itemId)
+                ])
+            ]),
+            createElement('div', { className: 'inline-actions' }, [
+                button('Up', 'btn tiny', () => commitSnapshotOperation(
+                    next => moveSnapshotPresetItemInState(next, preset.id, ref.itemId, -1),
+                    'Updated item order.'
+                ), index === 0),
+                button('Down', 'btn tiny', () => commitSnapshotOperation(
+                    next => moveSnapshotPresetItemInState(next, preset.id, ref.itemId, 1),
+                    'Updated item order.'
+                ), index === orderedRefs.length - 1)
+            ])
+        ]),
+        newBrowserItem ? renderNewBrowserItemFields(newBrowserItem) : null,
+        isBrowser ? createElement('div', { className: 'grid two' }, [
+            selectInput({
+                label: 'Account intention',
+                value: ref.accountIntentionId || newBrowserItem?.accountIntentionId || '',
+                options: optionsForSnapshotAccounts(editor),
+                onChange: value => commitSnapshotOperation(
+                    next => updateSnapshotPresetItem(next, preset.id, ref.itemId, { accountIntentionId: value }),
+                    'Updated browser account intention.'
+                )
+            }),
+            selectInput({
+                label: 'Profile intention',
+                value: ref.profileIntentionId || newBrowserItem?.profileIntentionId || '',
+                options: optionsForSnapshotProfiles(editor),
+                onChange: value => commitSnapshotOperation(
+                    next => updateSnapshotPresetItem(next, preset.id, ref.itemId, { profileIntentionId: value }),
+                    'Updated browser profile intention.'
+                )
+            })
+        ]) : null,
+        createElement('div', { className: 'item-footer' }, [
+            checkboxInput({
+                label: 'Enabled item',
+                checked: ref.enabled !== false,
+                onChange: value => commitSnapshotOperation(
+                    next => updateSnapshotPresetItem(next, preset.id, ref.itemId, { enabled: value }),
+                    'Updated preset item enabled state.'
+                )
+            }),
+            button('Remove item', 'btn danger small', () => commitSnapshotOperation(
+                next => removeSnapshotItemFromPreset(next, preset.id, ref.itemId),
+                'Removed preset item.'
+            ))
+        ])
+    ])
+}
+
+function renderNewBrowserItemFields(item) {
+    return createElement('div', { className: 'new-tab-fields' }, [
+        createElement('div', { className: 'grid two' }, [
+            textInput({
+                label: 'URL',
+                value: item.url,
+                maxLength: SAFE_PRESET_PATCH_LIMITS.maxBrowserTabUrlLength,
+                onInput: value => commitSnapshotOperation(
+                    next => updateSnapshotNewBrowserItem(next, item.id, { url: value }),
+                    'Updated new browser tab URL.'
+                )
+            }),
+            textInput({
+                label: 'Label',
+                value: item.label,
+                maxLength: SAFE_PRESET_PATCH_LIMITS.maxBrowserTabLabelLength,
+                onInput: value => commitSnapshotOperation(
+                    next => updateSnapshotNewBrowserItem(next, item.id, { label: value }),
+                    'Updated new browser tab label.'
+                )
+            })
+        ]),
+        textArea({
+            label: 'Notes',
+            value: item.notes,
+            maxLength: SAFE_PRESET_PATCH_LIMITS.maxBrowserTabNotesLength,
+            rows: 2,
+            onInput: value => commitSnapshotOperation(
+                next => updateSnapshotNewBrowserItem(next, item.id, { notes: value }),
+                'Updated new browser tab notes.'
+            )
+        })
+    ])
+}
+
+function renderAvailableSnapshotItems(editor, preset) {
+    const existingIds = new Set((preset?.itemRefs || []).map(ref => ref.itemId))
+    const items = editor.snapshot.availableItems
+    return createElement('section', { className: 'panel' }, [
+        createElement('div', { className: 'section-head' }, [
+            createElement('h2', { text: 'Available Safe Items' }),
+            createElement('span', { text: `${items.length}/${SANITIZED_PRESET_SNAPSHOT_LIMITS.maxAvailableItems}` })
+        ]),
+        createElement('div', { className: 'item-list compact-list' }, items.map(item => createElement('article', { className: 'item available-item' }, [
+            createElement('div', {}, [
+                createElement('strong', { text: item.label }),
+                createElement('div', { className: 'item-meta' }, [
+                    createElement('span', { className: 'tag', text: itemTypeLabel(item.type) }),
+                    createElement('span', { className: itemStatusClass(item.status), text: item.status }),
+                    safeIdNode(item.id)
+                ])
+            ]),
+            button('Add', 'btn tiny', () => {
+                if (!preset) return
+                commitSnapshotOperation(
+                    next => addExistingSnapshotItemToPreset(next, preset.id, item.id),
+                    'Added safe item id to preset.'
+                )
+            }, !preset || existingIds.has(item.id))
+        ])))
+    ])
+}
+
+function renderAddSnapshotBrowserTab(editor, preset) {
+    return createElement('section', { className: 'panel' }, [
+        createElement('div', { className: 'section-head' }, [
+            createElement('h2', { text: 'New Public Browser Tab' }),
+            createElement('span', { text: `${editor.newBrowserItems.length}/${SAFE_PRESET_PATCH_LIMITS.maxNewBrowserItems}` })
+        ]),
+        textInput({
+            label: 'URL',
+            value: newSnapshotTabDraft.url,
+            maxLength: SAFE_PRESET_PATCH_LIMITS.maxBrowserTabUrlLength,
+            placeholder: 'https://aistudio.google.com/',
+            onInput: value => { newSnapshotTabDraft.url = value }
+        }),
+        textInput({
+            label: 'Label',
+            value: newSnapshotTabDraft.label,
+            maxLength: SAFE_PRESET_PATCH_LIMITS.maxBrowserTabLabelLength,
+            onInput: value => { newSnapshotTabDraft.label = value }
+        }),
+        createElement('div', { className: 'grid two' }, [
+            selectInput({
+                label: 'Account intention',
+                value: newSnapshotTabDraft.accountIntentionId,
+                options: optionsForSnapshotAccounts(editor),
+                onChange: value => { newSnapshotTabDraft.accountIntentionId = value }
+            }),
+            selectInput({
+                label: 'Profile intention',
+                value: newSnapshotTabDraft.profileIntentionId,
+                options: optionsForSnapshotProfiles(editor),
+                onChange: value => { newSnapshotTabDraft.profileIntentionId = value }
+            })
+        ]),
+        textArea({
+            label: 'Notes',
+            value: newSnapshotTabDraft.notes,
+            maxLength: SAFE_PRESET_PATCH_LIMITS.maxBrowserTabNotesLength,
+            rows: 2,
+            onInput: value => { newSnapshotTabDraft.notes = value }
+        }),
+        createElement('div', { className: 'item-footer' }, [
+            checkboxInput({
+                label: 'Enabled tab',
+                checked: newSnapshotTabDraft.enabled !== false,
+                onChange: value => { newSnapshotTabDraft.enabled = value }
+            }),
+            button('Add Browser Tab', 'btn primary small', () => {
+                if (!preset) return
+                commitSnapshotOperation(
+                    next => addSnapshotBrowserTabToPreset(next, preset.id, newSnapshotTabDraft),
+                    'Added new safe browser tab.'
+                )
+            }, !preset || editor.newBrowserItems.length >= SAFE_PRESET_PATCH_LIMITS.maxNewBrowserItems)
+        ])
+    ])
+}
+
+function renderSnapshotExportPanel(editor) {
+    const validation = validateSafePresetPatchForExport(editor)
+    const message = validation.valid
+        ? 'Ready to export as a Phase 19 safe preset patch.'
+        : validation.errors[0]
+    return createElement('section', { className: `panel export-panel ${validation.valid ? '' : 'blocked'}` }, [
+        createElement('div', { className: 'section-head' }, [
+            createElement('h2', { text: 'Safe Patch Export' }),
+            createElement('span', { text: validation.valid ? 'valid' : 'blocked' })
+        ]),
+        createElement('p', { className: 'helper', text: message }),
+        createElement('div', { className: 'export-actions' }, [
+            button('Export Patch JSON', 'btn primary', () => exportSnapshotPatch(), !validation.valid),
+            button('Preview Patch JSON', 'btn', () => exportSnapshotPatch({ download: false }), !validation.valid)
+        ]),
+        createElement('textarea', {
+            className: 'export-json',
+            readonly: true,
+            rows: 10,
+            value: editor.lastExportJson || ''
+        })
+    ])
+}
+
+function renderSnapshotEditor(editor) {
+    if (!editor) {
+        return createElement('main', { className: 'planner-grid' }, [
+            renderSnapshotImportPanel(null)
+        ])
+    }
+    const preset = selectedSnapshotPreset()
+    return createElement('main', { className: 'planner-grid' }, [
+        renderSnapshotImportPanel(editor),
+        renderSnapshotPresetPicker(editor, preset),
+        renderSnapshotPresetDetails(editor, preset),
+        renderAddSnapshotBrowserTab(editor, preset),
+        renderSnapshotPresetItems(editor, preset),
+        renderAvailableSnapshotItems(editor, preset),
+        renderSnapshotExportPanel(editor)
     ])
 }
 
@@ -614,6 +1131,19 @@ function downloadJson(draft, json) {
     URL.revokeObjectURL(url)
 }
 
+function downloadPatchJson(editor, json) {
+    const blob = new Blob([json], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const preset = selectedSnapshotPreset()
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${safeFileName(preset?.name || editor.patchId)}.wipesnap-preset-patch.json`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+}
+
 function exportSelectedDraft({ download = true } = {}) {
     const draft = selectedDraft()
     if (!draft) return
@@ -666,14 +1196,20 @@ function renderEmptyState() {
 function render() {
     root.textContent = ''
     const draft = selectedDraft()
+    const editor = snapshotEditor()
     root.appendChild(renderHeader())
     root.appendChild(createElement('div', { id: 'status-line', className: 'status', text: errorMessage || statusMessage }))
+    root.appendChild(renderSnapshotEditor(editor))
     if (!draft) {
         root.appendChild(renderEmptyState())
         renderStatus()
         return
     }
 
+    root.appendChild(createElement('div', { className: 'legacy-head' }, [
+        createElement('p', { className: 'eyebrow', text: 'Legacy Local Drafts' }),
+        createElement('h2', { text: 'Local Draft Planner' })
+    ]))
     root.appendChild(createElement('main', { className: 'planner-grid' }, [
         renderDraftPicker(draft),
         renderDraftDetails(draft),
