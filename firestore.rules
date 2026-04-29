@@ -67,9 +67,9 @@ service cloud.firestore {
         );
     }
 
-    // Phase 21.1 is read-only for clients. Cloud writes are reserved for
-    // approved Functions ingestion that verifies device signatures, sequence
-    // counters, rate limits, and replay protection before using Admin SDK.
+    // Phase 21.2 keeps clients read-only. Cloud writes are reserved for
+    // Functions ingestion that verifies device signatures, sequence counters,
+    // rate limits, replay protection, and revocation before using Admin SDK.
     match /users/{userId}/devices/{deviceId} {
       allow get, list: if readableOwnDevice(userId, deviceId);
       allow create, update, delete: if false;
