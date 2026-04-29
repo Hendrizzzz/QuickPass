@@ -22,7 +22,9 @@ import {
     approveCloudSyncDeviceEnrollment,
     approveCloudSyncKeyGrant,
     bootstrapCloudSyncDesktopDevice,
+    claimApprovedCloudSyncDeviceSession,
     createCloudSyncAdminSignatureMetadata,
+    createCloudSyncDeviceSessionClaimDocument,
     createCloudSyncIngestionSignatureMetadata,
     ingestCloudSyncDocument,
     requestCloudSyncDeviceEnrollment,
@@ -711,12 +713,14 @@ test('Device enrollment, claim issuance, approval, and revocation stay desktop-a
         sequence: 1,
         status: 'pending'
     })
+    const pairingChallenge = 'pairing_phase21_3_code'
     const request = await requestCloudSyncDeviceEnrollment({
         store,
         auth: { uid: UID, token: {} },
         requestId: pendingPhone.deviceId,
         documentId: pendingPhone.deviceId,
         document: pendingPhone,
+        pairingChallenge,
         signature: adminSignature({
             operation: CLOUD_SYNC_ADMIN_OPERATIONS.requestDeviceEnrollment,
             actorDevice: pendingPhone,
@@ -752,7 +756,6 @@ test('Device enrollment, claim issuance, approval, and revocation stay desktop-a
 
     const approval = await approveCloudSyncDeviceEnrollment({
         store,
-        authIssuer: issuer,
         auth: authFor(desktop),
         requestId: pendingPhone.deviceId,
         signature: adminSignature({
@@ -771,17 +774,146 @@ test('Device enrollment, claim issuance, approval, and revocation stay desktop-a
     assert.equal(approval.status, 'approved')
     const activePhone = store.get(`users/${UID}/devices/${pendingPhone.deviceId}`)
     assert.equal(activePhone.status, 'active')
+    assert.equal(approval.deviceSessionClaimRequired, true)
+    assert.equal(approval.deviceSessionToken, undefined)
+    assert.equal(issuer.issued.length, 1)
+
+    await assertRejectsCode(() => claimApprovedCloudSyncDeviceSession({
+        store,
+        authIssuer: issuer,
+        auth: { uid: UID, token: {} },
+        requestId: activePhone.deviceId,
+        deviceId: activePhone.deviceId,
+        keyGrantId: 'grant_phase21_2_missing',
+        pairingChallenge,
+        deviceSequence: 2,
+        signature: adminSignature({
+            operation: CLOUD_SYNC_ADMIN_OPERATIONS.claimDeviceSession,
+            actorDevice: activePhone,
+            targetDeviceId: activePhone.deviceId,
+            keys: phoneKeys,
+            documentId: activePhone.deviceId,
+            document: createCloudSyncDeviceSessionClaimDocument({
+                requestId: activePhone.deviceId,
+                deviceId: activePhone.deviceId,
+                keyGrantId: 'grant_phase21_2_missing',
+                pairingChallengeHash: sha256Base64Url(Buffer.from(pairingChallenge, 'utf8'))
+            }),
+            sequence: 2
+        }),
+        requestedAt: NOW,
+        now: NOW + 32
+    }), 'failed-precondition', /key grant/)
+
+    const desktopForGrant = store.get(`users/${UID}/devices/${desktop.deviceId}`)
+    const approvalGrant = keyGrantRecord({ desktop: desktopForGrant, phone: activePhone, sequence: 2 })
+    const grantResult = await approveCloudSyncKeyGrant({
+        store,
+        auth: authFor(desktopForGrant),
+        documentId: approvalGrant.grantId,
+        document: approvalGrant,
+        deviceSequence: 2,
+        signature: ingestionSignature({
+            operation: CLOUD_SYNC_INGESTION_OPERATIONS.keyGrant,
+            device: desktopForGrant,
+            keys: desktopKeys,
+            documentId: approvalGrant.grantId,
+            document: approvalGrant,
+            sequence: 2
+        }),
+        requestedAt: NOW,
+        now: NOW + 33
+    })
+    assert.equal(grantResult.status, 'accepted')
+
+    const claimDocument = createCloudSyncDeviceSessionClaimDocument({
+        requestId: activePhone.deviceId,
+        deviceId: activePhone.deviceId,
+        keyGrantId: approvalGrant.grantId,
+        pairingChallengeHash: sha256Base64Url(Buffer.from(pairingChallenge, 'utf8'))
+    })
+    await assertRejectsCode(() => claimApprovedCloudSyncDeviceSession({
+        store,
+        authIssuer: issuer,
+        auth: { uid: UID, token: {} },
+        requestId: activePhone.deviceId,
+        deviceId: activePhone.deviceId,
+        keyGrantId: approvalGrant.grantId,
+        pairingChallenge: 'wrong_pairing_phase21_3',
+        deviceSequence: 2,
+        signature: adminSignature({
+            operation: CLOUD_SYNC_ADMIN_OPERATIONS.claimDeviceSession,
+            actorDevice: activePhone,
+            targetDeviceId: activePhone.deviceId,
+            keys: phoneKeys,
+            documentId: activePhone.deviceId,
+            document: claimDocument,
+            sequence: 2
+        }),
+        requestedAt: NOW,
+        now: NOW + 34
+    }), 'permission-denied', /pairing/)
+
+    const sessionClaim = await claimApprovedCloudSyncDeviceSession({
+        store,
+        authIssuer: issuer,
+        auth: { uid: UID, token: {} },
+        requestId: activePhone.deviceId,
+        deviceId: activePhone.deviceId,
+        keyGrantId: approvalGrant.grantId,
+        pairingChallenge,
+        deviceSequence: 2,
+        signature: adminSignature({
+            operation: CLOUD_SYNC_ADMIN_OPERATIONS.claimDeviceSession,
+            actorDevice: activePhone,
+            targetDeviceId: activePhone.deviceId,
+            keys: phoneKeys,
+            documentId: activePhone.deviceId,
+            document: claimDocument,
+            sequence: 2
+        }),
+        requestedAt: NOW,
+        now: NOW + 35
+    })
+    assert.equal(sessionClaim.status, 'accepted')
     assert.deepEqual(issuer.issued.at(-1), {
         uid: UID,
-        claims: authFor(activePhone).token
+        claims: authFor({ ...activePhone, deviceSequence: 2 }).token
     })
-    assert.equal(approval.deviceSessionToken, `device-session-token:${UID}:${activePhone.deviceId}`)
-    assert.equal(approval.deviceSessionSignInRequired, true)
+    assert.equal(sessionClaim.deviceSessionToken, `device-session-token:${UID}:${activePhone.deviceId}`)
+    assert.equal(sessionClaim.deviceSessionSignInRequired, true)
+    assert.equal(store.get(`users/${UID}/deviceEnrollmentRequests/${activePhone.deviceId}`).lastClaimedByDeviceId, activePhone.deviceId)
+    const serializedBackendDocs = JSON.stringify(Array.from(store.docs.values()))
+    assert.equal(serializedBackendDocs.includes(sessionClaim.deviceSessionToken), false)
+    assert.equal(serializedBackendDocs.includes(pairingChallenge), false)
 
+    await assertRejectsCode(() => claimApprovedCloudSyncDeviceSession({
+        store,
+        authIssuer: issuer,
+        auth: { uid: UID, token: {} },
+        requestId: activePhone.deviceId,
+        deviceId: activePhone.deviceId,
+        keyGrantId: approvalGrant.grantId,
+        pairingChallenge,
+        deviceSequence: 2,
+        signature: adminSignature({
+            operation: CLOUD_SYNC_ADMIN_OPERATIONS.claimDeviceSession,
+            actorDevice: activePhone,
+            targetDeviceId: activePhone.deviceId,
+            keys: phoneKeys,
+            documentId: activePhone.deviceId,
+            document: claimDocument,
+            sequence: 2
+        }),
+        requestedAt: NOW,
+        now: NOW + 36
+    }), 'already-exists', /replayed|stale/)
+
+    const claimedPhone = store.get(`users/${UID}/devices/${activePhone.deviceId}`)
     const revokedRead = store.evaluateClient({
-        path: `/users/${UID}/devices/${activePhone.deviceId}`,
+        path: `/users/${UID}/devices/${claimedPhone.deviceId}`,
         operation: 'get',
-        auth: authFor(activePhone)
+        auth: authFor(claimedPhone)
     })
     assert.equal(revokedRead.allowed, true)
 
@@ -793,10 +925,10 @@ test('Device enrollment, claim issuance, approval, and revocation stay desktop-a
         signature: adminSignature({
             operation: CLOUD_SYNC_ADMIN_OPERATIONS.revokeDevice,
             actorDevice: currentDesktop,
-            targetDeviceId: activePhone.deviceId,
+            targetDeviceId: claimedPhone.deviceId,
             keys: desktopKeys,
-            documentId: activePhone.deviceId,
-            document: activePhone,
+            documentId: claimedPhone.deviceId,
+            document: claimedPhone,
             sequence: 3
         }),
         deviceSequence: 3,
@@ -805,32 +937,32 @@ test('Device enrollment, claim issuance, approval, and revocation stay desktop-a
     })
     assert.equal(revoke.status, 'revoked')
     assert.equal(revoke.cachedClientDataMayRemain, true)
-    const revokedPhone = store.get(`users/${UID}/devices/${activePhone.deviceId}`)
+    const revokedPhone = store.get(`users/${UID}/devices/${claimedPhone.deviceId}`)
     assert.equal(revokedPhone.status, 'revoked')
     assert.equal(revokedPhone.revokedByDeviceId, desktop.deviceId)
 
     const deniedRead = store.evaluateClient({
-        path: `/users/${UID}/devices/${activePhone.deviceId}`,
+        path: `/users/${UID}/devices/${claimedPhone.deviceId}`,
         operation: 'get',
-        auth: authFor(activePhone)
+        auth: authFor(claimedPhone)
     })
     assert.equal(deniedRead.allowed, false)
     assert.equal(deniedRead.reason, 'revoked-device-denied')
 
     const patch = patchFixture({
         patchRevisionId: 'patchrev_phase21_3_revoked',
-        authorDeviceId: activePhone.deviceId
+        authorDeviceId: claimedPhone.deviceId
     })
     const patchEnvelope = envelopeFor({
         docType: CLOUD_SYNC_PATCH_DOC_TYPE,
         payload: patch,
-        device: activePhone,
+        device: claimedPhone,
         keys: phoneKeys,
-        sequence: 2
+        sequence: 3
     })
     await assertRejectsCode(() => ingest({
         store,
-        auth: authFor(activePhone),
+        auth: authFor(claimedPhone),
         operation: CLOUD_SYNC_INGESTION_OPERATIONS.patchEnvelope,
         documentId: patchEnvelope.revisionId,
         document: patchEnvelope

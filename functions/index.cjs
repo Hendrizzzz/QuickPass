@@ -90,6 +90,7 @@ exports.requestCloudSyncDeviceEnrollment = onCall({ region: 'us-central1' }, asy
             requestId: request.data?.requestId,
             documentId: request.data?.documentId,
             document: request.data?.document,
+            pairingChallenge: request.data?.pairingChallenge,
             signature: request.data?.signature,
             requestedAt: request.data?.requestedAt,
             store: await adminStore(),
@@ -107,6 +108,26 @@ exports.approveCloudSyncDeviceEnrollment = onCall({ region: 'us-central1' }, asy
                 : null,
             requestId: request.data?.requestId,
             documentId: request.data?.documentId,
+            signature: request.data?.signature,
+            deviceSequence: request.data?.deviceSequence,
+            requestedAt: request.data?.requestedAt,
+            store: await adminStore(),
+            now: Date.now()
+        })
+    )
+})
+
+exports.claimApprovedCloudSyncDeviceSession = onCall({ region: 'us-central1' }, async request => {
+    const { claimApprovedCloudSyncDeviceSession } = await import('./shared/main/cloudSyncIngestion.js')
+    return mapCloudSyncErrors(async () =>
+        claimApprovedCloudSyncDeviceSession({
+            auth: request.auth
+                ? { uid: request.auth.uid, token: request.auth.token || {} }
+                : null,
+            requestId: request.data?.requestId,
+            deviceId: request.data?.deviceId,
+            keyGrantId: request.data?.keyGrantId,
+            pairingChallenge: request.data?.pairingChallenge,
             signature: request.data?.signature,
             deviceSequence: request.data?.deviceSequence,
             requestedAt: request.data?.requestedAt,

@@ -32,6 +32,7 @@ import {
     CLOUD_SYNC_ADMIN_OPERATIONS,
     CLOUD_SYNC_INGESTION_OPERATIONS,
     createCloudSyncAdminSignatureMetadata,
+    createCloudSyncDeviceSessionClaimDocument,
     createCloudSyncIngestionSignatureMetadata
 } from '../src/main/cloudSyncIngestion.js'
 import { SANITIZED_PRESET_SNAPSHOT_LIMITS } from '../src/main/sanitizedPresetSnapshot.js'
@@ -356,6 +357,42 @@ async function refreshDeviceSessionToken(client, device) {
     return tokenResult.token
 }
 
+function decodeFirestoreValue(value) {
+    if (!value || typeof value !== 'object') return null
+    if ('stringValue' in value) return value.stringValue
+    if ('integerValue' in value) return Number(value.integerValue)
+    if ('doubleValue' in value) return Number(value.doubleValue)
+    if ('booleanValue' in value) return Boolean(value.booleanValue)
+    if ('nullValue' in value) return null
+    if ('arrayValue' in value) return (value.arrayValue.values || []).map(decodeFirestoreValue)
+    if ('mapValue' in value) return decodeFirestoreFields(value.mapValue.fields || {})
+    return null
+}
+
+function decodeFirestoreFields(fields) {
+    const decoded = {}
+    for (const [key, value] of Object.entries(fields || {})) decoded[key] = decodeFirestoreValue(value)
+    return decoded
+}
+
+async function readLiveAdminDocs(paths) {
+    const docs = []
+    for (const path of paths) {
+        const response = await fetch(
+            `http://${FIRESTORE.host}:${FIRESTORE.port}/v1/projects/${PROJECT_ID}/databases/(default)/documents/${path}`,
+            { headers: { Authorization: 'Bearer owner' } }
+        )
+        if (response.status === 404) {
+            docs.push(null)
+            continue
+        }
+        if (!response.ok) throw new Error(`Admin emulator read failed for ${path}: ${response.status}`)
+        const document = await response.json()
+        docs.push(decodeFirestoreFields(document.fields || {}))
+    }
+    return docs
+}
+
 test('Live Firestore rules deny non-device, stale, revoked, cross-user, and direct writes', async () => {
     const rules = readFileSync('firestore.rules', 'utf8')
     const testEnv = await initializeTestEnvironment({
@@ -504,10 +541,12 @@ test('Live Functions emulator enforces independent device sessions, ingestion, k
             sequence: 1,
             status: 'pending'
         })
+        const pairingChallenge = 'pairing_phase21_live_phone'
         await callCallable('requestCloudSyncDeviceEnrollment', {
             requestId: pendingPhone.deviceId,
             documentId: pendingPhone.deviceId,
             document: pendingPhone,
+            pairingChallenge,
             signature: adminSignature({
                 operation: CLOUD_SYNC_ADMIN_OPERATIONS.requestDeviceEnrollment,
                 ownerUid,
@@ -557,32 +596,124 @@ test('Live Functions emulator enforces independent device sessions, ingestion, k
             requestedAt: NOW
         }, desktopToken)
         assert.equal(approval.status, 'approved')
-        assert.deepEqual(approval.customClaims, claimsFor(approval.device))
-        assert.equal(typeof approval.deviceSessionToken, 'string')
+        assert.equal(approval.deviceSessionClaimRequired, true)
+        assert.equal(approval.deviceSessionToken, undefined)
 
         const ownerTokenAfterApproval = await ownerClient.auth.currentUser.getIdTokenResult(true)
         assert.equal(ownerTokenAfterApproval.claims.wipesnapDeviceId, undefined)
 
         const activePhone = approval.device
-        const phoneToken = await signInDeviceSession(phoneClient, approval.deviceSessionToken, activePhone)
+        const approvalGrant = keyGrantRecord({
+            ownerUid,
+            desktop: { ...desktop, deviceSequence: 2 },
+            phone: activePhone,
+            sequence: 4
+        })
+        const grantResult = await callCallable('approveCloudSyncKeyGrant', {
+            documentId: approvalGrant.grantId,
+            document: approvalGrant,
+            deviceSequence: 4,
+            signature: ingestionSignature({
+                operation: CLOUD_SYNC_INGESTION_OPERATIONS.keyGrant,
+                ownerUid,
+                device: { ...desktop, deviceSequence: 2 },
+                keys: desktopKeys,
+                documentId: approvalGrant.grantId,
+                document: approvalGrant,
+                sequence: 4
+            }),
+            requestedAt: NOW
+        }, desktopToken)
+        assert.equal(grantResult.status, 'accepted')
+
+        const claimDocument = createCloudSyncDeviceSessionClaimDocument({
+            requestId: activePhone.deviceId,
+            deviceId: activePhone.deviceId,
+            keyGrantId: approvalGrant.grantId,
+            pairingChallengeHash: sha256Base64Url(Buffer.from(pairingChallenge, 'utf8'))
+        })
+        await assertCallableFails('claimApprovedCloudSyncDeviceSession', {
+            requestId: activePhone.deviceId,
+            deviceId: activePhone.deviceId,
+            keyGrantId: approvalGrant.grantId,
+            pairingChallenge: 'wrong_pairing_phase21_live',
+            deviceSequence: 2,
+            signature: adminSignature({
+                operation: CLOUD_SYNC_ADMIN_OPERATIONS.claimDeviceSession,
+                ownerUid,
+                actorDevice: activePhone,
+                targetDeviceId: activePhone.deviceId,
+                keys: phoneKeys,
+                documentId: activePhone.deviceId,
+                document: claimDocument,
+                sequence: 2
+            }),
+            requestedAt: NOW
+        }, ownerToken, /pairing/)
+
+        const claimedSession = await callCallable('claimApprovedCloudSyncDeviceSession', {
+            requestId: activePhone.deviceId,
+            deviceId: activePhone.deviceId,
+            keyGrantId: approvalGrant.grantId,
+            pairingChallenge,
+            deviceSequence: 2,
+            signature: adminSignature({
+                operation: CLOUD_SYNC_ADMIN_OPERATIONS.claimDeviceSession,
+                ownerUid,
+                actorDevice: activePhone,
+                targetDeviceId: activePhone.deviceId,
+                keys: phoneKeys,
+                documentId: activePhone.deviceId,
+                document: claimDocument,
+                sequence: 2
+            }),
+            requestedAt: NOW
+        }, ownerToken)
+        assert.equal(claimedSession.status, 'accepted')
+        assert.deepEqual(claimedSession.customClaims, claimsFor({ ...activePhone, deviceSequence: 2 }))
+        assert.equal(typeof claimedSession.deviceSessionToken, 'string')
+
+        await assertCallableFails('claimApprovedCloudSyncDeviceSession', {
+            requestId: activePhone.deviceId,
+            deviceId: activePhone.deviceId,
+            keyGrantId: approvalGrant.grantId,
+            pairingChallenge,
+            deviceSequence: 2,
+            signature: adminSignature({
+                operation: CLOUD_SYNC_ADMIN_OPERATIONS.claimDeviceSession,
+                ownerUid,
+                actorDevice: activePhone,
+                targetDeviceId: activePhone.deviceId,
+                keys: phoneKeys,
+                documentId: activePhone.deviceId,
+                document: claimDocument,
+                sequence: 2
+            }),
+            requestedAt: NOW
+        }, ownerToken, /replayed|stale/)
+
+        const claimedPhoneForClaims = { ...activePhone, deviceSequence: 2 }
+        const phoneToken = await signInDeviceSession(phoneClient, claimedSession.deviceSessionToken, claimedPhoneForClaims)
         assert.equal(phoneClient.auth.currentUser.uid, ownerUid)
+        const claimedPhone = (await getDoc(doc(phoneClient.db, `users/${ownerUid}/devices/${activePhone.deviceId}`))).data()
+        assert.equal(claimedPhone.deviceSequence, 2)
         desktopToken = await refreshDeviceSessionToken(desktopClient, desktop)
         await assert.ok((await getDoc(doc(desktopClient.db, `users/${ownerUid}/snapshots/${snapshotEnvelope.revisionId}`))).exists())
         await assert.ok((await getDoc(doc(phoneClient.db, `users/${ownerUid}/snapshots/${snapshotEnvelope.revisionId}`))).exists())
 
         const revoke = await callCallable('revokeCloudSyncDevice', {
-            targetDeviceId: activePhone.deviceId,
+            targetDeviceId: claimedPhone.deviceId,
             signature: adminSignature({
                 operation: CLOUD_SYNC_ADMIN_OPERATIONS.revokeDevice,
                 ownerUid,
-                actorDevice: { ...desktop, deviceSequence: 3 },
-                targetDeviceId: activePhone.deviceId,
+                actorDevice: { ...desktop, deviceSequence: 4 },
+                targetDeviceId: claimedPhone.deviceId,
                 keys: desktopKeys,
-                documentId: activePhone.deviceId,
-                document: activePhone,
-                sequence: 4
+                documentId: claimedPhone.deviceId,
+                document: claimedPhone,
+                sequence: 5
             }),
-            deviceSequence: 4,
+            deviceSequence: 5,
             requestedAt: NOW
         }, desktopToken)
         assert.equal(revoke.status, 'revoked')
@@ -598,9 +729,9 @@ test('Live Functions emulator enforces independent device sessions, ingestion, k
             docType: CLOUD_SYNC_PATCH_DOC_TYPE,
             payload: revokedPatch,
             ownerUid,
-            device: activePhone,
+            device: claimedPhone,
             keys: phoneKeys,
-            sequence: 2
+            sequence: 3
         })
         await assertCallableFails('ingestCloudSyncDocument', {
             operation: CLOUD_SYNC_INGESTION_OPERATIONS.patchEnvelope,
@@ -620,7 +751,7 @@ test('Live Functions emulator enforces independent device sessions, ingestion, k
             ownerUid,
             device: desktop,
             keys: desktopKeys,
-            sequence: 5
+            sequence: 6
         })
         const secondSnapshotResult = await callCallable('ingestCloudSyncDocument', {
             operation: CLOUD_SYNC_INGESTION_OPERATIONS.snapshotEnvelope,
@@ -631,25 +762,49 @@ test('Live Functions emulator enforces independent device sessions, ingestion, k
 
         const grant = keyGrantRecord({
             ownerUid,
-            desktop: { ...desktop, deviceSequence: 5 },
-            phone: activePhone,
-            sequence: 6
+            desktop: { ...desktop, deviceSequence: 6 },
+            phone: claimedPhone,
+            sequence: 7
         })
         await assertCallableFails('approveCloudSyncKeyGrant', {
             documentId: grant.grantId,
             document: grant,
-            deviceSequence: 6,
+            deviceSequence: 7,
             signature: ingestionSignature({
                 operation: CLOUD_SYNC_INGESTION_OPERATIONS.keyGrant,
                 ownerUid,
-                device: { ...desktop, deviceSequence: 5 },
+                device: { ...desktop, deviceSequence: 6 },
                 keys: desktopKeys,
                 documentId: grant.grantId,
                 document: grant,
-                sequence: 6
+                sequence: 7
             }),
             requestedAt: NOW
         }, desktopToken, /recipient|active|revoked/)
+
+        const backendDocs = await readLiveAdminDocs([
+            `users/${ownerUid}/deviceEnrollmentRequests/${activePhone.deviceId}`,
+            `users/${ownerUid}/devices/${desktop.deviceId}`,
+            `users/${ownerUid}/devices/${activePhone.deviceId}`,
+            `users/${ownerUid}/keyGrants/${approvalGrant.grantId}`,
+            `users/${ownerUid}/snapshots/${snapshotEnvelope.revisionId}`,
+            `users/${ownerUid}/snapshots/${secondSnapshotEnvelope.revisionId}`
+        ])
+        for (const backendDoc of backendDocs) assertNoForbiddenCloudSyncBackendPlaintext(backendDoc)
+        const serializedBackendDocs = JSON.stringify(backendDocs)
+        for (const forbidden of [
+            bootstrap.deviceSessionToken,
+            claimedSession.deviceSessionToken,
+            pairingChallenge,
+            'deviceSessionToken',
+            'syncRootKey',
+            'rootKeyMaterial',
+            'vault.json',
+            'capability',
+            'password'
+        ]) {
+            assert.equal(serializedBackendDocs.includes(forbidden), false, `backend doc leaked ${forbidden}`)
+        }
     } finally {
         await Promise.allSettled([
             deleteApp(ownerClient.app),

@@ -27,12 +27,16 @@ export const CLOUD_SYNC_ADMIN_OPERATIONS = Object.freeze({
     bootstrapDesktopDevice: 'bootstrap-desktop-device',
     requestDeviceEnrollment: 'request-device-enrollment',
     approveDeviceEnrollment: 'approve-device-enrollment',
+    claimDeviceSession: 'claim-device-session',
     revokeDevice: 'revoke-device'
 })
 
 const DEVICE_ROLES = new Set(['desktop', 'phone', 'web-planner'])
 const DEVICE_ID_PATTERN = /^dev_[A-Za-z0-9_-]{1,92}$/
 const OWNER_UID_PATTERN = /^[A-Za-z0-9:_-]{1,128}$/
+const GRANT_ID_PATTERN = /^grant_[A-Za-z0-9_-]{1,90}$/
+const PAIRING_CHALLENGE_PATTERN = /^[A-Za-z0-9_-]{16,128}$/
+const HASH_PATTERN = /^[A-Za-z0-9_-]{32,128}$/
 const MAX_TIMESTAMP = 8_640_000_000_000_000
 
 export class CloudSyncIngestionError extends Error {
@@ -82,6 +86,26 @@ function normalizeDeviceId(value, fieldName = 'deviceId') {
     return text
 }
 
+function normalizeGrantId(value, fieldName = 'grantId') {
+    const text = normalizeString(value, fieldName, { max: 96 })
+    if (!GRANT_ID_PATTERN.test(text)) fail('invalid-argument', `${fieldName} must be a safe key grant id.`)
+    return text
+}
+
+function normalizePairingChallenge(value, fieldName = 'pairingChallenge') {
+    const text = normalizeString(value, fieldName, { max: 128 })
+    if (!PAIRING_CHALLENGE_PATTERN.test(text)) {
+        fail('invalid-argument', `${fieldName} must be a safe one-time pairing challenge.`)
+    }
+    return text
+}
+
+function normalizeHash(value, fieldName) {
+    const text = normalizeString(value, fieldName, { max: 128 })
+    if (!HASH_PATTERN.test(text)) fail('invalid-argument', `${fieldName} must be a safe hash.`)
+    return text
+}
+
 function normalizePositiveInteger(value, fieldName) {
     if (!Number.isSafeInteger(value) || value <= 0) {
         fail('invalid-argument', `${fieldName} must be a positive safe integer.`)
@@ -122,6 +146,10 @@ function normalizeAuth(auth) {
 
 function sha256Base64Url(value) {
     return createHash('sha256').update(value).digest('base64url')
+}
+
+function hashPairingChallenge(pairingChallenge) {
+    return sha256Base64Url(Buffer.from(pairingChallenge, 'utf8'))
 }
 
 function documentHash(document) {
@@ -184,6 +212,23 @@ export function createCloudSyncAdminSignatureMetadata({
         documentHash: documentHash(document),
         requestedAt
     })
+}
+
+export function createCloudSyncDeviceSessionClaimDocument({
+    requestId,
+    deviceId,
+    keyGrantId,
+    pairingChallengeHash
+}) {
+    return {
+        product: 'wipesnap',
+        schemaVersion: CLOUD_SYNC_INGESTION_SCHEMA_VERSION,
+        purpose: 'device-session-claim',
+        requestId: normalizeDeviceId(requestId, 'requestId'),
+        deviceId: normalizeDeviceId(deviceId, 'deviceId'),
+        keyGrantId: normalizeGrantId(keyGrantId, 'keyGrantId'),
+        pairingChallengeHash: normalizeHash(pairingChallengeHash, 'pairingChallengeHash')
+    }
 }
 
 function publicKeyFromDeviceRecord(device) {
@@ -865,6 +910,8 @@ export async function requestCloudSyncDeviceEnrollment(input = {}) {
     const requestedAt = normalizeTimestamp(input.requestedAt, 'requestedAt', now)
     const document = clone(input.document)
     const documentId = normalizeDeviceId(input.documentId, 'documentId')
+    const pairingChallenge = normalizePairingChallenge(input.pairingChallenge, 'pairingChallenge')
+    const pairingChallengeHash = hashPairingChallenge(pairingChallenge)
 
     return input.store.runTransaction(async tx => {
         const device = validateDeviceRecordForAdmin({
@@ -895,6 +942,8 @@ export async function requestCloudSyncDeviceEnrollment(input = {}) {
             ownerUid: ownerAuth.uid,
             requestId,
             status: 'pending',
+            pairingChallengeAlg: 'SHA-256-BASE64URL',
+            pairingChallengeHash,
             device,
             requestedAt: now,
             updatedAt: now
@@ -913,7 +962,7 @@ export async function approveCloudSyncDeviceEnrollment(input = {}) {
     const now = normalizeTimestamp(input.now, 'now', Date.now())
     const requestedAt = normalizeTimestamp(input.requestedAt, 'requestedAt', now)
 
-    const result = await input.store.runTransaction(async tx => {
+    return input.store.runTransaction(async tx => {
         const { device: approver } = await requireExistingActiveDesktop(tx, authContext)
         const requestPath = enrollmentRequestPath(authContext.uid, requestId)
         const request = await tx.get(requestPath)
@@ -961,19 +1010,173 @@ export async function approveCloudSyncDeviceEnrollment(input = {}) {
             device: approved,
             updatedAt: now
         })
-        return { status: 'approved', requestId, deviceId: approved.deviceId, device: approved }
+        return {
+            status: 'approved',
+            requestId,
+            deviceId: approved.deviceId,
+            device: approved,
+            deviceSessionClaimRequired: true
+        }
     })
+}
+
+export async function claimApprovedCloudSyncDeviceSession(input = {}) {
+    if (!isPlainObject(input)) fail('invalid-argument', 'Cloud sync device session claim input must be an object.')
+    if (!input.store || typeof input.store.runTransaction !== 'function') {
+        fail('failed-precondition', 'Cloud sync device session claim requires a Firestore Admin store.')
+    }
+    const ownerAuth = normalizeSignedInOwnerAuth(input.auth)
+    const deviceId = normalizeDeviceId(input.deviceId, 'deviceId')
+    const requestId = normalizeEnrollmentRequestId(input.requestId, deviceId)
+    const keyGrantId = normalizeGrantId(input.keyGrantId, 'keyGrantId')
+    const pairingChallenge = normalizePairingChallenge(input.pairingChallenge, 'pairingChallenge')
+    const pairingChallengeHash = hashPairingChallenge(pairingChallenge)
+    const now = normalizeTimestamp(input.now, 'now', Date.now())
+    const requestedAt = normalizeTimestamp(input.requestedAt, 'requestedAt', now)
+    const deviceSequence = normalizeNonNegativeInteger(input.deviceSequence, 'deviceSequence')
+    const rateLimit = {
+        windowMs: normalizePositiveInteger(
+            input.rateLimit?.windowMs ?? CLOUD_SYNC_INGESTION_RATE_LIMIT.windowMs,
+            'rateLimit.windowMs'
+        ),
+        maxWritesPerWindow: normalizePositiveInteger(
+            input.rateLimit?.maxWritesPerWindow ?? CLOUD_SYNC_INGESTION_RATE_LIMIT.maxWritesPerWindow,
+            'rateLimit.maxWritesPerWindow'
+        )
+    }
+
+    const result = await input.store.runTransaction(async tx => {
+        const requestPath = enrollmentRequestPath(ownerAuth.uid, requestId)
+        const request = await tx.get(requestPath)
+        if (!isPlainObject(request) || request.status !== 'approved') {
+            fail('failed-precondition', 'Cloud sync enrollment request is not approved.')
+        }
+        if (request.ownerUid !== ownerAuth.uid) fail('permission-denied', 'Enrollment request owner does not match caller.')
+        if (request.requestId !== requestId) fail('failed-precondition', 'Enrollment request id does not match caller.')
+        if (request.pairingChallengeAlg !== 'SHA-256-BASE64URL' || request.pairingChallengeHash !== pairingChallengeHash) {
+            fail('permission-denied', 'Cloud sync pairing challenge is not valid.')
+        }
+
+        const devicePath = userPath(ownerAuth.uid, 'devices', deviceId)
+        const rawDevice = await tx.get(devicePath)
+        if (!rawDevice) fail('permission-denied', 'Cloud sync device is not enrolled.')
+        let device
+        try {
+            device = validateCloudSyncDeviceRecord(rawDevice)
+        } catch (error) {
+            fail('failed-precondition', error.message || 'Cloud sync device record is invalid.')
+        }
+        if (device.ownerUid !== ownerAuth.uid) fail('permission-denied', 'Device owner does not match caller.')
+        if (device.deviceId !== deviceId) fail('permission-denied', 'Device id does not match caller.')
+        if (!['phone', 'web-planner'].includes(device.role)) {
+            fail('permission-denied', 'Only phone or web planner devices may claim a phone planning device session.')
+        }
+        if (device.status !== 'active' || device.revokedAt != null) {
+            fail('permission-denied', 'Device is not active or has been revoked.')
+        }
+        requireScope(device, 'read')
+        requireScope(device, 'patch-upload')
+        assertMonotonicDeviceSequence(device, deviceSequence)
+
+        const requestDevice = validateDeviceRecordForAdmin({
+            document: request.device,
+            ownerUid: ownerAuth.uid,
+            documentId: deviceId,
+            expectedStatus: 'active'
+        })
+        if (
+            requestDevice.role !== device.role ||
+            requestDevice.enrollmentEpoch !== device.enrollmentEpoch ||
+            requestDevice.keyVersion !== device.keyVersion
+        ) {
+            fail('failed-precondition', 'Approved enrollment request does not match the active device.')
+        }
+
+        const keyGrantPath = userPath(ownerAuth.uid, 'keyGrants', keyGrantId)
+        const rawKeyGrant = await tx.get(keyGrantPath)
+        if (!rawKeyGrant) fail('failed-precondition', 'Approved device session requires a wrapped sync key grant.')
+        let keyGrant
+        try {
+            keyGrant = validateCloudSyncKeyGrant(rawKeyGrant)
+        } catch (error) {
+            fail('failed-precondition', error.message || 'Cloud sync key grant is invalid.')
+        }
+        if (keyGrant.ownerUid !== ownerAuth.uid) fail('permission-denied', 'Key grant owner does not match caller.')
+        if (keyGrant.recipientDeviceId !== device.deviceId) fail('permission-denied', 'Key grant recipient does not match caller.')
+        if (keyGrant.keyVersion !== device.keyVersion) fail('permission-denied', 'Key grant key version does not match caller.')
+        if (keyGrant.revokedAt != null) fail('permission-denied', 'Key grant has been revoked.')
+
+        const creator = await tx.get(userPath(ownerAuth.uid, 'devices', keyGrant.createdByDeviceId))
+        if (!creator) fail('failed-precondition', 'Key grant creator device is not enrolled.')
+        let creatorDevice
+        try {
+            creatorDevice = validateCloudSyncDeviceRecord(creator)
+        } catch (error) {
+            fail('failed-precondition', error.message || 'Key grant creator device record is invalid.')
+        }
+        if (creatorDevice.ownerUid !== ownerAuth.uid || creatorDevice.role !== 'desktop') {
+            fail('permission-denied', 'Key grant must be created by an enrolled desktop device.')
+        }
+        if (creatorDevice.status !== 'active' || creatorDevice.revokedAt != null) {
+            fail('permission-denied', 'Key grant creator device is not active.')
+        }
+
+        const claimDocument = createCloudSyncDeviceSessionClaimDocument({
+            requestId,
+            deviceId,
+            keyGrantId,
+            pairingChallengeHash
+        })
+        verifyDetachedAdminSignature({
+            operation: CLOUD_SYNC_ADMIN_OPERATIONS.claimDeviceSession,
+            ownerUid: ownerAuth.uid,
+            actorDevice: device,
+            targetDeviceId: device.deviceId,
+            documentId: requestId,
+            document: claimDocument,
+            deviceSequence,
+            enrollmentEpoch: device.enrollmentEpoch,
+            keyVersion: device.keyVersion,
+            requestedAt,
+            signature: input.signature
+        })
+
+        await enforceReplayAndRateLimit(tx, {
+            authContext: {
+                uid: ownerAuth.uid,
+                deviceId: device.deviceId,
+                role: device.role,
+                enrollmentEpoch: device.enrollmentEpoch,
+                keyVersion: device.keyVersion
+            },
+            deviceSequence,
+            operation: CLOUD_SYNC_ADMIN_OPERATIONS.claimDeviceSession,
+            documentId: requestId,
+            now,
+            rateLimit
+        })
+        await updateDeviceSequence(tx, devicePath, device, deviceSequence, now)
+        await tx.set(requestPath, {
+            ...request,
+            lastClaimedAt: now,
+            lastClaimedByDeviceId: device.deviceId,
+            lastClaimKeyGrantId: keyGrant.grantId,
+            updatedAt: now
+        })
+        return { status: 'accepted', deviceId: device.deviceId, device: { ...device, deviceSequence, updatedAt: Math.max(device.updatedAt, now) } }
+    })
+
     const issued = await issueDeviceSessionToken({
         authIssuer: input.authIssuer,
-        ownerUid: authContext.uid,
+        ownerUid: ownerAuth.uid,
         device: result.device
     })
     return {
         status: result.status,
-        requestId: result.requestId,
         deviceId: result.deviceId,
-        device: result.device,
-        ...issued
+        customClaims: issued.customClaims,
+        deviceSessionToken: issued.deviceSessionToken,
+        deviceSessionSignInRequired: issued.deviceSessionSignInRequired
     }
 }
 
