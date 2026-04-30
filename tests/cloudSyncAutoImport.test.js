@@ -22,6 +22,7 @@ import {
 import {
     cloudSyncAutoImportStatusContainsForbiddenMaterial,
     createTrustedAutoImportOrchestrator,
+    sanitizeTrustedAutoImportError,
     sanitizeTrustedAutoImportResult
 } from '../src/main/cloudSyncAutoImport.js'
 import {
@@ -275,7 +276,7 @@ class InMemoryFirestore {
     }
 }
 
-function createMergeDeps(workspace, { unlocked = true } = {}) {
+function createMergeDeps(workspace, { unlocked = true, failCommit = false } = {}) {
     let storedWorkspace = clone(workspace)
     let meta = { version: '1.0.0' }
     const calls = {
@@ -297,6 +298,7 @@ function createMergeDeps(workspace, { unlocked = true } = {}) {
         }),
         commitVaultMeta: ({ vault, meta: nextMeta }) => {
             calls.commits += 1
+            if (failCommit) throw new Error('transaction failed for C:\\Users\\Alice\\vault.json bearer raw-token')
             storedWorkspace = clone(vault.payload)
             meta = clone(nextMeta)
         },
@@ -433,8 +435,8 @@ async function seedPlannerPatch(harness, patch) {
     })
 }
 
-async function runAutoImport({ harness, snapshot, workspace = workspaceFixture(), unlocked = true } = {}) {
-    const merge = createMergeDeps(workspace, { unlocked })
+async function runAutoImport({ harness, snapshot, workspace = workspaceFixture(), unlocked = true, mergeOptions = {} } = {}) {
+    const merge = createMergeDeps(workspace, { unlocked, ...mergeOptions })
     let snapshotBuilds = 0
     const orchestrator = createTrustedAutoImportOrchestrator({
         resolveDeps: () => ({
@@ -845,6 +847,217 @@ test('trusted auto-import failure matrix records safe decisions without unsafe v
     assert.equal(cloudSyncAutoImportStatusContainsForbiddenMaterial(duplicateResult.result), false)
 })
 
+test('trusted auto-import reports transaction failures as sanitized diagnostics', async () => {
+    const harness = createCloudHarness()
+    const snapshot = snapshotFixture({
+        sourceDeviceId: harness.desktop.deviceId,
+        revisionId: 'srev_phase28_transaction_base'
+    })
+    await seedDesktopSnapshot(harness, snapshot)
+    const upload = await seedPlannerPatch(harness, patchFixture({
+        authorDeviceId: harness.planner.deviceId,
+        baseSnapshotRevisionId: snapshot.revisionId,
+        patchRevisionId: 'patchrev_phase28_transaction_failure'
+    }))
+
+    const result = await runAutoImport({
+        harness,
+        snapshot,
+        mergeOptions: { failCommit: true }
+    })
+
+    assert.equal(result.merge.calls.commits, 1)
+    assert.equal(result.result.records[0].reason, 'transaction-failure')
+    assert.equal(result.result.records[0].cloudStatus.status, 'not-recorded')
+    assert.equal(result.result.statusCategory, 'transaction-failure')
+    assert.equal(result.result.diagnostics.category, 'transaction-failure')
+    assert.equal(result.result.sideEffects.writesVault, false)
+    assert.equal(result.result.sideEffects.writesCloudPatchStatus, false)
+    assert.equal(result.merge.storedWorkspace()[WORKSPACE_SAFE_PRESET_METADATA_KEY], undefined)
+    assert.equal(harness.store.get(`users/${UID}/patches/${upload.patchRevisionId}`).apply, undefined)
+    assert.equal(cloudSyncAutoImportStatusContainsForbiddenMaterial(result.result), false)
+
+    const view = createCloudSyncStatusView(result.result)
+    assert.equal(view.statusLabel, 'Transaction failure')
+    assert.equal(view.recoveryHint, 'Check vault health, then run manual cloud sync.')
+    assert.equal(cloudSyncStatusViewContainsForbiddenMaterial(view), false)
+})
+
+test('trusted auto-import status categories have clear sanitized renderer labels', () => {
+    const cases = [
+        {
+            name: 'not-configured',
+            status: sanitizeTrustedAutoImportResult({
+                success: false,
+                status: 'unavailable',
+                error: 'Cloud sync is not configured on this desktop.'
+            }),
+            label: 'Not configured'
+        },
+        {
+            name: 'unavailable-runtime',
+            status: sanitizeTrustedAutoImportError(new Error('Cloud sync transport requires a Firestore client adapter at C:\\Users\\Alice\\vault.json')),
+            label: 'Runtime unavailable'
+        },
+        {
+            name: 'locked',
+            status: sanitizeTrustedAutoImportError(new Error('Session is locked at C:\\Users\\Alice\\vault.json')),
+            label: 'Locked'
+        },
+        {
+            name: 'no-patches',
+            status: sanitizeTrustedAutoImportResult({
+                success: true,
+                status: 'completed',
+                summary: { uploaded: 0, downloaded: 0, planned: 0, applied: 0, conflicts: 0, skipped: 0 },
+                records: []
+            }),
+            label: 'No patches'
+        },
+        {
+            name: 'applied',
+            status: sanitizeTrustedAutoImportResult({
+                success: true,
+                status: 'completed',
+                summary: { applied: 1, conflicts: 0, skipped: 0 },
+                records: [{ status: 'applied', reason: 'merged' }]
+            }),
+            label: 'Applied'
+        },
+        {
+            name: 'conflict',
+            status: sanitizeTrustedAutoImportResult({
+                success: true,
+                status: 'completed',
+                summary: { applied: 0, conflicts: 1, skipped: 0 },
+                records: [{ status: 'conflict', reason: 'unknown-safe-id' }]
+            }),
+            label: 'Conflict'
+        },
+        {
+            name: 'skipped',
+            status: sanitizeTrustedAutoImportResult({
+                success: true,
+                status: 'completed',
+                summary: { applied: 0, conflicts: 0, skipped: 1 },
+                records: [{ status: 'skipped', reason: 'duplicate-patch' }]
+            }),
+            label: 'Skipped'
+        },
+        {
+            name: 'revoked-device',
+            status: sanitizeTrustedAutoImportResult({
+                success: true,
+                status: 'completed',
+                summary: { applied: 0, conflicts: 0, skipped: 1 },
+                records: [{ status: 'skipped', reason: 'revoked-device' }]
+            }),
+            label: 'Revoked device'
+        },
+        {
+            name: 'invalid-signature',
+            status: sanitizeTrustedAutoImportResult({
+                success: true,
+                status: 'completed',
+                summary: { applied: 0, conflicts: 0, skipped: 1 },
+                records: [{ status: 'skipped', reason: 'invalid-signature' }]
+            }),
+            label: 'Invalid signature'
+        },
+        {
+            name: 'invalid-key',
+            status: sanitizeTrustedAutoImportResult({
+                success: true,
+                status: 'completed',
+                summary: { applied: 0, conflicts: 0, skipped: 1 },
+                records: [{ status: 'skipped', reason: 'invalid-key' }]
+            }),
+            label: 'Invalid key'
+        },
+        {
+            name: 'invalid-patch',
+            status: sanitizeTrustedAutoImportResult({
+                success: true,
+                status: 'completed',
+                summary: { applied: 0, conflicts: 0, skipped: 1 },
+                records: [{ status: 'skipped', reason: 'schema-rejected' }]
+            }),
+            label: 'Invalid patch'
+        },
+        {
+            name: 'stale-base',
+            status: sanitizeTrustedAutoImportResult({
+                success: true,
+                status: 'completed',
+                summary: { applied: 0, conflicts: 1, skipped: 0 },
+                records: [{ status: 'conflict', reason: 'stale-base' }]
+            }),
+            label: 'Stale base'
+        },
+        {
+            name: 'transaction-failure',
+            status: sanitizeTrustedAutoImportResult({
+                success: true,
+                status: 'completed',
+                summary: { applied: 0, conflicts: 0, skipped: 1 },
+                records: [{ status: 'skipped', reason: 'transaction-failure' }]
+            }),
+            label: 'Transaction failure'
+        },
+        {
+            name: 'unknown-error',
+            status: sanitizeTrustedAutoImportError(new Error('Unexpected failure at C:\\Users\\Alice\\vault.json\n    at apply (secret.js:1:2) bearer raw-token')),
+            label: 'Sanitized error'
+        }
+    ]
+
+    for (const testCase of cases) {
+        assert.equal(testCase.status.statusCategory, testCase.name, testCase.name)
+        assert.equal(testCase.status.diagnostics.category, testCase.name, testCase.name)
+        assert.equal(testCase.status.diagnostics.metadataOnly, true, testCase.name)
+        assert.equal(cloudSyncAutoImportStatusContainsForbiddenMaterial(testCase.status), false, testCase.name)
+
+        const view = createCloudSyncStatusView(testCase.status)
+        assert.equal(view.statusLabel, testCase.label, testCase.name)
+        assert.equal(view.diagnostics.category, testCase.name, testCase.name)
+        assert.equal(view.metadataOnly, true, testCase.name)
+        assert.equal(cloudSyncStatusViewContainsForbiddenMaterial(view), false, testCase.name)
+    }
+})
+
+test('trusted auto-import manual recovery hints are passive sanitized text only', () => {
+    const status = sanitizeTrustedAutoImportResult({
+        success: true,
+        status: 'completed',
+        summary: { applied: 0, conflicts: 1, skipped: 0 },
+        records: [{ status: 'conflict', reason: 'stale-base' }],
+        sideEffects: {
+            writesVault: false,
+            writesCapabilityVault: false,
+            createsCapability: false,
+            createsAccountSlots: false,
+            createsBrowserProfiles: false,
+            launches: false,
+            writesCloudSnapshot: false,
+            writesCloudPatchStatus: false,
+            mergesPatch: false
+        }
+    })
+    const view = createCloudSyncStatusView(status)
+
+    assert.equal(status.manualRecovery.automatic, false)
+    assert.equal(typeof status.manualRecovery.hint, 'string')
+    assert.equal(view.recoveryHint, 'Review conflicts before applying phone changes.')
+    assert.equal('onClick' in view, false)
+    assert.equal('invoke' in view, false)
+    assert.equal(status.sideEffects.writesCloudSnapshot, false)
+    assert.equal(status.sideEffects.writesCloudPatchStatus, false)
+    assert.equal(status.sideEffects.mergesPatch, false)
+    assert.equal(status.sideEffects.launches, false)
+    assert.equal(status.sideEffects.createsCapability, false)
+    assert.equal(cloudSyncStatusViewContainsForbiddenMaterial(view), false)
+})
+
 test('trusted auto-import sanitizer strips payloads, plans, envelopes, ids, paths, and credentials', () => {
     const sanitized = sanitizeTrustedAutoImportResult({
         success: true,
@@ -879,11 +1092,19 @@ test('trusted auto-import sanitizer strips payloads, plans, envelopes, ids, path
             ciphertext: 'encrypted-envelope',
             importPlan: { presetPlans: [{ next: { name: 'Leaky Phone Patch' } }] },
             vaultPath: 'C:\\Users\\Alice\\vault.json',
-            capabilityId: `cap_${'a'.repeat(32)}`
+            capabilityId: `cap_${'a'.repeat(32)}`,
+            stack: 'Error: leaked\n    at apply (C:\\Users\\Alice\\secret.js:1:2)',
+            firebaseSecret: 'firebase-api-key',
+            signingPrivateKey: 'device private key',
+            credentials: 'oauth credential',
+            browserSession: 'browser session cookie',
+            launchAuthority: 'launch authority'
         }],
         envelope: { ciphertext: 'encrypted-envelope' },
         patchPayload: { name: 'Leaky Phone Patch' },
-        token: 'bearer raw-token'
+        token: 'bearer raw-token',
+        stack: 'Error: leaked\n    at apply (C:\\Users\\Alice\\secret.js:1:2)',
+        firebaseSecret: 'firebase-api-key'
     })
 
     const text = JSON.stringify(sanitized)
@@ -899,5 +1120,34 @@ test('trusted auto-import sanitizer strips payloads, plans, envelopes, ids, path
     assert.equal(text.includes('vault.json'), false)
     assert.equal(text.includes('cap_'), false)
     assert.equal(text.includes('raw-token'), false)
+    assert.equal(text.includes('secret.js'), false)
+    assert.equal(text.includes('firebase-api-key'), false)
+    assert.equal(text.includes('oauth credential'), false)
+    assert.equal(text.includes('browser session cookie'), false)
+    assert.equal(text.includes('launch authority'), false)
     assert.equal(cloudSyncAutoImportStatusContainsForbiddenMaterial(sanitized), false)
+})
+
+test('trusted auto-import logs only sanitized failure categories', async () => {
+    const logs = []
+    const orchestrator = createTrustedAutoImportOrchestrator({
+        resolveDeps: () => ({}),
+        applyHandler: async () => {
+            throw new Error('Unexpected C:\\Users\\Alice\\vault.json bearer raw-token\n    at apply (C:\\Users\\Alice\\secret.js:1:2)')
+        },
+        logger: {
+            warn: (...args) => logs.push(args.join(' '))
+        }
+    })
+
+    const result = await orchestrator.runAfterUnlock()
+    const logText = JSON.stringify(logs)
+
+    assert.equal(result.statusCategory, 'unknown-error')
+    assert.equal(logText.includes('unknown-error'), true)
+    assert.equal(logText.includes('vault.json'), false)
+    assert.equal(logText.includes('raw-token'), false)
+    assert.equal(logText.includes('secret.js'), false)
+    assert.equal(/C:\\Users/i.test(logText), false)
+    assert.equal(cloudSyncAutoImportStatusContainsForbiddenMaterial(result), false)
 })

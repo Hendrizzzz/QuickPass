@@ -43,14 +43,18 @@ function isRuntimeUnavailableError(error) {
         .test(error?.message || '')
 }
 
+function containsForbiddenErrorText(message) {
+    return /deviceSessionToken|bearer\s+|syncRootKey|rootKeyMaterial|privateKey|vault\.json|vault\.meta\.json|vault\.state\.json|BrowserProfile|AppData[\\/]|cap_[A-Za-z0-9_-]{4,128}|[A-Za-z]:[\\/]|\\\\|HKEY_|HKLM|HKCU|powershell|taskkill|cmd\s|ciphertext|cloudEnvelope|encryptedEnvelope|importPlan|patchPayload|vaultData|devicePrivateKey|credential|browserSession|launchAuthority|firebase[-_\s]*(api[-_\s]*)?key|firebaseSecret|stack trace|\bat\s+.*:\d+:\d+/i.test(message)
+}
+
 function safeErrorMessage(error, status) {
     if (status === 'locked') return 'Cloud sync requires an active unlocked vault session.'
     if (status === 'unavailable') return 'Cloud sync is not configured on this desktop.'
     const message = String(error?.message || '')
-    if (/vault\.json|vault\.meta\.json|vault\.state\.json|BrowserProfile|AppData[\\/]|[A-Za-z]:[\\/]|\\\\|cap_[a-f0-9]{32,64}|bearer\s+/i.test(message)) {
+    if (containsForbiddenErrorText(message)) {
         return 'Cloud sync invocation failed.'
     }
-    return message || 'Cloud sync invocation failed.'
+    return 'Cloud sync invocation failed.'
 }
 
 function errorSummary(operation, error) {

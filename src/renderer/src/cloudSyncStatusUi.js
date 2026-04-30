@@ -11,19 +11,38 @@ const STATUS_LABELS = {
     downloaded: 'Downloaded',
     planned: 'Planned',
     completed: 'Completed',
+    'not-configured': 'Not configured',
+    'unavailable-runtime': 'Runtime unavailable',
     locked: 'Locked',
     unavailable: 'Unavailable',
     rejected: 'Rejected',
     idle: 'Idle',
     scheduled: 'Scheduled',
     running: 'Running',
+    'no-patches': 'No patches',
     conflict: 'Conflict',
     skipped: 'Skipped',
     applied: 'Applied',
-    'already-decided': 'Already decided'
+    'already-decided': 'Already decided',
+    'revoked-device': 'Revoked device',
+    'invalid-signature': 'Invalid signature',
+    'invalid-key': 'Invalid key',
+    'invalid-patch': 'Invalid patch',
+    'invalid-envelope': 'Invalid patch',
+    'schema-rejected': 'Invalid patch',
+    'forbidden-material': 'Invalid patch',
+    'stale-base': 'Stale base',
+    'transaction-failure': 'Transaction failure',
+    'unknown-error': 'Sanitized error',
+    'duplicate-patch': 'Duplicate patch',
+    'merge-rejected': 'Merge rejected',
+    merged: 'Merged',
+    'unknown-safe-id': 'Unknown item',
+    'unknown-safe-preset': 'Unknown preset',
+    'cloud-conflict': 'Cloud conflict'
 }
 
-const FORBIDDEN_STATUS_TEXT = /deviceSessionToken|bearer\s+|syncRootKey|rootKeyMaterial|privateKey|vault\.json|vault\.meta\.json|vault\.state\.json|BrowserProfile|AppData[\\/]|cap_[a-f0-9]{32,64}|[A-Za-z]:[\\/]|\\\\|HKEY_|HKLM|HKCU|powershell|taskkill|cmd\s/i
+const FORBIDDEN_STATUS_TEXT = /deviceSessionToken|bearer\s+|syncRootKey|rootKeyMaterial|privateKey|vault\.json|vault\.meta\.json|vault\.state\.json|BrowserProfile|AppData[\\/]|cap_[A-Za-z0-9_-]{4,128}|[A-Za-z]:[\\/]|\\\\|HKEY_|HKLM|HKCU|powershell|taskkill|cmd\s|ciphertext|cloudEnvelope|encryptedEnvelope|importPlan|patchPayload|vaultData|devicePrivateKey|credential|browserSession|launchAuthority|firebase[-_\s]*(api[-_\s]*)?key|firebaseSecret|stack trace|\bat\s+.*:\d+:\d+/i
 
 function safeToken(value, fallback = 'unknown') {
     if (typeof value !== 'string') return fallback
@@ -52,8 +71,17 @@ function operationLabel(operation) {
     return OPERATION_LABELS[operation] || 'Cloud sync'
 }
 
+function displayStatusFor(result, status) {
+    if (result?.operation === 'auto-import-trusted-patches' && result?.statusCategory) {
+        return safeToken(result.statusCategory, status)
+    }
+    return status
+}
+
 function defaultMessage(result, status) {
     if (result?.success === false) {
+        if (status === 'not-configured') return 'Cloud sync is not configured on this desktop.'
+        if (status === 'unavailable-runtime') return 'Cloud sync runtime is unavailable on this desktop.'
         if (status === 'locked') return 'Unlock the vault before using cloud sync.'
         if (status === 'unavailable') return 'Cloud sync is not configured on this desktop.'
         return 'Cloud sync did not complete.'
@@ -65,7 +93,18 @@ function defaultMessage(result, status) {
     if (result?.operation === 'auto-import-trusted-patches') {
         if (status === 'scheduled') return 'Trusted auto-import scheduled.'
         if (status === 'running') return 'Trusted auto-import running.'
-        return 'Trusted auto-import complete.'
+        if (status === 'no-patches') return 'No trusted patches were available.'
+        if (status === 'applied') return 'Trusted preset metadata patches were applied.'
+        if (status === 'conflict') return 'Trusted auto-import found a metadata conflict.'
+        if (status === 'stale-base') return 'Phone changes were based on stale desktop metadata.'
+        if (status === 'revoked-device') return 'A patch was skipped because its author device is revoked.'
+        if (status === 'invalid-signature') return 'A patch was skipped because its signature was invalid.'
+        if (status === 'invalid-key') return 'A patch was skipped because its key check failed.'
+        if (status === 'invalid-patch') return 'A patch was skipped because its safe metadata was invalid.'
+        if (status === 'transaction-failure') return 'Trusted auto-import could not finish the vault transaction.'
+        if (status === 'unknown-error') return 'Trusted auto-import stopped with a sanitized error.'
+        if (status === 'skipped') return 'Trusted auto-import skipped one or more patches.'
+        return 'Trusted auto-import status updated.'
     }
     return 'Cloud sync action complete.'
 }
@@ -73,10 +112,13 @@ function defaultMessage(result, status) {
 function summarizeRecord(record) {
     const status = safeToken(record?.status, 'unknown')
     const reason = safeToken(record?.reason || record?.code || '', '')
+    const category = safeToken(record?.category || '', '')
     return {
         status,
         statusLabel: statusLabel(status),
         reason,
+        category,
+        categoryLabel: category ? statusLabel(category) : '',
         reasonLabel: reason ? statusLabel(reason) : '',
         encrypted: record?.encrypted === true,
         metadataOnly: true
@@ -90,6 +132,14 @@ export function createCloudSyncStatusView(result) {
             status: 'idle',
             statusLabel: 'Idle',
             message: 'No cloud sync action has run.',
+            diagnostics: {
+                category: 'idle',
+                summary: 'No cloud sync action has run.',
+                recordCount: 0,
+                recordCategories: [],
+                metadataOnly: true
+            },
+            recoveryHint: '',
             counts: { uploaded: 0, downloaded: 0, planned: 0, applied: 0, conflicts: 0, skipped: 0 },
             records: [],
             metadataOnly: true
@@ -97,12 +147,30 @@ export function createCloudSyncStatusView(result) {
     }
 
     const status = safeToken(result.status, result.success === false ? 'rejected' : 'completed')
+    const displayStatus = displayStatusFor(result, status)
     const summary = result.summary && typeof result.summary === 'object' ? result.summary : {}
+    const diagnostics = result.diagnostics && typeof result.diagnostics === 'object' && !Array.isArray(result.diagnostics)
+        ? result.diagnostics
+        : null
+    const recoveryHint = result.manualRecovery && typeof result.manualRecovery === 'object' && !Array.isArray(result.manualRecovery)
+        ? safeMessage(result.manualRecovery.hint, '')
+        : ''
     return {
         title: operationLabel(result.operation),
-        status,
-        statusLabel: statusLabel(status),
-        message: safeMessage(result.error, defaultMessage(result, status)),
+        status: displayStatus,
+        rawStatus: status,
+        statusLabel: statusLabel(displayStatus),
+        message: safeMessage(diagnostics?.summary, safeMessage(result.error, defaultMessage(result, displayStatus))),
+        diagnostics: {
+            category: safeToken(diagnostics?.category, displayStatus),
+            summary: safeMessage(diagnostics?.summary, defaultMessage(result, displayStatus)),
+            recordCount: safeCount(diagnostics?.recordCount),
+            recordCategories: Array.isArray(diagnostics?.recordCategories)
+                ? diagnostics.recordCategories.slice(0, 12).map(item => safeToken(item, '')).filter(Boolean)
+                : [],
+            metadataOnly: true
+        },
+        recoveryHint,
         counts: {
             uploaded: safeCount(summary.uploaded),
             downloaded: safeCount(summary.downloaded),
@@ -121,5 +189,5 @@ export function createCloudSyncStatusView(result) {
 export function cloudSyncStatusViewContainsForbiddenMaterial(value) {
     const text = JSON.stringify(value || {})
     return FORBIDDEN_STATUS_TEXT.test(text) ||
-        /ciphertext|importPlan|patchPayload|vaultData|devicePrivateKey|credential|browserSession|launchAuthority/i.test(text)
+        /ciphertext|cloudEnvelope|encryptedEnvelope|importPlan|patchPayload|vaultData|devicePrivateKey|credential|browserSession|launchAuthority|firebaseSecret|apiKey|firebase[-_\s]*(api[-_\s]*)?key|\bat\s+.*:\d+:\d+/i.test(text)
 }

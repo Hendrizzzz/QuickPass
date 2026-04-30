@@ -188,6 +188,12 @@ function reasonForMergeConflict(conflictCode) {
     return 'schema-rejected'
 }
 
+function reasonForMergeRejection(mergeResult) {
+    const text = `${mergeResult?.status || ''} ${mergeResult?.error || ''}`.toLowerCase()
+    if (/transaction|commitvaultmeta|commit vault/.test(text)) return 'transaction-failure'
+    return 'merge-rejected'
+}
+
 function classifyPatchApplyError(error) {
     const code = String(error?.code || '')
     const message = String(error?.message || '')
@@ -215,6 +221,9 @@ function classifyPatchApplyError(error) {
     }
     if (/duplicate|already exists|replayed/.test(text)) {
         return { status: 'skipped', reason: 'duplicate-patch', code: 'duplicate-patch' }
+    }
+    if (/transaction|commitvaultmeta|commit vault/.test(text)) {
+        return { status: 'skipped', reason: 'transaction-failure', code: 'transaction-failure' }
     }
     if (/cloud sync envelope/.test(text)) {
         return { status: 'skipped', reason: 'invalid-envelope', code: 'invalid-envelope' }
@@ -1031,15 +1040,16 @@ export async function applyTrustedCloudSafePresetPatchesAfterUnlock({
                 continue
             }
 
+            const rejectedReason = reasonForMergeRejection(mergeResult)
             records.push(patchRecord({
                 status: 'skipped',
-                code: 'merge-rejected',
-                reason: 'merge-rejected',
+                code: rejectedReason,
+                reason: rejectedReason,
                 envelope,
                 patch,
                 currentSnapshot,
                 mergeResult,
-                cloudStatus: { status: 'not-recorded', reason: 'merge-rejected' },
+                cloudStatus: { status: 'not-recorded', reason: rejectedReason },
                 message: 'Patch merge was rejected; no applied acknowledgement was recorded.'
             }))
         } catch (error) {
@@ -1082,7 +1092,11 @@ export async function applyTrustedCloudSafePresetPatchesAfterUnlock({
             ...sideEffectsNone({
                 writesVault: records.some(record => record.sideEffects.writesVault === true)
             }),
-            writesCloudPatchStatus: records.some(record => record.cloudStatus && record.cloudStatus.status !== 'failed')
+            writesCloudPatchStatus: records.some(record =>
+                record.cloudStatus &&
+                record.cloudStatus.status !== 'failed' &&
+                record.cloudStatus.status !== 'not-recorded'
+            )
         }
     }
 }

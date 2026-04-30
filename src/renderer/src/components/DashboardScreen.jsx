@@ -815,9 +815,9 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     }
 
     const getCloudSyncStatusClass = (status) => {
-        if (['accepted', 'downloaded', 'planned', 'completed', 'applied'].includes(status)) return 'text-success'
-        if (['conflict', 'skipped', 'already-decided', 'unavailable', 'locked'].includes(status)) return 'text-warning'
-        if (status === 'rejected') return 'text-error'
+        if (['accepted', 'downloaded', 'planned', 'completed', 'applied', 'no-patches'].includes(status)) return 'text-success'
+        if (['conflict', 'skipped', 'already-decided', 'unavailable', 'locked', 'not-configured', 'unavailable-runtime', 'stale-base'].includes(status)) return 'text-warning'
+        if (['rejected', 'revoked-device', 'invalid-signature', 'invalid-key', 'invalid-patch', 'transaction-failure', 'unknown-error'].includes(status)) return 'text-error'
         return 'text-muted'
     }
 
@@ -1292,6 +1292,9 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                 <div className="min-w-0">
                                     <p className="text-sm text-white font-medium truncate">{cloudSyncStatusView.title}</p>
                                     <p className="text-[11px] text-muted mt-0.5">{cloudSyncStatusView.message}</p>
+                                    {cloudSyncStatusView.recoveryHint && (
+                                        <p className="text-[11px] text-[#b8c7ff] mt-1">{cloudSyncStatusView.recoveryHint}</p>
+                                    )}
                                 </div>
                                 <span className={`text-[10px] font-semibold flex-shrink-0 ${getCloudSyncStatusClass(cloudSyncStatusView.status)}`}>
                                     {cloudSyncStatusView.statusLabel}
