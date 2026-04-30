@@ -1,4 +1,9 @@
 import { contextBridge, ipcRenderer } from 'electron'
+import { validateCloudSyncInvocationPayload } from './cloudSyncPreloadValidation.js'
+
+function invokeCloudSync(channel, data) {
+    return ipcRenderer.invoke(channel, validateCloudSyncInvocationPayload(data))
+}
 
 const wipesnapApi = {
     // Drive & Environment
@@ -56,6 +61,14 @@ const wipesnapApi = {
     saveCurrentSession: () => ipcRenderer.invoke('save-current-session'),
     quitAndRelaunch: (opts) => ipcRenderer.invoke('quit-and-relaunch', opts),
     closeDesktopApps: () => ipcRenderer.invoke('close-desktop-apps'),
+
+    // Cloud Sync
+    cloudSync: {
+        uploadSanitizedSnapshot: (data) => invokeCloudSync('cloud-sync:upload-sanitized-snapshot', data),
+        downloadEncryptedPatchSummaries: (data) => invokeCloudSync('cloud-sync:download-encrypted-patch-summaries', data),
+        planSafePresetPatches: (data) => invokeCloudSync('cloud-sync:plan-safe-preset-patches', data),
+        applyTrustedPatches: (data) => invokeCloudSync('cloud-sync:apply-trusted-patches', data)
+    },
 
     // Automation Engine
     launchWorkspace: (workspace) => ipcRenderer.invoke('launch-workspace', workspace),

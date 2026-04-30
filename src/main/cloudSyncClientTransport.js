@@ -264,6 +264,57 @@ function patchRecord({
     }
 }
 
+function encryptedPatchSummaryRecord({
+    status,
+    reason,
+    envelope = null,
+    requestedRevisionId = '',
+    cloudStatus = null,
+    authorTrust = null,
+    message = ''
+}) {
+    return {
+        status,
+        reason,
+        patchRevisionId: envelope?.revisionId || requestedRevisionId || '',
+        patchId: envelope?.patchId || null,
+        authorDeviceId: envelope?.deviceId || null,
+        baseSnapshotRevisionId: envelope?.baseRevisionId || null,
+        metadataOnly: true,
+        encrypted: true,
+        cloudStatus,
+        authorTrust,
+        sideEffects: sideEffectsNone(),
+        ...(message ? { message } : {})
+    }
+}
+
+async function trustedPatchAuthorSummary(firestoreClient, state, envelope) {
+    try {
+        const device = validateCloudSyncDeviceRecord(
+            await getTrustedDeviceRecord(firestoreClient, state.ownerUid, envelope.deviceId)
+        )
+        if (device.ownerUid !== state.ownerUid || device.deviceId !== envelope.deviceId) {
+            return { status: 'invalid', metadataOnly: true }
+        }
+        if (!['phone', 'web-planner'].includes(device.role)) {
+            return { status: 'invalid-role', role: device.role, metadataOnly: true }
+        }
+        if (device.status !== 'active' || device.revokedAt != null) {
+            return { status: 'revoked', role: device.role, metadataOnly: true }
+        }
+        if (!Array.isArray(device.syncScopes) || !device.syncScopes.includes('patch-upload')) {
+            return { status: 'untrusted', role: device.role, metadataOnly: true }
+        }
+        if (device.keyVersion !== envelope.keyVersion) {
+            return { status: 'invalid-key', role: device.role, metadataOnly: true }
+        }
+        return { status: 'trusted', role: device.role, metadataOnly: true }
+    } catch (_) {
+        return { status: 'invalid', metadataOnly: true }
+    }
+}
+
 function requireActiveVaultSessionForTrustedPatchApply(deps) {
     if (!deps || typeof deps.requireActiveSession !== 'function') {
         fail('Trusted cloud patch apply requires requireActiveSession.')
@@ -583,6 +634,104 @@ export async function downloadDesktopPatchPlans({
             writesVault: false,
             writesCapabilityVault: false,
             launches: false,
+            mergesPatch: false
+        }
+    }
+}
+
+export async function downloadDesktopEncryptedPatchSummaries({
+    storage,
+    firestoreClient,
+    patchRevisionIds
+} = {}) {
+    if (!storage || typeof storage.loadAfterUnlock !== 'function') {
+        fail('Desktop encrypted patch download requires unlocked desktop cloud sync storage.')
+    }
+    const state = normalizeDeviceState(await storage.loadAfterUnlock(), 'desktop', 'desktop cloud sync state')
+    const requestedPatchDocs = Array.isArray(patchRevisionIds)
+        ? await Promise.all(patchRevisionIds.map(async revisionId => ({
+            requestedRevisionId: revisionId,
+            rawEnvelope: await getCloudDocument(firestoreClient, `users/${state.ownerUid}/patches/${revisionId}`)
+        })))
+        : sortPatchDocuments(await listCloudDocuments(firestoreClient, `users/${state.ownerUid}/patches`))
+            .map(rawEnvelope => ({ requestedRevisionId: '', rawEnvelope }))
+
+    const records = []
+    for (const { requestedRevisionId, rawEnvelope } of requestedPatchDocs) {
+        let envelope = null
+        try {
+            if (!rawEnvelope) {
+                records.push(encryptedPatchSummaryRecord({
+                    status: 'skipped',
+                    reason: 'not-found',
+                    requestedRevisionId,
+                    message: 'Patch revision was not found.'
+                }))
+                continue
+            }
+            envelope = validateCloudSyncEnvelope(envelopeWithoutBackendIngestionMetadata(rawEnvelope), {
+                expectedDocType: CLOUD_SYNC_PATCH_DOC_TYPE,
+                activeKeyVersion: state.device.keyVersion
+            })
+            const existingDecision = backendApplyDecision(rawEnvelope)
+            if (existingDecision) {
+                records.push(encryptedPatchSummaryRecord({
+                    status: 'already-decided',
+                    reason: existingDecision.reason,
+                    envelope,
+                    cloudStatus: {
+                        status: existingDecision.status,
+                        reason: existingDecision.reason,
+                        metadataOnly: true
+                    },
+                    authorTrust: await trustedPatchAuthorSummary(firestoreClient, state, envelope)
+                }))
+                continue
+            }
+            const ingestionConflict = backendIngestionConflict(rawEnvelope)
+            if (ingestionConflict) {
+                records.push(encryptedPatchSummaryRecord({
+                    status: 'conflict',
+                    reason: ingestionConflict.reason || 'cloud-conflict',
+                    envelope,
+                    cloudStatus: {
+                        status: 'conflict',
+                        reason: ingestionConflict.reason || 'cloud-conflict',
+                        metadataOnly: true
+                    },
+                    authorTrust: await trustedPatchAuthorSummary(firestoreClient, state, envelope)
+                }))
+                continue
+            }
+            records.push(encryptedPatchSummaryRecord({
+                status: 'downloaded',
+                reason: 'encrypted',
+                envelope,
+                authorTrust: await trustedPatchAuthorSummary(firestoreClient, state, envelope)
+            }))
+        } catch (error) {
+            const classified = classifyPatchApplyError(error)
+            records.push(encryptedPatchSummaryRecord({
+                status: 'skipped',
+                reason: classified.reason,
+                envelope,
+                requestedRevisionId,
+                message: 'Patch envelope failed encrypted download validation.'
+            }))
+        }
+    }
+
+    return {
+        status: 'downloaded',
+        records,
+        summary: {
+            downloaded: records.filter(record => ['downloaded', 'already-decided', 'conflict'].includes(record.status)).length,
+            conflicts: records.filter(record => record.status === 'conflict').length,
+            skipped: records.filter(record => record.status === 'skipped').length
+        },
+        sideEffects: {
+            ...sideEffectsNone(),
+            writesCloudPatchStatus: false,
             mergesPatch: false
         }
     }
