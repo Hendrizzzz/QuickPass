@@ -1,0 +1,109 @@
+Wipesnap Phase 31.2 Cloudflare phone sync spike
+================================================
+
+Status: design and local implementation spike only. Do not deploy from this file.
+
+Independent viability verdict
+-----------------------------
+
+Cloudflare Pages + Workers + D1 is viable for a no-card/no-billing staging
+spike if Wipesnap keeps the hosted planner static, avoids realtime push, uses
+upload-on-save / download-on-open / desktop-sync-after-unlock, and keeps hard
+application limits below the free-plan ceilings.
+
+Current docs checked on 2026-05-01:
+
+- Cloudflare Pages Free limits: 500 builds/month, 20,000 files/site, 25 MiB
+  per file, functions counted as Workers.
+  https://developers.cloudflare.com/pages/platform/limits/
+- Cloudflare Workers Free limits: 100,000 requests/day, 10 ms CPU/request,
+  128 MB memory, 50 external subrequests/request, fail-closed mode available
+  for Workers route limits.
+  https://developers.cloudflare.com/workers/platform/limits/
+- Cloudflare Workers pricing: Workers Free is the default; static asset
+  requests are free/unlimited; D1 is available on Workers Free.
+  https://developers.cloudflare.com/workers/platform/pricing/
+- Cloudflare D1 Free limits: 10 databases/account, 500 MB/database,
+  5 GB account storage, 5 million rows read/day, 100,000 rows written/day,
+  50 D1 queries/invocation on Free.
+  https://developers.cloudflare.com/d1/platform/limits/
+  https://developers.cloudflare.com/d1/platform/pricing/
+- D1 batch statements are transactional and execute sequentially.
+  https://developers.cloudflare.com/d1/worker-api/d1-database/
+- Workers KV is eventually consistent and may take 60 seconds or more for
+  writes to become visible elsewhere. It is rejected as authoritative storage
+  for replay, revocation, device sequence, and rate-limit state.
+  https://developers.cloudflare.com/kv/concepts/how-kv-works/
+- Durable Objects are available on Free, but are primarily useful when a single
+  object must coordinate clients or realtime state. They are deferred here
+  because D1 constraints and transactions are enough for this spike.
+  https://developers.cloudflare.com/durable-objects/
+  https://developers.cloudflare.com/durable-objects/platform/limits/
+
+Expected early-user fit
+-----------------------
+
+1 user: viable with large margin.
+10 users: viable if each owner stays within retained snapshot/patch/device caps.
+20 users: viable for manual/offline sync and modest polling only while desktop is
+unlocked.
+50 users: viable as a staging/early-access ceiling if envelopes remain small and
+polling stays off by default.
+100 users: plausible for a quiet beta, but the 10 ms CPU and 100,000 requests/day
+limits become operational risks. Keep fail-closed Worker routes and monitor row
+reads/writes before treating this as production.
+
+Auth model
+----------
+
+Firebase Auth/custom claims are not used by the Cloudflare provider. Every
+enrolled device signs canonical request metadata with its non-exported private
+P-256 signing key. The Worker verifies:
+
+- owner id, device id, role, status, enrollment epoch, key version;
+- request timestamp and body SHA-256;
+- canonical route operation/method/path;
+- P-256 SHA-256 P1363 signature;
+- monotonic device sequence in D1;
+- D1-backed rate-limit bucket;
+- active, non-revoked device state.
+
+No bearer token is accepted as launch authority.
+
+Storage model
+-------------
+
+D1 is authoritative for owners, devices, enrollment requests, key grants,
+snapshots, patches, patch decisions, device sequences, and rate limits. Backend
+rows store encrypted envelopes and safe metadata only. The backend must never
+store plaintext snapshots, plaintext patches, raw sync root keys, device private
+keys, vault data, launch capabilities, raw paths, tokens, browser sessions, or
+launch authority.
+
+KV is not used for authorization, replay prevention, revocation, sequence
+tracking, or rate limits.
+
+Durable Objects are not needed for Phase 31.2. Revisit them only if a later
+phase adds per-owner realtime coordination, high-concurrency conflict handling,
+or browser push.
+
+Enrollment and key grants
+-------------------------
+
+The phone/web planner generates non-extractable signing and wrapping private
+keys where browser support allows. It sends a pending device record and pairing
+challenge hash. The desktop, after vault unlock, approves the pending device and
+uploads a key grant that wraps the sync root key to the phone public wrapping
+key. The Worker stores only the wrapped key grant. The phone claims the
+enrollment, downloads the grant, unwraps locally, and keeps raw root key
+material memory-only/non-extractable where practical. Clearing phone site data
+can destroy the private keys and require re-enrollment.
+
+Snapshot and patch flow
+-----------------------
+
+Desktop uploads encrypted sanitized snapshot envelopes. Phone downloads and
+decrypts locally, edits presets and safe item references, then uploads encrypted
+safe patch envelopes while desktop is offline. Desktop later downloads pending
+patches after unlock, decrypts, validates hostile input, and applies the
+existing Wipesnap safe-preset import gates. Trusted auto-launch remains separate.

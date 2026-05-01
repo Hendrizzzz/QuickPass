@@ -19,6 +19,10 @@ diff.txt
 .gemini/
 electron.vite.config.*.mjs
 src/phone-planner/firebase-staging-config.json
+src/phone-planner/cloudflare-sync-config.json
+cloudflare/wrangler.toml
+cloudflare/.dev.vars
+.wrangler/
 
 *.md
 !README.md

@@ -1,0 +1,19 @@
+name = "wipesnap-phone-sync-staging"
+main = "src/wipesnapCloudSyncWorker.js"
+compatibility_date = "2026-04-01"
+
+# Example only. Do not commit a real wrangler.toml with account IDs,
+# API tokens, production routes, or secrets.
+workers_dev = true
+
+[limits]
+cpu_ms = 10
+
+[[d1_databases]]
+binding = "WIPESNAP_D1"
+database_name = "wipesnap-phone-sync-staging"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[vars]
+WIPESNAP_CLOUD_SYNC_ENVIRONMENT = "staging"
+WIPESNAP_CLOUD_SYNC_PROVIDER = "cloudflare-d1-spike"

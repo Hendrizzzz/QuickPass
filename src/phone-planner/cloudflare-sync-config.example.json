@@ -1,0 +1,7 @@
+{
+    "environment": "staging",
+    "provider": "cloudflare-d1-spike",
+    "apiBaseUrl": "https://REPLACE-WITH-STAGING-WORKER.workers.dev",
+    "useLocalDev": false,
+    "maxEnvelopeJsonBytes": 786432
+}

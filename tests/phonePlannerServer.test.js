@@ -3,6 +3,7 @@ import fs from 'fs'
 import http from 'http'
 import { createRequire } from 'module'
 import { test } from 'node:test'
+import os from 'os'
 import path from 'path'
 
 const require = createRequire(import.meta.url)
@@ -11,9 +12,11 @@ const packageJson = require('../package.json')
 const {
     FORBIDDEN_ARTIFACT_NAMES,
     FORBIDDEN_ARTIFACT_SEGMENTS,
+    OPTIONAL_STAGING_CONFIGS,
     PHONE_PLANNER_STAGING_FILES,
     assertSafeArtifactFiles,
     buildPhonePlannerStaging,
+    copyOptionalStagingConfigs,
     targetDir
 } = require('../scripts/build-phone-planner-staging.cjs')
 const {
@@ -128,6 +131,7 @@ test('Firebase Hosting serves only the staged phone planner artifact with narrow
     assert.equal(PHONE_PLANNER_STAGING_FILES.includes('app.js'), true)
     assert.equal(PHONE_PLANNER_STAGING_FILES.includes('phonePlannerCloudWorkflow.js'), true)
     assert.equal(PHONE_PLANNER_STAGING_FILES.includes('firebase-staging-config.example.json'), true)
+    assert.equal(PHONE_PLANNER_STAGING_FILES.includes('cloudflare-sync-config.example.json'), true)
 
     buildPhonePlannerStaging()
     assertSafeArtifactFiles()
@@ -138,4 +142,44 @@ test('Firebase Hosting serves only the staged phone planner artifact with narrow
     assert.equal(artifactFiles.has('tests'), false)
     assert.equal(artifactFiles.has('vault.json'), false)
     assert.equal(artifactFiles.has('package.json'), false)
+})
+
+test('hosted artifact optional staging configs are copied only when explicitly present', () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wipesnap-phone-config-copy-'))
+    try {
+        const sourceRoot = path.join(tempRoot, 'source')
+        const targetRoot = path.join(tempRoot, 'target')
+        fs.mkdirSync(sourceRoot)
+        fs.mkdirSync(targetRoot)
+        const warnings = []
+
+        let copied = copyOptionalStagingConfigs({
+            sourceRoot,
+            targetRoot,
+            warn: message => warnings.push(message)
+        })
+        assert.deepEqual(copied, [])
+        assert.equal(warnings.length, OPTIONAL_STAGING_CONFIGS.length)
+        assert.equal(fs.existsSync(path.join(targetRoot, 'cloudflare-sync-config.json')), false)
+
+        fs.writeFileSync(path.join(sourceRoot, 'cloudflare-sync-config.json'), JSON.stringify({
+            environment: 'staging',
+            provider: 'cloudflare-d1-spike',
+            apiBaseUrl: 'https://example-stage.workers.dev',
+            useLocalDev: false
+        }))
+        warnings.length = 0
+        copied = copyOptionalStagingConfigs({
+            sourceRoot,
+            targetRoot,
+            warn: message => warnings.push(message)
+        })
+        assert.deepEqual(copied, ['cloudflare-sync-config.json'])
+        assert.equal(warnings.length, 1)
+        assert.equal(fs.existsSync(path.join(targetRoot, 'cloudflare-sync-config.json')), true)
+        assert.equal(fs.existsSync(path.join(targetRoot, 'vault.json')), false)
+        assert.equal(fs.existsSync(path.join(targetRoot, 'package.json')), false)
+    } finally {
+        fs.rmSync(tempRoot, { recursive: true, force: true })
+    }
 })
