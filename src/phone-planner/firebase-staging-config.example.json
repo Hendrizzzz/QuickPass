@@ -1,0 +1,12 @@
+{
+  "environment": "staging",
+  "projectId": "wipesnap-staging-example",
+  "apiKey": "replace-with-firebase-web-api-key",
+  "appId": "1:123456789012:web:replace-with-web-app-id",
+  "authDomain": "wipesnap-staging-example.firebaseapp.com",
+  "messagingSenderId": "123456789012",
+  "storageBucket": "wipesnap-staging-example.appspot.com",
+  "functionsRegion": "us-central1",
+  "allowAnonymousAuth": false,
+  "useEmulators": false
+}

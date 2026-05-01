@@ -80,6 +80,15 @@ function validateResourceMetadata({ authUid, claims, resourceData }) {
     return { valid: true }
 }
 
+function validateTrustedDeviceResource({ authUid, claims, resourceData }) {
+    const resourceCheck = validateResourceMetadata({ authUid, claims, resourceData })
+    if (!resourceCheck.valid) return resourceCheck
+    if (resourceData.status !== 'active' || resourceData.revokedAt != null) {
+        return { valid: false, reason: 'revoked-device-denied' }
+    }
+    return { valid: true }
+}
+
 export function evaluateCloudSyncFirestoreAccess({
     path,
     operation,
@@ -105,7 +114,11 @@ export function evaluateCloudSyncFirestoreAccess({
     const collection = parts[2]
     const documentId = parts[3]
     if (collection === 'devices') {
-        if (documentId !== claims.deviceId) return { allowed: false, reason: 'mismatched-device-denied' }
+        if (documentId !== claims.deviceId) {
+            const trustedDeviceCheck = validateTrustedDeviceResource({ authUid, claims, resourceData })
+            if (!trustedDeviceCheck.valid) return { allowed: false, reason: trustedDeviceCheck.reason }
+            return { allowed: true, reason: 'trusted-device-read' }
+        }
         return { allowed: true, reason: 'device-bound-read' }
     }
 

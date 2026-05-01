@@ -55,6 +55,8 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const [accountSlotForm, setAccountSlotForm] = useState(EMPTY_ACCOUNT_SLOT_FORM)
     const [cloudSyncBusyAction, setCloudSyncBusyAction] = useState('')
     const [cloudSyncStatusView, setCloudSyncStatusView] = useState(() => createCloudSyncStatusView())
+    const [cloudEnrollmentRequests, setCloudEnrollmentRequests] = useState([])
+    const [cloudEnrollmentRequestId, setCloudEnrollmentRequestId] = useState('')
 
     const [showAppForm, setShowAppForm] = useState(false)
     const [appForm, setAppForm] = useState({ name: '', path: '', args: '', portableData: false })
@@ -498,6 +500,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         try {
             const result = await invokeAction()
             setCloudSyncStatusView(createCloudSyncStatusView(result))
+            return result
         } catch (err) {
             setCloudSyncStatusView(createCloudSyncStatusView({
                 success: false,
@@ -513,6 +516,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                     skipped: 0
                 }
             }))
+            return null
         } finally {
             setCloudSyncBusyAction('')
         }
@@ -536,6 +540,32 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const applyTrustedCloudPatches = () => runCloudSyncAction(
         'apply-trusted-patches',
         () => window.wipesnap.cloudSync.applyTrustedPatches({})
+    )
+
+    const listCloudDeviceEnrollments = () => runCloudSyncAction(
+        'list-pending-device-enrollments',
+        async () => {
+            const result = await window.wipesnap.cloudSync.listPendingDeviceEnrollments()
+            const records = Array.isArray(result?.records) ? result.records : []
+            setCloudEnrollmentRequests(records)
+            if (!cloudEnrollmentRequestId && records[0]?.requestId) {
+                setCloudEnrollmentRequestId(records[0].requestId)
+            }
+            return result
+        }
+    )
+
+    const approveCloudDeviceEnrollment = () => runCloudSyncAction(
+        'approve-phone-planner-enrollment',
+        async () => {
+            const result = await window.wipesnap.cloudSync.approveDeviceEnrollment({
+                requestId: cloudEnrollmentRequestId
+            })
+            if (result?.success) {
+                setCloudEnrollmentRequests(items => items.filter(item => item.requestId !== result.requestId))
+            }
+            return result
+        }
     )
 
     const refreshStaleAppDataPayloads = async () => {
@@ -814,7 +844,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     }
 
     const getCloudSyncStatusClass = (status) => {
-        if (['accepted', 'downloaded', 'planned', 'completed', 'applied', 'no-patches'].includes(status)) return 'text-success'
+        if (['accepted', 'downloaded', 'planned', 'completed', 'applied', 'no-patches', 'listed', 'approved'].includes(status)) return 'text-success'
         if (['conflict', 'skipped', 'already-decided', 'unavailable', 'locked', 'not-configured', 'unavailable-runtime', 'stale-base'].includes(status)) return 'text-warning'
         if (['rejected', 'revoked-device', 'invalid-signature', 'invalid-key', 'invalid-patch', 'transaction-failure', 'unknown-error'].includes(status)) return 'text-error'
         return 'text-muted'
@@ -1284,6 +1314,51 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                             >
                                 {cloudSyncBusyAction === 'apply-trusted-patches' ? 'Applying...' : 'Apply Trusted'}
                             </button>
+                        </div>
+
+                        <div className="mt-3 rounded bg-[#101018] border border-[#242435] p-2">
+                            <div className="flex items-center justify-between gap-2 mb-2">
+                                <p className="text-[10px] font-semibold uppercase tracking-wide text-muted">Phone Enrollment</p>
+                                <span className="text-[10px] text-muted">{cloudEnrollmentRequests.length} pending</span>
+                            </div>
+                            <input
+                                className="w-full bg-[#14141c] border border-[#242435] rounded px-2 py-1.5 text-[11px] text-white outline-none"
+                                value={cloudEnrollmentRequestId}
+                                placeholder="dev_..."
+                                maxLength={96}
+                                onChange={event => setCloudEnrollmentRequestId(event.target.value)}
+                            />
+                            <div className="grid grid-cols-2 gap-2 mt-2">
+                                <button
+                                    className="btn-secondary text-[11px] py-2 px-2"
+                                    disabled={!!cloudSyncBusyAction}
+                                    onClick={listCloudDeviceEnrollments}
+                                >
+                                    {cloudSyncBusyAction === 'list-pending-device-enrollments' ? 'Listing...' : 'List Phones'}
+                                </button>
+                                <button
+                                    className="btn-secondary text-[11px] py-2 px-2"
+                                    disabled={!!cloudSyncBusyAction || !cloudEnrollmentRequestId.trim()}
+                                    onClick={approveCloudDeviceEnrollment}
+                                >
+                                    {cloudSyncBusyAction === 'approve-phone-planner-enrollment' ? 'Approving...' : 'Approve Phone'}
+                                </button>
+                            </div>
+                            {cloudEnrollmentRequests.length > 0 && (
+                                <div className="flex flex-col gap-1.5 mt-2">
+                                    {cloudEnrollmentRequests.slice(0, 3).map(record => (
+                                        <button
+                                            key={record.requestId}
+                                            className="flex items-center justify-between gap-2 text-left rounded border border-[#242435] bg-[#14141c] px-2 py-1.5"
+                                            onClick={() => setCloudEnrollmentRequestId(record.requestId)}
+                                            disabled={!!cloudSyncBusyAction}
+                                        >
+                                            <span className="text-[10px] text-white truncate">{record.requestId}</span>
+                                            <span className="text-[10px] text-muted flex-shrink-0">{record.role}</span>
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
                         </div>
 
                         <div className="mt-3 rounded bg-[#101018] border border-[#242435] p-2">

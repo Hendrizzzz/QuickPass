@@ -32,6 +32,18 @@ import {
     loadPhonePlannerState,
     savePhonePlannerState
 } from './phonePlannerStorage.js'
+import { loadPhonePlannerFirebaseConfig } from './phonePlannerFirebaseConfig.js'
+import { createPhonePlannerFirebaseRestApp } from './phonePlannerFirebaseRest.js'
+import {
+    createIndexedDbAdapter,
+    createPhonePlannerCloudStorage
+} from './phonePlannerCloudStorage.js'
+import {
+    claimHostedPlannerDeviceSession,
+    downloadLatestHostedPlannerSnapshot,
+    requestHostedPlannerEnrollment,
+    uploadHostedPlannerSafePatch
+} from './phonePlannerCloudWorkflow.js'
 
 let state = loadPhonePlannerState()
 let statusMessage = state.loadError || 'Saved locally on this browser.'
@@ -45,6 +57,27 @@ let newSnapshotTabDraft = {
     enabled: true,
     accountIntentionId: '',
     profileIntentionId: ''
+}
+let cloudState = {
+    status: 'loading',
+    message: 'Loading staging cloud config.',
+    error: '',
+    busy: '',
+    config: null,
+    authClient: null,
+    functionsClient: null,
+    firestoreClient: null,
+    storage: null,
+    auth: { signedIn: false, uid: '', email: '', metadataOnly: true },
+    email: '',
+    password: '',
+    deviceId: '',
+    requestId: '',
+    pairingChallengeDisplay: '',
+    keyGrantId: '',
+    lastSnapshotRevisionId: '',
+    lastPatchRevisionId: '',
+    syncKeyActive: false
 }
 
 const root = document.getElementById('app')
@@ -319,6 +352,171 @@ function readSnapshotFile(file) {
     reader.readAsText(file)
 }
 
+function safeCloudError(error) {
+    const text = String(error?.message || 'Hosted cloud action failed.').replace(/[\u0000-\u001F\u007F]/g, ' ').trim()
+    if (!text || /token|secret|private|syncRootKey|rootKeyMaterial|ciphertext|vault\.json|BrowserProfile|AppData[\\/]|[A-Za-z]:[\\/]|\\\\|cap_[A-Za-z0-9_-]{4,128}/i.test(text)) {
+        return 'Hosted cloud action failed.'
+    }
+    return text.length > 140 ? `${text.slice(0, 137).trim()}...` : text
+}
+
+function refreshCloudAuthState() {
+    cloudState.auth = cloudState.authClient?.getSafeAuthState
+        ? cloudState.authClient.getSafeAuthState()
+        : { signedIn: false, uid: '', email: '', metadataOnly: true }
+}
+
+function requireCloudRuntime() {
+    if (!cloudState.authClient || !cloudState.functionsClient || !cloudState.firestoreClient || !cloudState.storage) {
+        throw new Error('Hosted staging cloud is not configured.')
+    }
+    return {
+        authClient: cloudState.authClient,
+        functionsClient: cloudState.functionsClient,
+        firestoreClient: cloudState.firestoreClient,
+        storage: cloudState.storage
+    }
+}
+
+async function runHostedCloudAction(actionName, action) {
+    if (cloudState.busy) return
+    cloudState.busy = actionName
+    cloudState.error = ''
+    render()
+    try {
+        const result = await action(requireCloudRuntime())
+        refreshCloudAuthState()
+        cloudState.message = cloudMessageForResult(actionName, result)
+        cloudState.status = 'ready'
+        return result
+    } catch (err) {
+        cloudState.error = safeCloudError(err)
+        return null
+    } finally {
+        cloudState.busy = ''
+        render()
+    }
+}
+
+function cloudMessageForResult(actionName, result) {
+    if (actionName === 'sign-in') return 'Signed in to staging cloud.'
+    if (actionName === 'create-user') return 'Created staging auth user.'
+    if (actionName === 'anonymous-auth') return 'Signed in anonymously to staging cloud.'
+    if (actionName === 'request-enrollment') return 'Phone enrollment request uploaded.'
+    if (actionName === 'claim-session') return 'Device session claimed and sync key activated.'
+    if (actionName === 'download-snapshot') return `Downloaded sanitized snapshot ${result?.revisionId || ''}`.trim()
+    if (actionName === 'upload-patch') return `Uploaded encrypted safe patch ${result?.patchRevisionId || ''}`.trim()
+    return 'Hosted cloud action complete.'
+}
+
+async function signInHostedCloud(createUser = false) {
+    await runHostedCloudAction(createUser ? 'create-user' : 'sign-in', async ({ authClient }) => {
+        const email = cloudState.email.trim()
+        const password = cloudState.password
+        if (!email || !password) throw new Error('Email and password are required.')
+        const result = createUser
+            ? await authClient.createUserWithEmailAndPassword(email, password)
+            : await authClient.signInWithEmailAndPassword(email, password)
+        cloudState.password = ''
+        return result
+    })
+}
+
+async function signInHostedCloudAnonymously() {
+    await runHostedCloudAction('anonymous-auth', async ({ authClient }) => authClient.signInAnonymously())
+}
+
+async function requestHostedCloudEnrollment() {
+    await runHostedCloudAction('request-enrollment', async ({ authClient, functionsClient, storage }) => {
+        const result = await requestHostedPlannerEnrollment({
+            authClient,
+            functionsClient,
+            storage
+        })
+        cloudState.deviceId = result.deviceId
+        cloudState.requestId = result.requestId
+        cloudState.keyGrantId = result.keyGrantId
+        cloudState.pairingChallengeDisplay = result.pairingChallengeDisplay
+        return result
+    })
+}
+
+async function claimHostedCloudSession() {
+    await runHostedCloudAction('claim-session', async ({ authClient, functionsClient, firestoreClient, storage }) => {
+        const deviceId = (cloudState.deviceId || cloudState.requestId).trim()
+        if (!deviceId) throw new Error('A phone enrollment request id is required.')
+        const result = await claimHostedPlannerDeviceSession({
+            authClient,
+            functionsClient,
+            firestoreClient,
+            storage,
+            deviceId
+        })
+        cloudState.deviceId = result.deviceId
+        cloudState.keyGrantId = result.keyGrantId
+        cloudState.syncKeyActive = result.syncKeyActive === true
+        return result
+    })
+}
+
+async function downloadHostedCloudSnapshot() {
+    await runHostedCloudAction('download-snapshot', async ({ firestoreClient, storage }) => {
+        const result = await downloadLatestHostedPlannerSnapshot({
+            firestoreClient,
+            storage
+        })
+        const nextState = importSnapshotIntoPlannerState(state, result.snapshot, {
+            authorDeviceId: cloudState.deviceId || result.sourceDeviceId
+        })
+        state = savePhonePlannerState(nextState)
+        cloudState.lastSnapshotRevisionId = result.revisionId
+        return result
+    })
+}
+
+async function uploadHostedCloudPatch() {
+    await runHostedCloudAction('upload-patch', async ({ functionsClient, storage }) => {
+        const editor = snapshotEditor()
+        if (!editor) throw new Error('Load a sanitized snapshot before uploading a safe patch.')
+        const result = await uploadHostedPlannerSafePatch({
+            functionsClient,
+            storage,
+            editor
+        })
+        cloudState.lastPatchRevisionId = result.patchRevisionId
+        return result
+    })
+}
+
+async function initializeHostedCloud() {
+    try {
+        const config = await loadPhonePlannerFirebaseConfig()
+        const restApp = createPhonePlannerFirebaseRestApp({ config })
+        const storage = createPhonePlannerCloudStorage({
+            indexedDbAdapter: createIndexedDbAdapter()
+        })
+        cloudState = {
+            ...cloudState,
+            status: 'ready',
+            message: 'Staging cloud ready.',
+            config,
+            authClient: restApp.authClient,
+            functionsClient: restApp.functionsClient,
+            firestoreClient: restApp.firestoreClient,
+            storage
+        }
+        refreshCloudAuthState()
+    } catch (err) {
+        cloudState = {
+            ...cloudState,
+            status: 'unavailable',
+            error: safeCloudError(err),
+            message: 'Hosted staging cloud is unavailable.'
+        }
+    }
+    render()
+}
+
 function exportSnapshotPatch({ download = true } = {}) {
     const editor = snapshotEditor()
     if (!editor) return
@@ -353,6 +551,77 @@ function renderHeader() {
             })
         ]),
         createElement('div', { className: 'offline-pill', text: 'Offline local' })
+    ])
+}
+
+function renderHostedCloudPanel(editor) {
+    const ready = cloudState.status === 'ready'
+    const signedIn = cloudState.auth?.signedIn === true
+    const busy = !!cloudState.busy
+    const canClaim = ready && signedIn && !!(cloudState.deviceId || cloudState.requestId)
+    const cloudStatus = cloudState.error || cloudState.message
+    return createElement('section', { className: `panel wide hosted-cloud ${cloudState.error ? 'blocked' : ''}` }, [
+        createElement('div', { className: 'section-head' }, [
+            createElement('h2', { text: 'Hosted Staging Cloud' }),
+            createElement('span', { text: ready ? (signedIn ? 'signed in' : 'auth required') : cloudState.status })
+        ]),
+        createElement('p', {
+            className: `helper ${cloudState.error ? 'cloud-error' : ''}`,
+            text: cloudStatus
+        }),
+        createElement('div', { className: 'grid two' }, [
+            textInput({
+                label: 'Email',
+                value: cloudState.email,
+                maxLength: 160,
+                type: 'email',
+                onInput: value => { cloudState.email = value }
+            }),
+            textInput({
+                label: 'Password',
+                value: cloudState.password,
+                maxLength: 256,
+                type: 'password',
+                onInput: value => { cloudState.password = value }
+            })
+        ]),
+        createElement('div', { className: 'toolbar-actions' }, [
+            button(busy && cloudState.busy === 'sign-in' ? 'Signing In' : 'Sign In', 'btn primary', () => signInHostedCloud(false), !ready || busy),
+            button(busy && cloudState.busy === 'create-user' ? 'Creating' : 'Create User', 'btn', () => signInHostedCloud(true), !ready || busy),
+            cloudState.config?.allowAnonymousAuth
+                ? button(busy && cloudState.busy === 'anonymous-auth' ? 'Signing In' : 'Anonymous', 'btn', () => signInHostedCloudAnonymously(), !ready || busy)
+                : null
+        ]),
+        createElement('div', { className: 'grid two cloud-session-grid' }, [
+            textInput({
+                label: 'Request ID',
+                value: cloudState.requestId || cloudState.deviceId,
+                maxLength: 96,
+                placeholder: 'dev_...',
+                onInput: value => {
+                    cloudState.requestId = value
+                    cloudState.deviceId = value
+                }
+            }),
+            textInput({
+                label: 'Pairing Challenge',
+                value: cloudState.pairingChallengeDisplay,
+                maxLength: 128,
+                onInput: value => { cloudState.pairingChallengeDisplay = value },
+                hint: cloudState.keyGrantId ? `grant ${cloudState.keyGrantId}` : ''
+            })
+        ]),
+        createElement('div', { className: 'toolbar-actions' }, [
+            button(busy && cloudState.busy === 'request-enrollment' ? 'Requesting' : 'Request Enrollment', 'btn primary', () => requestHostedCloudEnrollment(), !ready || !signedIn || busy),
+            button(busy && cloudState.busy === 'claim-session' ? 'Claiming' : 'Claim Session', 'btn', () => claimHostedCloudSession(), !canClaim || busy),
+            button(busy && cloudState.busy === 'download-snapshot' ? 'Downloading' : 'Download Snapshot', 'btn', () => downloadHostedCloudSnapshot(), !ready || !signedIn || busy || !cloudState.syncKeyActive),
+            button(busy && cloudState.busy === 'upload-patch' ? 'Uploading' : 'Upload Patch', 'btn', () => uploadHostedCloudPatch(), !ready || !signedIn || busy || !cloudState.syncKeyActive || !editor)
+        ]),
+        createElement('div', { className: 'cloud-meta-line' }, [
+            createElement('span', { text: cloudState.auth?.email || cloudState.auth?.uid || 'not signed in' }),
+            cloudState.lastSnapshotRevisionId ? createElement('span', { text: `snapshot ${cloudState.lastSnapshotRevisionId}` }) : null,
+            cloudState.lastPatchRevisionId ? createElement('span', { text: `patch ${cloudState.lastPatchRevisionId}` }) : null
+        ])
     ])
 }
 
@@ -699,11 +968,13 @@ function renderSnapshotExportPanel(editor) {
 function renderSnapshotEditor(editor) {
     if (!editor) {
         return createElement('main', { className: 'planner-grid' }, [
+            renderHostedCloudPanel(null),
             renderSnapshotImportPanel(null)
         ])
     }
     const preset = selectedSnapshotPreset()
     return createElement('main', { className: 'planner-grid' }, [
+        renderHostedCloudPanel(editor),
         renderSnapshotImportPanel(editor),
         renderSnapshotPresetPicker(editor, preset),
         renderSnapshotPresetDetails(editor, preset),
@@ -1223,3 +1494,4 @@ function render() {
 }
 
 render()
+initializeHostedCloud()

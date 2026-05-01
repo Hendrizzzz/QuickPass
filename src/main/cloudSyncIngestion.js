@@ -1329,10 +1329,9 @@ export async function claimApprovedCloudSyncDeviceSession(input = {}) {
         if (!isPlainObject(request)) {
             fail('failed-precondition', 'Cloud sync enrollment request is not approved.')
         }
-        if (request.status === 'claimed') {
-            fail('failed-precondition', 'Cloud sync enrollment request has already been claimed.')
+        if (request.status !== 'approved' && request.status !== 'claimed') {
+            fail('failed-precondition', 'Cloud sync enrollment request is not approved.')
         }
-        if (request.status !== 'approved') fail('failed-precondition', 'Cloud sync enrollment request is not approved.')
         if (request.ownerUid !== ownerAuth.uid) fail('permission-denied', 'Enrollment request owner does not match caller.')
         if (request.requestId !== requestId) fail('failed-precondition', 'Enrollment request id does not match caller.')
         if (request.pairingChallengeAlg !== 'SHA-256-BASE64URL' || request.pairingChallengeHash !== pairingChallengeHash) {
@@ -1522,6 +1521,60 @@ export async function revokeCloudSyncDevice(input = {}) {
     })
 }
 
+function sanitizePendingEnrollmentRequestForDesktop(request) {
+    if (!isPlainObject(request)) fail('failed-precondition', 'Cloud sync enrollment request is invalid.')
+    const requestId = normalizeEnrollmentRequestId(request.requestId, request.device?.deviceId)
+    const status = normalizeString(request.status, 'enrollment request.status', { max: 40 })
+    if (status !== 'pending') return null
+    const device = validateDeviceRecordForAdmin({
+        document: request.device,
+        ownerUid: request.ownerUid,
+        documentId: requestId,
+        expectedStatus: 'pending'
+    })
+    if (device.role === 'desktop') return null
+    return {
+        ownerUid: normalizeOwnerUid(request.ownerUid, 'enrollment request.ownerUid'),
+        requestId,
+        status: 'pending',
+        pairingChallengeAlg: request.pairingChallengeAlg === 'SHA-256-BASE64URL'
+            ? 'SHA-256-BASE64URL'
+            : '',
+        pairingChallengeHash: normalizeHash(request.pairingChallengeHash, 'enrollment request.pairingChallengeHash'),
+        device,
+        requestedAt: normalizeTimestamp(request.requestedAt, 'enrollment request.requestedAt', 0),
+        updatedAt: normalizeTimestamp(request.updatedAt, 'enrollment request.updatedAt', 0)
+    }
+}
+
+export async function listPendingCloudSyncDeviceEnrollments(input = {}) {
+    if (!isPlainObject(input)) fail('invalid-argument', 'Cloud sync pending enrollment list input must be an object.')
+    if (!input.store || typeof input.store.runTransaction !== 'function' || typeof input.store.listCollection !== 'function') {
+        fail('failed-precondition', 'Cloud sync pending enrollment listing requires a Firestore Admin store.')
+    }
+    const authContext = normalizeAuth(input.auth)
+    await input.store.runTransaction(async tx => {
+        const { device } = await requireExistingActiveDesktop(tx, authContext)
+        requireScope(device, 'read')
+        return { status: 'authorized' }
+    })
+    const rawRecords = await input.store.listCollection(`users/${authContext.uid}/deviceEnrollmentRequests`)
+    const records = []
+    for (const raw of rawRecords || []) {
+        const record = sanitizePendingEnrollmentRequestForDesktop(raw)
+        if (record) records.push(record)
+    }
+    records.sort((left, right) => {
+        if (left.requestedAt !== right.requestedAt) return left.requestedAt - right.requestedAt
+        return left.requestId.localeCompare(right.requestId)
+    })
+    return {
+        status: 'listed',
+        records,
+        metadataOnly: true
+    }
+}
+
 export async function approveCloudSyncKeyGrant(input = {}) {
     return ingestCloudSyncDocument({
         ...input,
@@ -1557,6 +1610,10 @@ export function createFirestoreAdminStore(db) {
                     transaction.update(db.doc(path), data)
                 }
             }))
+        },
+        async listCollection(path) {
+            const snapshot = await db.collection(path).get()
+            return snapshot.docs.map(document => document.data())
         }
     }
 }

@@ -135,6 +135,10 @@ import {
     createTrustedAutoLaunchOrchestrator,
     trustedAutoLaunchStatusContainsForbiddenMaterial
 } from './trustedAutoLaunch.js'
+import {
+    approveCloudSyncDeviceEnrollmentAndGrantAfterUnlock,
+    listPendingCloudSyncDeviceEnrollmentsAfterUnlock
+} from './cloudSyncEnrollmentApproval.js'
 
 registerPackagedRendererProtocolScheme(protocol)
 
@@ -915,6 +919,21 @@ function registerIpcHandlers() {
     registerCloudSyncInvocationIpcHandlers({
         trustedHandle,
         deps: createCloudSyncInvocationHandlerDeps
+    })
+    trustedHandle('cloud-sync:list-pending-device-enrollments', async () => {
+        const deps = createCloudSyncInvocationHandlerDeps()
+        return listPendingCloudSyncDeviceEnrollmentsAfterUnlock({
+            storage: deps.storage,
+            functionsClient: deps.functionsClient
+        })
+    })
+    trustedHandle('cloud-sync:approve-device-enrollment', async (_, input) => {
+        const deps = createCloudSyncInvocationHandlerDeps()
+        return approveCloudSyncDeviceEnrollmentAndGrantAfterUnlock({
+            input,
+            storage: deps.storage,
+            functionsClient: deps.functionsClient
+        })
     })
     trustedHandle('cloud-sync:get-auto-import-status', async () => cloudSyncAutoImport.getStatus())
     trustedHandle('auto-launch:get-status', async () => trustedAutoLaunch.getStatus())

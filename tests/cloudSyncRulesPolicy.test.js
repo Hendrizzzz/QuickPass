@@ -28,6 +28,8 @@ test('Firestore rules file is default-deny and routes Phase 21.1 writes away fro
     assert.match(firestoreRules, /status == 'active'/)
     assert.match(firestoreRules, /revokedAt == null/)
     assert.match(firestoreRules, /syncScopes\.hasAny\(\['read'\]\)/)
+    assert.match(firestoreRules, /readableTrustedDevice/)
+    assert.match(firestoreRules, /allow get: if readableOwnDevice\(userId, deviceId\) \|\| readableTrustedDevice\(userId\);/)
     assert.doesNotMatch(firestoreRules, /allow get, list: if owns\(userId\)/)
     assert.doesNotMatch(firestoreRules, /allow create, update, delete: if owns\(userId\)/)
     assert.doesNotMatch(firestoreRules, /allow write: if owns\(userId\)/)

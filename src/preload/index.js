@@ -1,5 +1,8 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import { validateCloudSyncInvocationPayload } from './cloudSyncPreloadValidation.js'
+import {
+    validateCloudSyncEnrollmentApprovalPayload,
+    validateCloudSyncInvocationPayload
+} from './cloudSyncPreloadValidation.js'
 import { validateTrustedAutoLaunchSettingPayload } from './autoLaunchPreloadValidation.js'
 
 function invokeCloudSync(channel, data) {
@@ -69,6 +72,11 @@ const wipesnapApi = {
         downloadEncryptedPatchSummaries: (data) => invokeCloudSync('cloud-sync:download-encrypted-patch-summaries', data),
         planSafePresetPatches: (data) => invokeCloudSync('cloud-sync:plan-safe-preset-patches', data),
         applyTrustedPatches: (data) => invokeCloudSync('cloud-sync:apply-trusted-patches', data),
+        listPendingDeviceEnrollments: () => ipcRenderer.invoke('cloud-sync:list-pending-device-enrollments'),
+        approveDeviceEnrollment: (data) => ipcRenderer.invoke(
+            'cloud-sync:approve-device-enrollment',
+            validateCloudSyncEnrollmentApprovalPayload(data)
+        ),
         getAutoImportStatus: () => ipcRenderer.invoke('cloud-sync:get-auto-import-status'),
         onAutoImportStatus: (callback) => {
             const listener = (_, data) => callback(data)

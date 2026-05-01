@@ -6,6 +6,36 @@
     "firestore": {
         "rules": "firestore.rules"
     },
+    "hosting": {
+        "target": "phone-planner-staging",
+        "public": "out/phone-planner-staging",
+        "ignore": [
+            "firebase.json",
+            "**/.*",
+            "**/node_modules/**"
+        ],
+        "headers": [
+            {
+                "source": "**",
+                "headers": [
+                    {
+                        "key": "Content-Security-Policy",
+                        "value": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firestore.googleapis.com https://*.cloudfunctions.net; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none';"
+                    },
+                    {
+                        "key": "X-Content-Type-Options",
+                        "value": "nosniff"
+                    },
+                    {
+                        "key": "Referrer-Policy",
+                        "value": "no-referrer"
+                    }
+                ]
+            }
+        ],
+        "cleanUrls": true,
+        "trailingSlash": false
+    },
     "emulators": {
         "firestore": {
             "port": 8080

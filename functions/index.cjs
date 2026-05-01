@@ -117,6 +117,18 @@ exports.approveCloudSyncDeviceEnrollment = onCall({ region: 'us-central1' }, asy
     )
 })
 
+exports.listPendingCloudSyncDeviceEnrollments = onCall({ region: 'us-central1' }, async request => {
+    const { listPendingCloudSyncDeviceEnrollments } = await import('./shared/main/cloudSyncIngestion.js')
+    return mapCloudSyncErrors(async () =>
+        listPendingCloudSyncDeviceEnrollments({
+            auth: request.auth
+                ? { uid: request.auth.uid, token: request.auth.token || {} }
+                : null,
+            store: await adminStore()
+        })
+    )
+})
+
 exports.claimApprovedCloudSyncDeviceSession = onCall({ region: 'us-central1' }, async request => {
     const { claimApprovedCloudSyncDeviceSession } = await import('./shared/main/cloudSyncIngestion.js')
     return mapCloudSyncErrors(async () =>

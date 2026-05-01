@@ -1,6 +1,8 @@
 const MAX_CLOUD_SYNC_PATCH_REVISION_IDS = 50
 const CLOUD_SYNC_PATCH_REVISION_ID_PATTERN = /^patchrev_[A-Za-z0-9_-]{1,120}$/
+const CLOUD_SYNC_ENROLLMENT_REQUEST_ID_PATTERN = /^dev_[A-Za-z0-9_-]{1,92}$/
 const ALLOWED_KEYS = new Set(['patchRevisionIds'])
+const ENROLLMENT_APPROVAL_KEYS = new Set(['requestId'])
 
 function fail(message) {
     throw new Error(message)
@@ -105,4 +107,23 @@ export function validateCloudSyncInvocationPayload(value = {}) {
     }
     const patchRevisionIds = normalizePatchRevisionIds(payload.patchRevisionIds)
     return patchRevisionIds ? { patchRevisionIds } : {}
+}
+
+export function validateCloudSyncEnrollmentApprovalPayload(value = {}) {
+    const payload = value == null ? {} : value
+    if (!isPlainObject(payload)) fail('cloud sync enrollment approval payload must be an object.')
+    assertNoForbiddenMaterial(payload)
+    for (const key of Object.keys(payload)) {
+        if (!ENROLLMENT_APPROVAL_KEYS.has(key)) {
+            fail(`cloud sync enrollment approval payload.${key} is not accepted.`)
+        }
+    }
+    if (typeof payload.requestId !== 'string') {
+        fail('cloud sync enrollment approval requestId must be a string.')
+    }
+    const requestId = payload.requestId.trim()
+    if (!CLOUD_SYNC_ENROLLMENT_REQUEST_ID_PATTERN.test(requestId)) {
+        fail('cloud sync enrollment approval requestId must be a safe enrollment request id.')
+    }
+    return { requestId }
 }

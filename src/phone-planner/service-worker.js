@@ -4,7 +4,12 @@ const ASSETS = [
     './index.html',
     './styles.css',
     './app.js',
+    './phonePlannerCloudCrypto.js',
+    './phonePlannerCloudStorage.js',
+    './phonePlannerCloudWorkflow.js',
     './phonePlannerCore.js',
+    './phonePlannerFirebaseConfig.js',
+    './phonePlannerFirebaseRest.js',
     './phonePlannerStorage.js',
     './manifest.webmanifest'
 ]

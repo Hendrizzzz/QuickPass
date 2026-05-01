@@ -3,13 +3,17 @@ const OPERATION_LABELS = {
     'download-encrypted-patch-summaries': 'Patch download',
     'plan-safe-preset-patches': 'Patch planning',
     'apply-trusted-patches': 'Trusted apply',
-    'auto-import-trusted-patches': 'Trusted auto-import'
+    'auto-import-trusted-patches': 'Trusted auto-import',
+    'list-pending-device-enrollments': 'Phone enrollment',
+    'approve-phone-planner-enrollment': 'Phone approval'
 }
 
 const STATUS_LABELS = {
     accepted: 'Uploaded',
     downloaded: 'Downloaded',
     planned: 'Planned',
+    listed: 'Listed',
+    approved: 'Approved',
     completed: 'Completed',
     'not-configured': 'Not configured',
     'unavailable-runtime': 'Runtime unavailable',
@@ -90,6 +94,8 @@ function defaultMessage(result, status) {
     if (result?.operation === 'download-encrypted-patch-summaries') return 'Encrypted patch summaries checked.'
     if (result?.operation === 'plan-safe-preset-patches') return 'Validate-only patch planning complete.'
     if (result?.operation === 'apply-trusted-patches') return 'Trusted patch apply complete.'
+    if (result?.operation === 'list-pending-device-enrollments') return 'Pending phone enrollment metadata refreshed.'
+    if (result?.operation === 'approve-phone-planner-enrollment') return 'Phone enrollment approved and key grant staged.'
     if (result?.operation === 'auto-import-trusted-patches') {
         if (status === 'scheduled') return 'Trusted auto-import scheduled.'
         if (status === 'running') return 'Trusted auto-import running.'

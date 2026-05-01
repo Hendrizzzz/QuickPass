@@ -59,6 +59,14 @@ service cloud.firestore {
         && resource.data.deviceId == request.auth.token.wipesnapDeviceId;
     }
 
+    function readableTrustedDevice(userId) {
+      return hasActiveDevice(userId)
+        && resource.data.ownerUid == userId
+        && resource.data.status == 'active'
+        && resource.data.revokedAt == null
+        && resource.data.keyVersion == request.auth.token.wipesnapKeyVersion;
+    }
+
     function readableKeyGrant(userId) {
       return readableCloudResource(userId)
         && (
@@ -71,7 +79,8 @@ service cloud.firestore {
     // Functions ingestion that verifies device signatures, sequence counters,
     // rate limits, replay protection, and revocation before using Admin SDK.
     match /users/{userId}/devices/{deviceId} {
-      allow get, list: if readableOwnDevice(userId, deviceId);
+      allow get: if readableOwnDevice(userId, deviceId) || readableTrustedDevice(userId);
+      allow list: if readableOwnDevice(userId, deviceId);
       allow create, update, delete: if false;
     }
 

@@ -907,9 +907,9 @@ test('Device enrollment, claim issuance, approval, and revocation stay desktop-a
         }),
         requestedAt: NOW,
         now: NOW + 36
-    }), 'failed-precondition', /already been claimed/)
+    }), 'already-exists', /replayed|stale/)
 
-    await assertRejectsCode(() => claimApprovedCloudSyncDeviceSession({
+    const reclaimedSession = await claimApprovedCloudSyncDeviceSession({
         store,
         authIssuer: issuer,
         auth: { uid: UID, token: {} },
@@ -929,9 +929,15 @@ test('Device enrollment, claim issuance, approval, and revocation stay desktop-a
         }),
         requestedAt: NOW,
         now: NOW + 37
-    }), 'failed-precondition', /already been claimed/)
+    })
+    assert.equal(reclaimedSession.status, 'accepted')
+    assert.deepEqual(issuer.issued.at(-1), {
+        uid: UID,
+        claims: authFor({ ...activePhone, deviceSequence: 3 }).token
+    })
 
     const claimedPhone = store.get(`users/${UID}/devices/${activePhone.deviceId}`)
+    assert.equal(claimedPhone.deviceSequence, 3)
     const revokedRead = store.evaluateClient({
         path: `/users/${UID}/devices/${claimedPhone.deviceId}`,
         operation: 'get',

@@ -86,7 +86,7 @@
         "reason": "device-bound-read"
     },
     {
-        "name": "active enrolled device can read only its own device record",
+        "name": "active enrolled device can read its own device record",
         "path": "/users/user_a/devices/dev_phone_1",
         "operation": "get",
         "authUid": "user_a",
@@ -108,6 +108,38 @@
         },
         "allowed": true,
         "reason": "device-bound-read"
+    },
+    {
+        "name": "active enrolled phone can read trusted desktop public device metadata",
+        "path": "/users/user_a/devices/dev_desktop_1",
+        "operation": "get",
+        "authUid": "user_a",
+        "authClaims": {
+            "wipesnapDeviceId": "dev_phone_1",
+            "wipesnapDeviceRole": "phone",
+            "wipesnapEnrollmentEpoch": 3,
+            "wipesnapKeyVersion": 2
+        },
+        "deviceRecord": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_phone_1",
+            "role": "phone",
+            "status": "active",
+            "syncScopes": ["read", "patch-upload"],
+            "enrollmentEpoch": 3,
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "resourceData": {
+            "ownerUid": "user_a",
+            "deviceId": "dev_desktop_1",
+            "role": "desktop",
+            "status": "active",
+            "keyVersion": 2,
+            "revokedAt": null
+        },
+        "allowed": true,
+        "reason": "trusted-device-read"
     },
     {
         "name": "cross-user snapshot read is denied before device claims matter",

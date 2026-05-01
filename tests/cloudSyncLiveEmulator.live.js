@@ -436,10 +436,19 @@ test('Live Firestore rules deny non-device, stale, revoked, cross-user, and dire
         keys,
         sequence: 1
     })
+    const phone = deviceRecord({
+        ownerUid: UID,
+        deviceId: 'dev_live_rules_phone',
+        role: 'phone',
+        syncScopes: ['read', 'patch-upload'],
+        keys,
+        sequence: 1
+    })
     const revoked = { ...desktop, deviceId: 'dev_live_rules_revoked', status: 'revoked', revokedAt: NOW }
     await testEnv.withSecurityRulesDisabled(async context => {
         const db = context.firestore()
         await setDoc(doc(db, `users/${UID}/devices/${desktop.deviceId}`), desktop)
+        await setDoc(doc(db, `users/${UID}/devices/${phone.deviceId}`), phone)
         await setDoc(doc(db, `users/${UID}/devices/${revoked.deviceId}`), revoked)
         await setDoc(doc(db, `users/${UID}/snapshots/srev_live_rules`), {
             ownerUid: UID,
@@ -451,6 +460,9 @@ test('Live Firestore rules deny non-device, stale, revoked, cross-user, and dire
     try {
         const activeDb = testEnv.authenticatedContext(UID, claimsFor(desktop)).firestore()
         await assertSucceeds(getDoc(doc(activeDb, `users/${UID}/snapshots/srev_live_rules`)))
+        const phoneDb = testEnv.authenticatedContext(UID, claimsFor(phone)).firestore()
+        await assertSucceeds(getDoc(doc(phoneDb, `users/${UID}/devices/${desktop.deviceId}`)))
+        await assertFails(getDoc(doc(phoneDb, `users/${UID}/devices/${revoked.deviceId}`)))
 
         await assertFails(getDoc(doc(testEnv.unauthenticatedContext().firestore(), `users/${UID}/snapshots/srev_live_rules`)))
         await assertFails(getDoc(doc(testEnv.authenticatedContext(OTHER_UID, claimsFor(desktop)).firestore(), `users/${UID}/snapshots/srev_live_rules`)))
@@ -583,6 +595,10 @@ test('Live Functions emulator enforces independent device sessions, ingestion, k
             }),
             requestedAt: NOW
         }, ownerToken)
+        const pendingList = await callCallable('listPendingCloudSyncDeviceEnrollments', {}, desktopToken)
+        assert.equal(pendingList.status, 'listed')
+        assert.equal(pendingList.records.some(record => record.requestId === pendingPhone.deviceId), true)
+        assert.equal(JSON.stringify(pendingList).includes(pairingChallenge), false)
 
         const badApproval = clone(pendingPhone)
         badApproval.deviceId = 'dev_live_phone_bad'
@@ -714,7 +730,7 @@ test('Live Functions emulator enforces independent device sessions, ingestion, k
                 sequence: 2
             }),
             requestedAt: NOW
-        }, ownerToken, /already been claimed/)
+        }, ownerToken, /replayed|stale/)
 
         const claimedPhoneForClaims = { ...activePhone, deviceSequence: 2 }
         const phoneToken = await signInDeviceSession(phoneClient, claimedSession.deviceSessionToken, claimedPhoneForClaims)

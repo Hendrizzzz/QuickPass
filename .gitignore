@@ -18,6 +18,7 @@ temp-profile/
 diff.txt
 .gemini/
 electron.vite.config.*.mjs
+src/phone-planner/firebase-staging-config.json
 
 *.md
 !README.md

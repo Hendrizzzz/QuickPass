@@ -394,6 +394,32 @@ code {
     border-color: rgba(213, 155, 58, 0.5);
 }
 
+.hosted-cloud.blocked {
+    border-color: rgba(214, 96, 96, 0.44);
+}
+
+.hosted-cloud .cloud-error {
+    color: #ffc2c2;
+}
+
+.cloud-session-grid {
+    margin-top: 12px;
+}
+
+.cloud-meta-line {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+    color: var(--muted);
+    font-size: 0.78rem;
+}
+
+.cloud-meta-line span {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+}
+
 .export-json {
     margin-top: 12px;
     min-height: 220px;

@@ -1,11 +1,21 @@
 import assert from 'assert/strict'
+import fs from 'fs'
 import http from 'http'
 import { createRequire } from 'module'
 import { test } from 'node:test'
 import path from 'path'
 
 const require = createRequire(import.meta.url)
+const firebaseJson = require('../firebase.json')
 const packageJson = require('../package.json')
+const {
+    FORBIDDEN_ARTIFACT_NAMES,
+    FORBIDDEN_ARTIFACT_SEGMENTS,
+    PHONE_PLANNER_STAGING_FILES,
+    assertSafeArtifactFiles,
+    buildPhonePlannerStaging,
+    targetDir
+} = require('../scripts/build-phone-planner-staging.cjs')
 const {
     PHONE_PLANNER_STATIC_ROOT,
     parseArgs,
@@ -92,4 +102,40 @@ test('phone planner static server serves planner files and not repo root files',
     } finally {
         await closeServer(started.server)
     }
+})
+
+test('Firebase Hosting serves only the staged phone planner artifact with narrow CSP', () => {
+    assert.equal(firebaseJson.hosting.target, 'phone-planner-staging')
+    assert.equal(firebaseJson.hosting.public, 'out/phone-planner-staging')
+    assert.notEqual(firebaseJson.hosting.public, '.')
+    assert.notEqual(firebaseJson.hosting.public, 'src')
+
+    const csp = firebaseJson.hosting.headers[0].headers
+        .find(header => header.key === 'Content-Security-Policy')
+        ?.value || ''
+    assert.match(csp, /connect-src 'self'/)
+    assert.doesNotMatch(csp, /connect-src\s+\*/)
+    assert.doesNotMatch(csp, /localhost|127\.0\.0\.1/)
+    assert.match(csp, /identitytoolkit\.googleapis\.com/)
+    assert.match(csp, /firestore\.googleapis\.com/)
+    assert.match(csp, /cloudfunctions\.net/)
+
+    for (const fileName of PHONE_PLANNER_STAGING_FILES) {
+        assert.equal(path.dirname(fileName), '.')
+        assert.equal(FORBIDDEN_ARTIFACT_NAMES.has(fileName), false)
+        assert.equal(FORBIDDEN_ARTIFACT_SEGMENTS.has(fileName), false)
+    }
+    assert.equal(PHONE_PLANNER_STAGING_FILES.includes('app.js'), true)
+    assert.equal(PHONE_PLANNER_STAGING_FILES.includes('phonePlannerCloudWorkflow.js'), true)
+    assert.equal(PHONE_PLANNER_STAGING_FILES.includes('firebase-staging-config.example.json'), true)
+
+    buildPhonePlannerStaging()
+    assertSafeArtifactFiles()
+    const artifactFiles = new Set(fs.readdirSync(targetDir))
+    assert.equal(artifactFiles.has('index.html'), true)
+    assert.equal(artifactFiles.has('app.js'), true)
+    assert.equal(artifactFiles.has('functions'), false)
+    assert.equal(artifactFiles.has('tests'), false)
+    assert.equal(artifactFiles.has('vault.json'), false)
+    assert.equal(artifactFiles.has('package.json'), false)
 })
