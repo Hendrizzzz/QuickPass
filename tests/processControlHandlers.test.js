@@ -232,6 +232,30 @@ test('unlocked quit-and-relaunch follows closeApps policy before app quit', asyn
     assert.equal(calls.quitApp, 1)
 })
 
+test('quit-and-relaunch marks cleanup failed when desktop app cleanup throws', async () => {
+    const { deps, calls } = createDeps({
+        closeDesktopApps: async () => {
+            calls.closeDesktopApps += 1
+            throw new Error('taskkill denied for C:\\Users\\Alice\\AppData\\Local\\Host.exe')
+        }
+    })
+
+    await assert.rejects(() => quitAndRelaunchHandlerCore({
+        input: { closeApps: true },
+        deps
+    }), /taskkill denied/)
+
+    assert.equal(calls.closeBrowser, 1)
+    assert.equal(calls.closeDesktopApps, 1)
+    assert.equal(calls.quitApp, 0)
+    assert.deepEqual(calls.lifecyclePhases, [
+        { event: 'start', name: 'quit-requested' },
+        { event: 'end', name: 'quit-requested', status: 'ok', detail: '' },
+        { event: 'start', name: 'workspace-cleanup' },
+        { event: 'end', name: 'workspace-cleanup', status: 'failed', detail: 'Quit cleanup reported an error.' }
+    ])
+})
+
 test('locked close-desktop-apps rejects before side effects', async () => {
     const { deps, calls } = createDeps({
         hasActiveSession: () => false
@@ -274,6 +298,43 @@ test('close-window is allowed while locked and reaches before-quit lifecycle cle
     assert.equal(calls.removeTempTraces, 1)
     assert.equal(calls.quitApp, 1)
     assert.equal(state.isQuitting, true)
+})
+
+test('before-quit continues diagnostics and temp cleanup when desktop app cleanup throws', async () => {
+    const { deps, calls, quitEvent } = createDeps({
+        closeDesktopApps: async () => {
+            calls.closeDesktopApps += 1
+            throw new Error('taskkill denied for C:\\Users\\Alice\\Host.exe')
+        },
+        onCloseDesktopAppsError: (err) => {
+            calls.closeDesktopAppsErrors = calls.closeDesktopAppsErrors || []
+            calls.closeDesktopAppsErrors.push(err.message)
+        }
+    })
+    const state = { isQuitting: false }
+
+    await beforeQuitLifecycleCleanupCore({
+        event: quitEvent,
+        state,
+        deps
+    })
+
+    assert.equal(calls.preventDefault, 1)
+    assert.equal(calls.closeBrowser, 1)
+    assert.equal(calls.closeDesktopApps, 1)
+    assert.deepEqual(calls.closeDesktopAppsErrors, ['taskkill denied for C:\\Users\\Alice\\Host.exe'])
+    assert.deepEqual(calls.setActiveMasterPassword, [null])
+    assert.deepEqual(calls.wipeRuntimeAppProfiles, [{ staleOnly: true }])
+    assert.equal(calls.persistDiagnostics, 1)
+    assert.equal(calls.removeTempTraces, 1)
+    assert.equal(calls.quitApp, 1)
+    assert.equal(state.isQuitting, true)
+    assert.deepEqual(calls.lifecyclePhases, [
+        { event: 'start', name: 'quit-requested' },
+        { event: 'end', name: 'quit-requested', status: 'ok', detail: '' },
+        { event: 'start', name: 'workspace-cleanup' },
+        { event: 'end', name: 'workspace-cleanup', status: 'failed', detail: 'Desktop app cleanup reported an error.' }
+    ])
 })
 
 test('factory-reset missing token rejects before deletion', () => {

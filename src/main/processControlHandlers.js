@@ -167,7 +167,7 @@ export async function quitAndRelaunchHandlerCore({ input = {}, deps }) {
         if (closeApps) await deps.closeDesktopApps()
         endLifecyclePhase(deps, 'workspace-cleanup')
     } catch (err) {
-        endLifecyclePhase(deps, 'workspace-cleanup', 'warning', 'Quit cleanup reported an error.')
+        endLifecyclePhase(deps, 'workspace-cleanup', 'failed', 'Quit cleanup reported an error.')
         throw err
     }
     deps.quitApp()
@@ -202,7 +202,13 @@ export async function beforeQuitLifecycleCleanupCore({ event, state, deps }) {
         if (deps.onCloseBrowserError) deps.onCloseBrowserError(err)
     } finally {
         deps.setActiveMasterPassword(null)
-        await deps.closeDesktopApps()
+        try {
+            await deps.closeDesktopApps()
+        } catch (err) {
+            cleanupStatus = 'failed'
+            cleanupDetail = 'Desktop app cleanup reported an error.'
+            if (deps.onCloseDesktopAppsError) deps.onCloseDesktopAppsError(err)
+        }
         try { deps.wipeRuntimeAppProfiles({ staleOnly: true }) } catch (_) { }
         endLifecyclePhase(deps, 'workspace-cleanup', cleanupStatus, cleanupDetail)
         try { deps.persistDiagnostics() } catch (_) { }

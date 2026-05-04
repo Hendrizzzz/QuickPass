@@ -223,7 +223,15 @@ function validateSavedArgs(entry, record, appHealth, summary) {
 
 function checkHostExecutable(record, appHealth, summary, fs) {
     const target = statPath(fs, record.launch.path)
-    if (!target.exists) {
+    if (target.inaccessible) {
+        addAppIssue(
+            appHealth,
+            summary,
+            'broken',
+            'Saved host executable could not be inspected on this PC.',
+            'inaccessible-host-executable'
+        )
+    } else if (!target.exists) {
         addAppIssue(
             appHealth,
             summary,
@@ -244,7 +252,15 @@ function checkHostExecutable(record, appHealth, summary, fs) {
 
 function checkHostFolder(record, appHealth, summary, fs) {
     const target = statPath(fs, record.launch.path)
-    if (!target.exists) {
+    if (target.inaccessible) {
+        addAppIssue(
+            appHealth,
+            summary,
+            'broken',
+            'Saved host folder could not be inspected on this PC.',
+            'inaccessible-host-folder'
+        )
+    } else if (!target.exists) {
         addAppIssue(
             appHealth,
             summary,
@@ -265,7 +281,15 @@ function checkHostFolder(record, appHealth, summary, fs) {
 
 function checkShellTarget(record, appHealth, summary, fs) {
     const target = statPath(fs, record.launch.path)
-    if (!target.exists) {
+    if (target.inaccessible) {
+        addAppIssue(
+            appHealth,
+            summary,
+            'broken',
+            'Saved shell target could not be inspected on this PC.',
+            'inaccessible-shell-target'
+        )
+    } else if (!target.exists) {
         addAppIssue(
             appHealth,
             summary,

@@ -746,6 +746,10 @@ function createProcessControlHandlerDeps() {
             console.error('[Wipesnap] Profile sync during quit failed:', err)
             diagError('before-quit', err.message)
         },
+        onCloseDesktopAppsError: (err) => {
+            console.error('[Wipesnap] Desktop app cleanup during quit failed:', err)
+            diagError('before-quit', err.message)
+        },
         wipeRuntimeAppProfiles: wipeAllRuntimeAppProfiles,
         persistDiagnostics: () => {
             const vd = getVaultDir()
@@ -1116,7 +1120,7 @@ function registerIpcHandlers() {
                 return {
                     success: false,
                     error: 'HARDWARE_MISMATCH',
-                    message: 'Hardware change detected. PIN disabled. Enter your Master Password.'
+                    message: 'Drive binding changed. PIN disabled. Enter your Master Password.'
                 }
             }
 

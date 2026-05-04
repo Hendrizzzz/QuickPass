@@ -11,10 +11,10 @@ Current product focus: desktop MVP hardening. The production path is vault setup
 - **Encrypted workspace config:** `vault.json` stores workspace configuration with AES-256-GCM and PBKDF2-SHA512 key derivation.
 - **Drive detection:** Wipesnap queries `Win32_LogicalDisk` through PowerShell/CIM first and falls back to `vol <drive>` for a volume serial when CIM is unavailable.
 - **Convenience unlock:** optional PIN and Fast Boot store encrypted helper material in `vault.meta.json` using the Windows volume serial reported by the host. This is convenience binding, not raw USB hardware identity.
-- **Browser orchestration:** Playwright launches a persistent Chromium profile copied from `BrowserProfile/` to host temp and synced back on close.
+- **Browser orchestration:** Playwright launches the Chrome channel with a persistent Chromium profile copied from `BrowserProfile/` to host temp and synced back on close. Edge/default-browser fallback is not claimed in the desktop MVP.
 - **Desktop app import:** imported app binaries are compressed as `Apps/<storage-id>.tar.zst`, extracted to host temp on launch, and described by Manifest V2 metadata.
 - **App support tiers:** verified, best-effort, launch-only, needs-adapter, and unsupported tiers keep data-portability claims conservative.
-- **Host cleanup:** temp browser profiles, runtime profiles, imported AppData copies, and app caches are wiped with ownership/path checks.
+- **Host cleanup:** Wipesnap attempts to wipe temp browser profiles, runtime profiles, imported AppData copies, and app caches with ownership/path checks.
 - **Diagnostics:** each run can write structured launch, readiness, sync, and cleanup diagnostics.
 - **Cloud/phone staging:** Firebase and Cloudflare transport code can carry app-encrypted sanitized snapshots and patches when explicitly configured for staging. Phone remains a safe preset editor, not a launch control plane; desktop remains launch authority.
 
@@ -59,6 +59,26 @@ Normal shutdown cleanup closes the managed browser, closes only owned or safely 
 
 If sync-back or cleanup fails, is deferred, or is unknown, do not treat the workspace as fully synced or safe to unplug until diagnostics are reviewed and the remaining action is resolved.
 
+## Windows Compatibility Status
+
+Wipesnap targets Windows 10 and Windows 11, but Phase 34 treats host compatibility as a matrix of expectations, automated coverage, and manual validation still needed. Do not infer real-hardware validation from the presence of a code path or automated fixture.
+
+Tracked Phase 34 matrix summary:
+
+| Area | Expected behavior | Validation status |
+| --- | --- | --- |
+| Windows 10/11, admin/non-admin | Use Windows primitives without requiring elevation; denied operations degrade to failed, blocked, deferred, unavailable, or needs-attention states. | Automated coverage is partial; real-host validation still needed. |
+| Locked-down corporate hosts | Denied registry, PowerShell/CIM, process, or file operations must not leak raw commands, registry data, paths, or authority to renderer status. | Automated sanitization coverage is partial; managed-host smoke still needed. |
+| Slow or yanked removable drive | Launch, sync-back, cleanup, and diagnostics must not be presented as synced or safe when the drive is unavailable, failed, running, deferred, blocked, or unknown. | Diagnostics tests cover several simulated states; physical yank tests still needed. |
+| Chrome and browser profile lifecycle | Chrome-channel launch is the MVP path. Missing profiles need attention when tabs exist; copy-in failure blocks browser launch to protect the portable profile; copy-out failure remains action-needed. | Automated diagnostics and copy-in fail-closed coverage; real Chrome-missing/locked-profile smoke still needed. |
+| App processes and ownership | Wipesnap may close only owned or safely identified processes; ambiguous, launch-only, or unmanaged processes are skipped or deferred. | Process-control tests cover handler states; real long-running app smoke still needed. |
+| AppData and path escape cleanup | Cleanup must fail closed on symlink, junction, or path escape risk and never delete arbitrary host data. | Automated stale AppData guard coverage; NTFS junction manual smoke still needed. |
+| Redirected known folders, AV, file locks, missing primitives | Health and diagnostics should show broken/needs-attention/failure without raw path or command leakage. | Automated coverage is partial; OneDrive/AV/missing-primitive smoke still needed. |
+| Corrupt, oversized, missing, or stale diagnostics/cleanup selections | Renderer receives sanitized metadata-only status, and stale selected cleanup items are revalidated before deletion. | Automated coverage. |
+| Partial lifecycle outcomes | Sync success plus cleanup blocked/deferred/failed, or cleanup success plus sync failed/unknown, remains action-needed rather than synced/safe. | Automated diagnostics coverage. |
+
+Some worktrees may also contain a fuller local planning matrix at `docs/phase-34-windows-compatibility-matrix.md`. The `docs/` directory is ignored by this repository policy, so that file is a local planning artifact unless it is intentionally force-added in a future docs policy change.
+
 Legacy compatibility names still recognized in one pass:
 
 - `.quickpass-app.json` imported-app manifests are read for old vaults; new manifests use `.wipesnap-app.json`.
@@ -88,7 +108,7 @@ Cloud/phone note: staging cloud code stores app-encrypted snapshots and patches,
 
 ### Prerequisites
 
-- Windows 10 or 11
+- Windows 10 or 11. Current support expectations are documented in the Phase 34 matrix; not every host combination has been manually validated yet.
 - Node.js 18+
 
 ### Install

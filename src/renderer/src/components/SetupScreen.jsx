@@ -7,7 +7,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
     const [step, setStep] = useState(1)
     const [masterPassword, setMasterPassword] = useState('')
     const [confirmPassword, setConfirmPassword] = useState('')
-    // Flash Drives completely skip Master Password prompts and use an incredibly strong hidden 64-char AES key.
+    // Removable-drive setup can use generated vault material plus PIN/Fast Boot convenience unlock.
     const [hiddenMasterPassword] = useState(() => Array.from(crypto.getRandomValues(new Uint8Array(32))).map(b => b.toString(16).padStart(2, '0')).join(''))
     const [pin, setPin] = useState('')
     const [confirmPin, setConfirmPin] = useState('')
@@ -259,7 +259,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
             {step === 1 && !supportsConvenienceUnlock && (
                 <div className="flex flex-col gap-3 animate-fade-in">
                     <p className="text-secondary text-sm">
-                        Create a master password. This encrypts everything on your local drive.
+                        Create a master password for the encrypted workspace vault.
                     </p>
                     <input
                         type="password"
@@ -330,7 +330,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
                     <div className="flex items-center justify-between p-3 rounded-md bg-[#14141c]">
                         <div>
                             <p className="text-sm text-white font-medium">Fast Boot</p>
-                            <p className="text-xs text-muted">Skip PIN - hardware-only unlock</p>
+                            <p className="text-xs text-muted">Skip PIN on this drive when the volume serial matches</p>
                         </div>
                         <div
                             className={`toggle-track ${fastBoot ? 'active' : ''}`}

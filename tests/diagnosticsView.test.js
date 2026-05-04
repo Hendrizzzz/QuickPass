@@ -533,6 +533,44 @@ test('failed browser copy-out is visible, actionable, and sanitized', () => with
     assert.equal(serialized.includes(secretToken), false)
 }))
 
+test('failed browser copy-in is visible and sanitized without implying healthy launch', () => withVaultDir((vaultDir) => {
+    const secretPath = 'E:\\Wipesnap\\BrowserProfile\\Default'
+    const secretToken = '0123456789abcdef0123456789abcdef01234567'
+    writeDiagnostics(vaultDir, {
+        cycleType: 'launch',
+        cycleStartTime: 645,
+        phases: [
+            { name: 'launch-started', status: 'ok' },
+            { name: 'browser-copy-in', status: 'failed', detail: `robocopy failed at ${secretPath} token=${secretToken}` },
+            { name: 'workspace-running', status: 'warning', detail: '1 item failed during launch.' }
+        ],
+        browserSync: {
+            copyInMs: 13,
+            copyOutMs: null
+        },
+        webResults: [{
+            tabIndex: 1,
+            success: false,
+            error: `copy-in failed at ${secretPath} token=${secretToken}`
+        }],
+        errors: [{
+            context: 'browser-copy-in',
+            message: `copy failed at ${secretPath} token=${secretToken}`
+        }]
+    })
+
+    const summary = loadDiagnosticsSummary({ vaultDir })
+    const serialized = JSON.stringify(summary)
+
+    assert.equal(summary.status, 'failed')
+    assert.equal(summary.browser.status, 'failed')
+    assert.equal(summary.lifecycle.finalState, 'unknown')
+    assert.equal(summary.failures.some(item => item.scope === 'phase' && item.name === 'browser-copy-in'), true)
+    assert.equal(serialized.includes(secretPath), false)
+    assert.equal(serialized.includes('BrowserProfile'), false)
+    assert.equal(serialized.includes(secretToken), false)
+}))
+
 test('running deferred blocked missing null and unknown app sync-back never report synced', () => {
     const cases = [
         { rawStatus: 'running', expectedStatus: 'running' },

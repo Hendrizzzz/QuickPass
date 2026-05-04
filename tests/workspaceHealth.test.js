@@ -65,6 +65,20 @@ function createHostFolderRecord(pathValue) {
     })
 }
 
+function createShellTargetRecord(pathValue) {
+    return createCapabilityRecord({
+        type: 'shell-execute',
+        provenance: 'test',
+        displayName: 'Shell Target',
+        launch: { path: pathValue },
+        policy: {
+            allowedArgs: 'none',
+            canCloseFromWipesnap: false,
+            ownership: 'external'
+        }
+    })
+}
+
 function createImportedRecord(storageId) {
     return createCapabilityRecord({
         type: 'vault-archive',
@@ -149,6 +163,41 @@ test('missing host executable and host folder are detected without returning pat
     assert.equal(reasonCodes(summary).has('missing-host-folder'), true)
     assert.equal(serialized.includes(missingExe), false)
     assert.equal(serialized.includes(missingFolder), false)
+}))
+
+test('inaccessible host references fail closed without returning paths or raw errors', () => withVaultDir((vaultDir) => {
+    const deniedExe = join(vaultDir, 'Denied.exe')
+    const deniedFolder = join(vaultDir, 'DeniedFolder')
+    const deniedShell = join(vaultDir, 'DeniedShortcut.lnk')
+    const exeRecord = createHostExeRecord(deniedExe)
+    const folderRecord = createHostFolderRecord(deniedFolder)
+    const shellRecord = createShellTargetRecord(deniedShell)
+    const fsApi = {
+        existsSync: () => true,
+        statSync: (pathValue) => {
+            throw new Error(`EACCES: access denied, stat '${pathValue}'`)
+        },
+        readFileSync: () => '{}',
+        readdirSync: () => []
+    }
+
+    const summary = loadWorkspaceHealthSummary({
+        vaultDir,
+        fsApi,
+        workspace: workspaceFor(
+            [exeRecord, folderRecord, shellRecord],
+            [appEntry(exeRecord), appEntry(folderRecord), appEntry(shellRecord)]
+        )
+    })
+    const serialized = JSON.stringify(summary)
+
+    assert.equal(summary.status, WORKSPACE_HEALTH_STATUSES.BROKEN)
+    assert.equal(reasonCodes(summary).has('inaccessible-host-executable'), true)
+    assert.equal(reasonCodes(summary).has('inaccessible-host-folder'), true)
+    assert.equal(reasonCodes(summary).has('inaccessible-shell-target'), true)
+    for (const forbidden of [deniedExe, deniedFolder, deniedShell, 'EACCES', 'access denied']) {
+        assert.equal(serialized.includes(forbidden), false, `health summary leaked ${forbidden}`)
+    }
 }))
 
 test('missing imported manifests and archives are detected', () => withVaultDir((vaultDir) => {

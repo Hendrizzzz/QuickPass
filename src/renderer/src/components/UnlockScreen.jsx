@@ -11,7 +11,7 @@ export default function UnlockScreen({ driveInfo, vaultMeta, onUnlock }) {
     const [password, setPassword] = useState('')
     const [resetConfirming, setResetConfirming] = useState(false)
     const [error, setError] = useState(
-        hardwareMismatch ? 'Hardware change detected. Enter your master password.' : ''
+        hardwareMismatch ? 'Drive binding changed. Enter your master password.' : ''
     )
     const [loading, setLoading] = useState(false)
     const hiddenInputRef = useRef(null)
@@ -139,7 +139,7 @@ export default function UnlockScreen({ driveInfo, vaultMeta, onUnlock }) {
                 <form onSubmit={handlePasswordSubmit} className="flex flex-col gap-3">
                     <p className="text-secondary text-sm text-center">
                         {hardwareMismatch
-                            ? 'Drive changed. Enter your master password.'
+                            ? 'Drive binding changed. Enter your master password.'
                             : 'Enter your Master Password'}
                     </p>
                     <input

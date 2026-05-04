@@ -83,7 +83,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, surfa
     const [confirmPin, setConfirmPin] = useState('')
     const [securityPinProof, setSecurityPinProof] = useState('')
     const [fastBoot, setFastBoot] = useState(false)
-    const [clearCacheOnExit, setClearCacheOnExit] = useState(true) // default ON = zero footprint
+    const [clearCacheOnExit, setClearCacheOnExit] = useState(true) // default ON = clear extracted app caches on exit
     const [securityMeta, setSecurityMeta] = useState(vaultMeta || null)
     const productSurface = normalizeProductSurfacePolicyForRenderer(surfacePolicy)
     const showCloudSyncControls = shouldShowCloudSyncControls(productSurface)
@@ -1936,7 +1936,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, surfa
                             <div className="border border-[#2a2a3a] rounded-md overflow-hidden bg-[#1a1a24] p-3 flex justify-between items-center">
                                 <div>
                                     <p className="text-sm text-white">Fast Boot</p>
-                                    <p className="text-xs text-muted mt-0.5">Skip PIN & unlock directly via hardware</p>
+                                    <p className="text-xs text-muted mt-0.5">Skip PIN when this drive's volume serial matches</p>
                                 </div>
                                 <div className={`toggle-track ${fastBoot ? 'active' : ''}`} onClick={handleToggleFastBoot}>
                                     <div className="toggle-thumb" />

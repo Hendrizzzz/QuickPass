@@ -2012,38 +2012,79 @@ function handleProfileMigration(profileDir) {
  * This is the "PortableApps pattern"  same approach used by
  * Portable Firefox, Tor Browser, etc.
  */
-async function launchChrome(vaultDir, onStatus = () => { }) {
-    activeVaultDir = vaultDir
+const BROWSER_PROFILE_COPY_IN_BLOCKED_MESSAGE = 'Browser profile copy-in failed. Browser launch was blocked to protect the portable profile.'
+const BROWSER_LAUNCH_FAILED_MESSAGE = 'Browser launch failed. Chrome could not start from the managed profile.'
+
+const defaultBrowserLifecycleOps = Object.freeze({
+    existsSync: (pathValue) => existsSync(pathValue),
+    mkdirSync: (pathValue, options) => mkdirSync(pathValue, options),
+    rmSync: (pathValue, options) => rmSync(pathValue, options),
+    robocopyAsync,
+    cleanProfileLocks,
+    handleProfileMigration,
+    patchProfileLocale,
+    launchPersistentContext: (profileDir, launchOptions) => chromium.launchPersistentContext(profileDir, launchOptions)
+})
+
+function createBrowserCopyInBlockedError() {
+    const err = new Error(BROWSER_PROFILE_COPY_IN_BLOCKED_MESSAGE)
+    err.code = 'browser-copy-in-failed'
+    return err
+}
+
+export function resetBrowserLifecycleStateForTests() {
+    activeBrowser = null
+    activeContext = null
+    onDisconnectCallback = null
+    activeVaultDir = null
+}
+
+export async function launchChromeForTests(vaultDir, onStatus = () => { }, ops = {}) {
+    return launchChrome(vaultDir, onStatus, { ...defaultBrowserLifecycleOps, ...ops })
+}
+
+async function launchChrome(vaultDir, onStatus = () => { }, ops = defaultBrowserLifecycleOps) {
+    activeVaultDir = null
     const usbProfile = join(vaultDir, 'BrowserProfile')
     const localProfile = getLocalProfileDir(vaultDir)
-    mkdirSync(localProfile, { recursive: true })
+    ops.mkdirSync(localProfile, { recursive: true })
 
     // Mirror USB profile -> local temp (if profile exists on USB)
     diagPhaseStart('browser-copy-in')
     const copyInStart = Date.now()
-    if (existsSync(usbProfile)) {
+    let copyInStatus = 'ok'
+    let copyInDetail = ''
+    if (ops.existsSync(usbProfile)) {
         try {
-            await robocopyAsync(usbProfile, localProfile)
+            await ops.robocopyAsync(usbProfile, localProfile)
         } catch (err) {
             console.error('[Wipesnap] Failed to sync profile from USB:', err)
-            diagError('browser-copy-in', err.message)
+            copyInStatus = 'failed'
+            copyInDetail = BROWSER_PROFILE_COPY_IN_BLOCKED_MESSAGE
+            diagError('browser-copy-in', err?.message || BROWSER_PROFILE_COPY_IN_BLOCKED_MESSAGE)
         }
     }
     runDiagnostics.browserSync.copyInMs = Date.now() - copyInStart
-    diagPhaseEnd('browser-copy-in')
+    diagPhaseEnd('browser-copy-in', copyInStatus, copyInDetail)
+
+    if (copyInStatus === 'failed') {
+        try { ops.rmSync(localProfile, { recursive: true, force: true }) } catch (_) { }
+        onStatus('[ERROR] Browser profile copy-in failed. Browser launch was blocked to protect the portable profile.')
+        throw createBrowserCopyInBlockedError()
+    }
 
     // Clean stale lock files from crashed sessions
-    cleanProfileLocks(localProfile)
+    ops.cleanProfileLocks(localProfile)
 
     // Detect cross-machine migration and scrub DPAPI secrets
-    const migrated = handleProfileMigration(localProfile)
+    const migrated = ops.handleProfileMigration(localProfile)
     if (migrated) {
         onStatus('[INFO] New PC detected - browser sessions will require re-login')
         runDiagnostics.browserSync.migrated = true
     }
 
     // Force English language by aggressively patching the embedded JSON preferences
-    patchProfileLocale(localProfile)
+    ops.patchProfileLocale(localProfile)
 
     const launchOptions = {
         headless: false,
@@ -2073,26 +2114,35 @@ async function launchChrome(vaultDir, onStatus = () => { }) {
     let context
     diagPhaseStart('browser-launch')
     try {
-        context = await chromium.launchPersistentContext(localProfile, launchOptions)
+        context = await ops.launchPersistentContext(localProfile, launchOptions)
     } catch (launchErr) {
         diagError('browser-launch', `Primary launch failed: ${launchErr.message}`)
         console.error('[Wipesnap] Chrome launch failed, retrying with clean profile:', launchErr.message)
 
         // Nuclear fallback: nuke the corrupted local profile and start fresh
-        try { rmSync(localProfile, { recursive: true, force: true }) } catch (_) { }
-        mkdirSync(localProfile, { recursive: true })
-        patchProfileLocale(localProfile)
+        try { ops.rmSync(localProfile, { recursive: true, force: true }) } catch (_) { }
+        ops.mkdirSync(localProfile, { recursive: true })
+        ops.patchProfileLocale(localProfile)
         // Write machine marker so next run doesn't re-trigger migration
         const machineHash = crypto.createHash('sha256')
             .update(`${os.hostname()}:${os.userInfo().username}`)
             .digest('hex').slice(0, 16)
             try { require('fs').writeFileSync(join(localProfile, MACHINE_MARKER_FILE), machineHash) } catch (_) { }
 
-        context = await chromium.launchPersistentContext(localProfile, launchOptions)
-        onStatus('[WARN] Browser launched with fresh profile - all sessions reset')
+        try {
+            context = await ops.launchPersistentContext(localProfile, launchOptions)
+            onStatus('[WARN] Browser launched with fresh profile - all sessions reset')
+        } catch (retryErr) {
+            diagError('browser-launch', `Retry with fresh profile failed: ${retryErr.message}`)
+            diagPhaseEnd('browser-launch', 'failed', BROWSER_LAUNCH_FAILED_MESSAGE)
+            try { ops.rmSync(localProfile, { recursive: true, force: true }) } catch (_) { }
+            activeVaultDir = null
+            throw new Error(BROWSER_LAUNCH_FAILED_MESSAGE)
+        }
     }
     diagPhaseEnd('browser-launch')
 
+    activeVaultDir = vaultDir
     const browser = context.browser()
     return { context, browser }
 }
@@ -2272,7 +2322,7 @@ export async function captureCurrentSession() {
  * Gracefully closes the browser, syncs profile to USB, wipes local copy.
  * Uses try/finally to GUARANTEE local wipe even if sync fails.
  */
-export async function closeBrowser() {
+export async function closeBrowser(ops = defaultBrowserLifecycleOps) {
     onDisconnectCallback = null
     if (activeContext) {
         // Close context first  flushes all profile data to local temp dir
@@ -2293,8 +2343,8 @@ export async function closeBrowser() {
         let copyOutStatus = 'ok'
         let copyOutDetail = ''
         try {
-            mkdirSync(usbProfile, { recursive: true })
-            await robocopyAsync(localProfile, usbProfile)
+            ops.mkdirSync(usbProfile, { recursive: true })
+            await ops.robocopyAsync(localProfile, usbProfile)
         } catch (err) {
             console.error('[Wipesnap] Profile sync to USB failed:', err)
             copyOutStatus = 'failed'
@@ -2304,7 +2354,7 @@ export async function closeBrowser() {
             runDiagnostics.browserSync.copyOutMs = Date.now() - copyOutStart
             diagPhaseEnd('browser-copy-out', copyOutStatus, copyOutDetail)
             // ALWAYS wipe local profile  even if sync failed
-            try { rmSync(localProfile, { recursive: true, force: true }) } catch (_) { }
+            try { ops.rmSync(localProfile, { recursive: true, force: true }) } catch (_) { }
             activeVaultDir = null
         }
     }
