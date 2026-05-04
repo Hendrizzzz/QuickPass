@@ -27,8 +27,8 @@ const LAUNCH_VERIFIED_BY_VALUES = new Set(['unknown', 'shell-activation-sent', '
 const IMPORTED_DATA_SUPPORT_LEVEL_VALUES = new Set(['verified', 'best-effort', 'unsupported', 'unknown'])
 const ARCHIVE_POLICY_STATUS_VALUES = new Set(['current', 'legacy', 'unknown', 'ok', 'failed'])
 const SYNC_BACK_STATUS_VALUES = new Set(['not-run', 'running', 'completed', 'failed', 'deferred', 'blocked', 'unknown'])
-const CLEANUP_LIFECYCLE_STATUS_VALUES = new Set(['not-run', 'started', 'completed', 'deferred', 'blocked', 'unknown'])
-const FINAL_STATE_VALUES = new Set(['synced', 'cleanup-completed', 'cleanup-deferred', 'action-needed', 'unknown'])
+const CLEANUP_LIFECYCLE_STATUS_VALUES = new Set(['not-run', 'started', 'completed', 'deferred', 'blocked', 'failed', 'unknown'])
+const FINAL_STATE_VALUES = new Set(['synced', 'cleanup-completed', 'cleanup-deferred', 'cleanup-failed', 'action-needed', 'unknown'])
 const BROWSER_REASON_VALUES = new Set(['', 'empty-url', 'local-file-url', 'browser-error-page', 'browser-internal-page', 'unsupported-browser-scheme', 'unsupported-browser-url'])
 const STATUS_CLASSIFICATION_VALUES = new Set([
     ...PHASE_STATUS_VALUES,
@@ -88,8 +88,8 @@ function createEmptySummary(state = 'missing', overrides = {}) {
             workspaceRunning: false,
             quitRequested: false,
             browserSyncBack: { status: 'not-run', copyOutMs: null },
-            appSessionSyncBack: { status: 'not-run', completed: 0, failed: 0, deferred: 0 },
-            cleanup: { status: 'not-run', completed: false, deferred: 0, blocked: 0 },
+            appSessionSyncBack: { status: 'not-run', completed: 0, failed: 0, deferred: 0, blocked: 0 },
+            cleanup: { status: 'not-run', completed: false, deferred: 0, blocked: 0, failed: 0 },
             finalState: 'unknown',
             finalStateLabel: 'Unknown',
             recoveryGuidance: 'No final lifecycle status has been recorded yet.'
@@ -435,6 +435,7 @@ function syncBackStatusLabel(status) {
     if (status === 'deferred') return 'Deferred'
     if (status === 'blocked') return 'Blocked'
     if (status === 'running') return 'Running'
+    if (status === 'started') return 'Started'
     if (status === 'not-run') return 'Not run'
     return 'Unknown'
 }
@@ -443,6 +444,7 @@ function finalStateLabel(state) {
     if (state === 'synced') return 'Synced'
     if (state === 'cleanup-completed') return 'Cleanup completed'
     if (state === 'cleanup-deferred') return 'Cleanup deferred'
+    if (state === 'cleanup-failed') return 'Cleanup failed'
     if (state === 'action-needed') return 'Action needed'
     return 'Unknown'
 }
@@ -456,6 +458,9 @@ function lifecycleGuidance(finalState) {
     }
     if (finalState === 'cleanup-deferred') {
         return 'Cleanup was deferred for safety. Close remaining launched apps, reopen Wipesnap, and review diagnostics before unplugging.'
+    }
+    if (finalState === 'cleanup-failed') {
+        return 'Cleanup failed. Keep the drive connected, close remaining launched apps, reopen Wipesnap, and review diagnostics before unplugging.'
     }
     if (finalState === 'action-needed') {
         return 'Sync-back or cleanup needs attention. Keep the drive connected, reopen Wipesnap, and review diagnostics before unplugging.'
@@ -489,49 +494,63 @@ function summarizeBrowserSyncBack({ browser, phases, errors, quitRequested }) {
 function summarizeAppSessionSyncBack(apps) {
     const syncApps = apps.filter(app => app.runtimeProfileSynced || app.appSessionSyncBackStatus !== 'not-run')
     const failed = syncApps.filter(app => app.appSessionSyncBackStatus === 'failed').length
-    const deferred = syncApps.filter(app => ['deferred', 'blocked'].includes(app.appSessionSyncBackStatus)).length
+    const blocked = syncApps.filter(app => app.appSessionSyncBackStatus === 'blocked').length
+    const deferred = syncApps.filter(app => app.appSessionSyncBackStatus === 'deferred').length
     const completed = syncApps.filter(app => app.appSessionSyncBackStatus === 'completed').length
     const running = syncApps.filter(app => app.appSessionSyncBackStatus === 'running').length
     const status = failed > 0
         ? 'failed'
-        : deferred > 0
-            ? 'deferred'
-            : running > 0
-                ? 'running'
-                : completed > 0
-                    ? 'completed'
-                    : syncApps.length > 0
-                        ? 'unknown'
-                        : 'not-run'
+        : blocked > 0
+            ? 'blocked'
+            : deferred > 0
+                ? 'deferred'
+                : running > 0
+                    ? 'running'
+                    : completed > 0
+                        ? 'completed'
+                        : syncApps.length > 0
+                            ? 'unknown'
+                            : 'not-run'
 
     return {
         status,
         statusLabel: syncBackStatusLabel(status),
         completed,
         failed,
-        deferred
+        deferred,
+        blocked
     }
+}
+
+function phaseRunning(phases, name) {
+    return phases.some(phase => phase.name === name && phase.status === 'running')
 }
 
 function summarizeCleanupLifecycle(cleanup, phases) {
     const blocked = Number(cleanup.skippedForSafety || 0)
     const deferred = Number(cleanup.runtimeProfilesDeferred || 0)
-    const completed = !!cleanup.present && blocked === 0 && deferred === 0
+    const failed = phaseFailed(phases, 'workspace-cleanup')
+    const completed = !!cleanup.present && blocked === 0 && deferred === 0 && !failed
     const status = blocked > 0
         ? 'blocked'
-        : deferred > 0
-            ? 'deferred'
-            : completed
-                ? 'completed'
-                : phaseNamed(phases, 'workspace-cleanup')
-                    ? 'unknown'
-                    : 'not-run'
+        : failed
+            ? 'failed'
+            : deferred > 0
+                ? 'deferred'
+                : completed
+                    ? 'completed'
+                    : phaseRunning(phases, 'workspace-cleanup')
+                        ? 'started'
+                        : phaseNamed(phases, 'workspace-cleanup')
+                            ? 'unknown'
+                            : 'not-run'
     return {
         status: sanitizeStatus(status, 'unknown', CLEANUP_LIFECYCLE_STATUS_VALUES),
         statusLabel: syncBackStatusLabel(status),
         completed,
         deferred,
-        blocked
+        blocked,
+        failed: failed ? 1 : 0
     }
 }
 
@@ -540,7 +559,8 @@ function deriveFinalState({ browserSyncBack, appSessionSyncBack, cleanup }) {
     const syncNeedsAttention = [browserSyncBack.status, appSessionSyncBack.status].some(status =>
         ['unknown', 'running', 'deferred', 'blocked'].includes(status)
     )
-    if (syncFailed || syncNeedsAttention || cleanup.status === 'blocked') return 'action-needed'
+    if (cleanup.status === 'failed') return 'cleanup-failed'
+    if (syncFailed || syncNeedsAttention || ['blocked', 'started'].includes(cleanup.status)) return 'action-needed'
     if (cleanup.status === 'deferred') return 'cleanup-deferred'
     if (cleanup.status === 'completed') {
         if (browserSyncBack.status === 'completed' || appSessionSyncBack.status === 'completed') return 'synced'

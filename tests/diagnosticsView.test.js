@@ -492,6 +492,237 @@ test('unknown sync-back guidance does not use completed guidance', () => withVau
     assert.equal(/Last diagnostics show sync-back and cleanup completed|Cleanup completed/i.test(summary.lifecycle.recoveryGuidance), false)
 }))
 
+test('failed browser copy-out is visible, actionable, and sanitized', () => withVaultDir((vaultDir) => {
+    const secretPath = 'C:\\Users\\Alice\\BrowserProfile\\Default'
+    const secretToken = '0123456789abcdef0123456789abcdef01234567'
+    writeDiagnostics(vaultDir, {
+        cycleType: 'launch',
+        cycleStartTime: 640,
+        phases: [
+            { name: 'launch-started', status: 'ok' },
+            { name: 'workspace-running', status: 'ok' },
+            { name: 'quit-requested', status: 'ok' },
+            { name: 'browser-copy-out', status: 'failed', detail: `robocopy failed at ${secretPath} token=${secretToken}` },
+            { name: 'workspace-cleanup', status: 'ok' }
+        ],
+        browserSync: {
+            copyInMs: 11,
+            copyOutMs: 22
+        },
+        webResults: [{
+            tabIndex: 1,
+            success: true
+        }],
+        errors: [{
+            context: 'browser-copy-out',
+            message: `copy failed at ${secretPath} token=${secretToken}`
+        }]
+    })
+
+    const summary = loadDiagnosticsSummary({ vaultDir })
+    const serialized = JSON.stringify(summary)
+
+    assert.equal(summary.status, 'failed')
+    assert.equal(summary.lifecycle.browserSyncBack.status, 'failed')
+    assert.equal(summary.lifecycle.cleanup.status, 'completed')
+    assert.equal(summary.lifecycle.finalState, 'action-needed')
+    assert.match(summary.lifecycle.recoveryGuidance, /needs attention/i)
+    assert.equal(summary.failures.some(item => item.scope === 'phase' && item.name === 'browser-copy-out'), true)
+    assert.equal(serialized.includes(secretPath), false)
+    assert.equal(serialized.includes('BrowserProfile'), false)
+    assert.equal(serialized.includes(secretToken), false)
+}))
+
+test('running deferred blocked missing null and unknown app sync-back never report synced', () => {
+    const cases = [
+        { rawStatus: 'running', expectedStatus: 'running' },
+        { rawStatus: 'deferred', expectedStatus: 'deferred' },
+        { rawStatus: 'blocked', expectedStatus: 'blocked' },
+        { rawStatus: 'unknown', expectedStatus: 'unknown' },
+        { rawStatus: null, expectedStatus: 'unknown' },
+        { expectedStatus: 'unknown' }
+    ]
+
+    for (const syncCase of cases) {
+        withVaultDir((vaultDir) => {
+            const appResult = {
+                name: 'Portable App',
+                diagnosticRole: 'cleanup',
+                status: 'ok',
+                launchStage: 'ok',
+                closeMethod: 'graceful',
+                runtimeProfileSynced: true
+            }
+            if ('rawStatus' in syncCase) {
+                appResult.appSessionSyncBackStatus = syncCase.rawStatus
+            }
+
+            writeDiagnostics(vaultDir, {
+                cycleType: 'launch',
+                cycleStartTime: 650,
+                phases: [
+                    { name: 'launch-started', status: 'ok' },
+                    { name: 'workspace-running', status: 'ok' },
+                    { name: 'quit-requested', status: 'ok' },
+                    { name: 'workspace-cleanup', status: 'ok' }
+                ],
+                appResults: [appResult]
+            })
+
+            const summary = loadDiagnosticsSummary({ vaultDir })
+
+            assert.equal(summary.lifecycle.appSessionSyncBack.status, syncCase.expectedStatus)
+            assert.equal(summary.lifecycle.finalState, 'action-needed')
+            assert.notEqual(summary.lifecycle.finalState, 'synced')
+            assert.match(summary.lifecycle.recoveryGuidance, /needs attention/i)
+            if (syncCase.rawStatus === 'blocked') {
+                assert.equal(summary.lifecycle.appSessionSyncBack.blocked, 1)
+                assert.equal(summary.apps[0].appSessionSyncBackStatus, 'blocked')
+            }
+        })
+    }
+})
+
+test('cleanup lifecycle distinguishes completed deferred blocked failed started and unknown', () => {
+    const cases = [
+        {
+            name: 'completed',
+            phases: [
+                { name: 'quit-requested', status: 'ok' },
+                { name: 'browser-copy-out', status: 'ok' },
+                { name: 'workspace-cleanup', status: 'ok' }
+            ],
+            browserSync: { copyOutMs: 12 },
+            expectedStatus: 'completed',
+            expectedLabel: 'Completed'
+        },
+        {
+            name: 'deferred',
+            phases: [
+                { name: 'quit-requested', status: 'ok' },
+                { name: 'workspace-cleanup', status: 'warning' }
+            ],
+            appResults: [{
+                name: 'Runtime App',
+                diagnosticRole: 'cleanup',
+                status: 'ok',
+                launchStage: 'ok',
+                runtimeProfileWipeSkippedForSafety: true
+            }],
+            expectedStatus: 'deferred',
+            expectedLabel: 'Deferred'
+        },
+        {
+            name: 'blocked',
+            phases: [
+                { name: 'quit-requested', status: 'ok' },
+                { name: 'workspace-cleanup', status: 'warning' }
+            ],
+            appResults: [{
+                name: 'Owned App',
+                diagnosticRole: 'cleanup',
+                status: 'ok',
+                launchStage: 'ok',
+                cleanupSkippedForSafety: true
+            }],
+            expectedStatus: 'blocked',
+            expectedLabel: 'Blocked'
+        },
+        {
+            name: 'failed',
+            phases: [
+                { name: 'quit-requested', status: 'ok' },
+                { name: 'workspace-cleanup', status: 'failed' }
+            ],
+            expectedStatus: 'failed',
+            expectedLabel: 'Failed',
+            expectedFinalState: 'cleanup-failed'
+        },
+        {
+            name: 'started',
+            phases: [
+                { name: 'quit-requested', status: 'ok' },
+                { name: 'workspace-cleanup', status: 'running' }
+            ],
+            expectedStatus: 'started',
+            expectedLabel: 'Started'
+        },
+        {
+            name: 'unknown',
+            phases: [
+                { name: 'quit-requested', status: 'ok' },
+                { name: 'workspace-cleanup', status: 'ok' }
+            ],
+            expectedStatus: 'unknown',
+            expectedLabel: 'Unknown'
+        }
+    ]
+
+    for (const cleanupCase of cases) {
+        withVaultDir((vaultDir) => {
+            writeDiagnostics(vaultDir, {
+                cycleType: 'launch',
+                cycleStartTime: 660,
+                phases: cleanupCase.phases,
+                browserSync: cleanupCase.browserSync || {},
+                appResults: cleanupCase.appResults || []
+            })
+
+            const summary = loadDiagnosticsSummary({ vaultDir })
+
+            assert.equal(summary.lifecycle.cleanup.status, cleanupCase.expectedStatus, cleanupCase.name)
+            assert.equal(summary.lifecycle.cleanup.statusLabel, cleanupCase.expectedLabel, cleanupCase.name)
+            if (cleanupCase.expectedFinalState) {
+                assert.equal(summary.lifecycle.finalState, cleanupCase.expectedFinalState, cleanupCase.name)
+            }
+            if (cleanupCase.expectedStatus !== 'completed') {
+                assert.notEqual(summary.lifecycle.finalState, 'synced', cleanupCase.name)
+            }
+        })
+    }
+})
+
+test('cleanup failure lifecycle produces distinct sanitized final state and guidance', () => withVaultDir((vaultDir) => {
+    const secretPath = 'C:\\Users\\Alice\\AppData\\Local\\Wipesnap\\Runtime'
+    const secretToken = '0123456789abcdef0123456789abcdef01234567'
+    writeDiagnostics(vaultDir, {
+        cycleType: 'launch',
+        cycleStartTime: 670,
+        phases: [
+            { name: 'launch-started', status: 'ok' },
+            { name: 'workspace-running', status: 'ok' },
+            { name: 'quit-requested', status: 'ok' },
+            { name: 'browser-copy-out', status: 'ok' },
+            { name: 'workspace-cleanup', status: 'failed', detail: `Cleanup failed at ${secretPath} token=${secretToken}` }
+        ],
+        browserSync: {
+            copyInMs: 14,
+            copyOutMs: 28
+        },
+        webResults: [{
+            tabIndex: 1,
+            success: true
+        }]
+    })
+
+    const summary = loadDiagnosticsSummary({ vaultDir })
+    const lifecycle = summary.lifecycle
+    const serializedLifecycle = JSON.stringify(lifecycle)
+
+    assert.equal(summary.status, 'failed')
+    assert.equal(lifecycle.cleanup.status, 'failed')
+    assert.equal(lifecycle.cleanup.statusLabel, 'Failed')
+    assert.equal(lifecycle.cleanup.failed, 1)
+    assert.equal(lifecycle.finalState, 'cleanup-failed')
+    assert.equal(lifecycle.finalStateLabel, 'Cleanup failed')
+    assert.match(lifecycle.recoveryGuidance, /Cleanup failed/i)
+    assert.match(lifecycle.recoveryGuidance, /before unplugging/i)
+    assert.equal(summary.failures.some(item => item.scope === 'phase' && item.name === 'workspace-cleanup'), true)
+    assert.equal(serializedLifecycle.includes(secretPath), false)
+    assert.equal(serializedLifecycle.includes('AppData'), false)
+    assert.equal(serializedLifecycle.includes(secretToken), false)
+}))
+
 test('diagnostics handler rejects locked state before reading diagnostics', () => {
     let getVaultDirCalled = false
     const summary = loadDiagnosticsSummaryHandlerCore({

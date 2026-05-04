@@ -38,6 +38,8 @@ import {
 import {
     findStaleUnsupportedAppDataPayloads,
     isSafePayloadDirectory,
+    sanitizeStaleAppDataCleanupResultForRenderer,
+    sanitizeStaleAppDataPayloadsForRenderer,
     selectStaleAppDataPayloads
 } from './staleAppData.js'
 import {
@@ -2043,9 +2045,9 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
             const payloads = await findStaleUnsupportedAppDataPayloads(workspace, getVaultDir(), {
                 onError: (desktopApp, err) => diagError('unsupported-appdata-scan', `${desktopApp?.name || desktopApp?.path || 'unknown'}: ${err.message}`)
             })
-            return { success: true, payloads }
-        } catch (e) {
-            return { success: false, error: e.message, payloads: [] }
+            return { success: true, payloads: sanitizeStaleAppDataPayloadsForRenderer(payloads) }
+        } catch (_) {
+            return { success: false, error: 'Stale AppData scan could not complete safely.', payloads: [] }
         }
     })
 
@@ -2069,7 +2071,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
             for (const payload of selectedPayloads) {
                 const safety = isSafePayloadDirectory(appDataRoot, payload.path)
                 if (!safety.safe) {
-                    failed.push({ ...payload, error: safety.reason })
+                    failed.push({ payload, status: 'blocked', reasonCode: 'cleanup-blocked' })
                     continue
                 }
 
@@ -2077,23 +2079,25 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                     rmSync(payload.path, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 })
                     console.log(`[Wipesnap] Removed stale AppData payload: ${payload.path} (${payload.sizeBytes || 0} bytes)`)
                     removed.push(payload)
-                } catch (err) {
-                    failed.push({ ...payload, error: err.message })
+                } catch (_) {
+                    failed.push({ payload, status: 'failed', reasonCode: 'cleanup-failed' })
                 }
             }
 
             const remainingPayloads = await findStaleUnsupportedAppDataPayloads(workspace, getVaultDir(), {
                 onError: (desktopApp, err) => diagError('unsupported-appdata-scan', `${desktopApp?.name || desktopApp?.path || 'unknown'}: ${err.message}`)
             })
-            return {
-                success: failed.length === 0,
+            return sanitizeStaleAppDataCleanupResultForRenderer({
                 removed,
                 failed,
-                remainingPayloads,
-                error: failed.length > 0 ? 'Some stale AppData payloads could not be removed.' : null
-            }
+                remainingPayloads
+            })
         } catch (e) {
-            return { success: false, error: e.message, removed: [], failed: [], remainingPayloads: [] }
+            return sanitizeStaleAppDataCleanupResultForRenderer({
+                success: false,
+                error: e?.message || 'Stale AppData cleanup failed.',
+                errorCode: 'cleanup-request-invalid'
+            })
         }
     })
 

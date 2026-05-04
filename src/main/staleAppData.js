@@ -13,6 +13,14 @@ const IMPORTED_DATA_ACTIVE_MODES = new Set([
     'vscode-user-data',
     'electron-user-data'
 ])
+const MAX_RENDERER_TEXT_LENGTH = 160
+const CLEANUP_RESULT_STATUS_VALUES = new Set(['removed', 'failed', 'blocked'])
+const CLEANUP_RESULT_REASON_CODE_VALUES = new Set([
+    'removed',
+    'cleanup-blocked',
+    'cleanup-failed',
+    'cleanup-request-invalid'
+])
 
 async function getDirSizeAsync(dirPath, skipDirs = new Set()) {
     let total = 0
@@ -44,6 +52,41 @@ function safeRealpath(targetPath) {
     } catch (_) {
         try { return realpathSync(targetPath) } catch (_) { return null }
     }
+}
+
+function isPlainObject(value) {
+    return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function limitRendererText(value, maxLength = MAX_RENDERER_TEXT_LENGTH) {
+    const text = String(value ?? '').replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim()
+    if (text.length <= maxLength) return text
+    return `${text.slice(0, Math.max(0, maxLength - 1)).trim()}...`
+}
+
+function redactRendererText(value, maxLength = MAX_RENDERER_TEXT_LENGTH) {
+    let text = limitRendererText(value, maxLength * 2)
+    if (!text) return ''
+
+    text = text
+        .replace(/file:\/\/\/[^\s"')]+/gi, '[redacted-path]')
+        .replace(/\\\\[^\s"')]+/g, '[redacted-path]')
+        .replace(/[a-zA-Z]:\\[^\r\n"']+/g, '[redacted-path]')
+        .replace(/\b(password|pin|token|secret|cookie|credential|auth|key|fastboot)([\w.-]{0,24})\s*[:=]\s*[^,;\s]+/gi, '$1$2=[redacted]')
+        .replace(/\b[A-Fa-f0-9]{32,}\b/g, '[redacted-token]')
+        .replace(/\b[A-Za-z0-9+/]{40,}={0,2}\b/g, '[redacted-token]')
+
+    return limitRendererText(text, maxLength)
+}
+
+function normalizeCleanupResultStatus(value, fallback = 'failed') {
+    const status = String(value || '').toLowerCase()
+    return CLEANUP_RESULT_STATUS_VALUES.has(status) ? status : fallback
+}
+
+function normalizeCleanupReasonCode(value, fallback = 'cleanup-failed') {
+    const reasonCode = String(value || '').toLowerCase()
+    return CLEANUP_RESULT_REASON_CODE_VALUES.has(reasonCode) ? reasonCode : fallback
 }
 
 export function isSafePayloadDirectory(appDataRoot, payloadPath) {
@@ -232,4 +275,86 @@ export function selectStaleAppDataPayloads(payloadIds, payloads) {
     }
 
     return selectedPayloads
+}
+
+export function sanitizeStaleAppDataPayloadForRenderer(payload) {
+    return {
+        id: String(payload?.id || ''),
+        name: redactRendererText(payload?.name || 'Imported AppData', 96) || 'Imported AppData',
+        safeName: redactRendererText(payload?.safeName || '', 96),
+        sizeBytes: Number.isFinite(Number(payload?.sizeBytes)) && Number(payload.sizeBytes) >= 0 ? Number(payload.sizeBytes) : 0,
+        sizeMB: Number.isFinite(Number(payload?.sizeMB)) && Number(payload.sizeMB) >= 0 ? Number(payload.sizeMB) : 0,
+        cleanupBlocked: payload?.cleanupBlocked === true,
+        cleanupBlockedReason: payload?.cleanupBlocked ? 'Cleanup blocked for safety.' : null,
+        orphaned: payload?.orphaned === true,
+        reason: redactRendererText(payload?.reason || 'This imported AppData payload is no longer used by the saved workspace.')
+    }
+}
+
+export function sanitizeStaleAppDataPayloadsForRenderer(payloads) {
+    return (Array.isArray(payloads) ? payloads : []).map(sanitizeStaleAppDataPayloadForRenderer)
+}
+
+function getCleanupRecordPayload(record) {
+    if (isPlainObject(record?.payload)) return record.payload
+    return record
+}
+
+function getCleanupRecordStatus(record, fallback) {
+    return normalizeCleanupResultStatus(record?.status || fallback, fallback)
+}
+
+function getCleanupRecordReasonCode(record, status) {
+    const fallback = status === 'removed'
+        ? 'removed'
+        : status === 'blocked'
+            ? 'cleanup-blocked'
+            : 'cleanup-failed'
+    return normalizeCleanupReasonCode(record?.reasonCode, fallback)
+}
+
+export function sanitizeStaleAppDataCleanupRecordForRenderer(record, fallbackStatus = 'failed') {
+    const payload = getCleanupRecordPayload(record)
+    const item = sanitizeStaleAppDataPayloadForRenderer(payload)
+    const status = getCleanupRecordStatus(record, fallbackStatus)
+    return {
+        id: item.id,
+        name: item.name,
+        safeName: item.safeName,
+        sizeMB: item.sizeMB,
+        orphaned: item.orphaned,
+        status,
+        reasonCode: getCleanupRecordReasonCode(record, status),
+        metadataOnly: true
+    }
+}
+
+export function sanitizeStaleAppDataCleanupResultForRenderer(result = {}) {
+    const removed = (Array.isArray(result.removed) ? result.removed : [])
+        .map(record => sanitizeStaleAppDataCleanupRecordForRenderer(record, 'removed'))
+    const failed = (Array.isArray(result.failed) ? result.failed : [])
+        .map(record => sanitizeStaleAppDataCleanupRecordForRenderer(record, 'failed'))
+    const explicitFailure = result.success === false || !!result.error
+    const success = result.success === true
+        ? failed.length === 0 && !explicitFailure
+        : failed.length === 0 && !explicitFailure
+    const errorCode = success
+        ? null
+        : normalizeCleanupReasonCode(result.errorCode, failed.length > 0 ? 'cleanup-failed' : 'cleanup-request-invalid')
+
+    return {
+        success,
+        removed,
+        failed,
+        removedCount: removed.length,
+        failedCount: failed.length,
+        remainingPayloads: sanitizeStaleAppDataPayloadsForRenderer(result.remainingPayloads),
+        error: success
+            ? null
+            : errorCode === 'cleanup-request-invalid'
+                ? 'Stale AppData cleanup could not start safely.'
+                : 'Some stale AppData payloads could not be removed.',
+        errorCode,
+        metadataOnly: true
+    }
 }
