@@ -819,6 +819,8 @@ function createAppDiagnostic(appConfig, attemptedPath) {
         runtimeProfileWipeSafetyReason: null,
         runtimeProfileWipeError: null,
         runtimeProfileInUsePids: [],
+        appSessionSyncBackStatus: 'not-run',
+        appSessionSyncBackError: null,
         cleanupRequiresStrongOwnership: false,
         cleanupSkippedForSafety: false,
         cleanupSafetyReason: null,
@@ -1450,14 +1452,35 @@ let closeInProgress = null
  * Guarantees sequential writes even if multiple apps close simultaneously.
  * Always wipes local data after sync (security), even if sync fails.
  */
-function enqueueSync(usbPath, localPath) {
+function enqueueSync(usbPath, localPath, appObj = null) {
     globalSyncQueue = globalSyncQueue.then(async () => {
         // Check if USB drive is still accessible before attempting sync
         const driveRoot = pathParse(usbPath).root
-        if (!existsSync(driveRoot)) return
+        if (!existsSync(driveRoot)) {
+            updateAppDiagnostic(appObj, {
+                appSessionSyncBackStatus: 'deferred',
+                appSessionSyncBackError: 'Portable drive was unavailable during sync-back.'
+            })
+            return
+        }
 
         try {
+            updateAppDiagnostic(appObj, {
+                appSessionSyncBackStatus: 'running',
+                appSessionSyncBackError: null
+            })
             await robocopyAsync(localPath, usbPath)
+            updateAppDiagnostic(appObj, {
+                appSessionSyncBackStatus: 'completed',
+                appSessionSyncBackError: null
+            })
+        } catch (err) {
+            const message = err?.message || 'App session sync-back failed.'
+            updateAppDiagnostic(appObj, {
+                appSessionSyncBackStatus: 'failed',
+                appSessionSyncBackError: message
+            })
+            diagError('app-session-sync-back', message)
         } finally {
             // ALWAYS wipe local copy  security trumps data integrity
             try { rmSync(localPath, { recursive: true, force: true }) } catch (_) { }
@@ -2267,15 +2290,19 @@ export async function closeBrowser() {
         const localProfile = getLocalProfileDir(activeVaultDir)
         diagPhaseStart('browser-copy-out')
         const copyOutStart = Date.now()
+        let copyOutStatus = 'ok'
+        let copyOutDetail = ''
         try {
             mkdirSync(usbProfile, { recursive: true })
             await robocopyAsync(localProfile, usbProfile)
         } catch (err) {
             console.error('[Wipesnap] Profile sync to USB failed:', err)
+            copyOutStatus = 'failed'
+            copyOutDetail = err?.message || 'Browser profile sync-back failed.'
             diagError('browser-copy-out', err.message)
         } finally {
             runDiagnostics.browserSync.copyOutMs = Date.now() - copyOutStart
-            diagPhaseEnd('browser-copy-out')
+            diagPhaseEnd('browser-copy-out', copyOutStatus, copyOutDetail)
             // ALWAYS wipe local profile  even if sync failed
             try { rmSync(localProfile, { recursive: true, force: true }) } catch (_) { }
             activeVaultDir = null
@@ -3105,7 +3132,7 @@ function startLauncherMonitor(appObj, realPid, signal = 'known-real-pid') {
             clearInterval(checkInterval)
             console.log(`[Wipesnap] ${appObj.diagRef.name} manual close detected. Syncing to USB...`)
             if (appObj.usbPath && appObj.localPath && !appObj.syncPromise && !appObj.abandonSync) {
-                appObj.syncPromise = enqueueSync(appObj.usbPath, appObj.localPath)
+                appObj.syncPromise = enqueueSync(appObj.usbPath, appObj.localPath, appObj)
             } else {
                 wipeRuntimeOnlyProfile(appObj)
             }
@@ -3312,7 +3339,7 @@ export async function closeDesktopApps() {
 
             if (app.usbPath && app.localPath && !app.syncPromise && !app.abandonSync) {
                 if (sessionProcessesClosed) {
-                    app.syncPromise = enqueueSync(app.usbPath, app.localPath)
+                    app.syncPromise = enqueueSync(app.usbPath, app.localPath, app)
                 } else {
                     app.abandonSync = true
                     app.abandonSyncReason = rootAlive
@@ -3323,6 +3350,8 @@ export async function closeDesktopApps() {
                                 ? successorDiscoveryUncertaintyReason
                                 : 'Owned successor process remained alive after teardown; skipped sync for safety.'
                     updateAppDiagnostic(app, {
+                        appSessionSyncBackStatus: 'deferred',
+                        appSessionSyncBackError: app.abandonSyncReason,
                         cleanupSkippedForSafety: true,
                         cleanupSafetyReason: app.abandonSyncReason
                     })
@@ -4028,7 +4057,7 @@ async function launchDesktopApp(appConfig, onStatus, vaultDir) {
             if (closeInProgress) return
 
             if (appObj.usbPath && appObj.localPath && !appObj.syncPromise) {
-                appObj.syncPromise = enqueueSync(appObj.usbPath, appObj.localPath)
+                appObj.syncPromise = enqueueSync(appObj.usbPath, appObj.localPath, appObj)
             } else if (appObj.localPath && !appObj.usbPath) {
                 wipeRuntimeOnlyProfile(appObj)
             }
@@ -4157,7 +4186,9 @@ export async function launchWorkspace(workspace, onStatus, vaultDir, options = {
         return { webResults: [], appResults: [] }
     }
 
+    diagPhaseStart('launch-started')
     onStatus(`Launching ${total} items...`)
+    diagPhaseEnd('launch-started')
 
     // --- Track: Browser (async) ---
     // Runs robocopy -> Chrome -> tabs concurrently with desktop apps
@@ -4230,6 +4261,21 @@ export async function launchWorkspace(workspace, onStatus, vaultDir, options = {
         browserTrack(),
         appsTrack()
     ])
+
+    const failed = webResults.filter(item => item?.success === false && !item?.skipped).length +
+        appResults.filter(item => item?.success === false && !item?.skipped).length
+    const skipped = webResults.filter(item => item?.skipped).length +
+        appResults.filter(item => item?.skipped).length
+    diagPhaseStart('workspace-running')
+    diagPhaseEnd(
+        'workspace-running',
+        failed > 0 ? 'warning' : 'ok',
+        failed > 0
+            ? `${failed} item${failed === 1 ? '' : 's'} failed during launch.`
+            : skipped > 0
+                ? `${skipped} item${skipped === 1 ? '' : 's'} skipped during launch.`
+                : 'Workspace launch completed.'
+    )
 
     return { webResults, appResults }
 }

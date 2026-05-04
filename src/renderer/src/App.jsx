@@ -4,6 +4,10 @@ import SetupScreen from './components/SetupScreen'
 import DashboardScreen from './components/DashboardScreen'
 import LaunchingScreen from './components/LaunchingScreen'
 import { autoLaunchFlagForDashboardSave } from './rendererAutoLaunchPolicy'
+import {
+    defaultProductSurfacePolicy,
+    normalizeProductSurfacePolicyForRenderer
+} from '../../shared/productSurfacePolicy'
 
 export default function App() {
     const [screen, setScreen] = useState('loading')
@@ -13,12 +17,17 @@ export default function App() {
     const [vaultMeta, setVaultMeta] = useState(null)
     const [error, setError] = useState(null)
     const [autoLaunch, setAutoLaunch] = useState(false)
+    const [surfacePolicy, setSurfacePolicy] = useState(() => defaultProductSurfacePolicy())
 
     useEffect(() => {
         async function boot() {
             try {
                 const info = await window.wipesnap.getDriveInfo()
                 setDriveInfo(info)
+                if (window.wipesnap.loadProductSurfacePolicy) {
+                    const policy = await window.wipesnap.loadProductSurfacePolicy()
+                    setSurfacePolicy(normalizeProductSurfacePolicyForRenderer(policy))
+                }
 
                 const exists = await window.wipesnap.vaultExists()
                 if (!exists) {
@@ -165,6 +174,7 @@ export default function App() {
                         driveInfo={driveInfo}
                         workspace={workspace}
                         vaultMeta={vaultMeta}
+                        surfacePolicy={surfacePolicy}
                         onSave={handleDashboardSave}
                         onCancel={handleDashboardCancel}
                     />
@@ -174,6 +184,7 @@ export default function App() {
                     <LaunchingScreen
                         workspace={workspace}
                         autoLaunch={autoLaunch}
+                        surfacePolicy={surfacePolicy}
                         onSettingsClick={handleSettingsFromLaunch}
                     />
                 )}

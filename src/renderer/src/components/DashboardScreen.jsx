@@ -1,6 +1,13 @@
 import { useState, useEffect, useRef } from 'react'
 import ImportAppsModal from './ImportAppsModal'
 import { createCloudSyncStatusView } from '../cloudSyncStatusUi'
+import {
+    normalizeProductSurfacePolicyForRenderer,
+    shouldShowCloudSyncControls,
+    shouldShowPhoneEnrollmentControls,
+    shouldShowProviderControls,
+    shouldShowTrustedAutoImportStatus
+} from '../../../shared/productSurfacePolicy'
 
 const ACCOUNT_SLOT_STATES = [
     'unknown',
@@ -31,7 +38,7 @@ const EMPTY_ACCOUNT_SLOT_FORM = {
     notes: ''
 }
 
-export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSave, onCancel }) {
+export default function DashboardScreen({ driveInfo, workspace, vaultMeta, surfacePolicy, onSave, onCancel }) {
     const [webTabs, setWebTabs] = useState(workspace?.webTabs || [])
     const [desktopApps, setDesktopApps] = useState(workspace?.desktopApps || [])
     const [saving, setSaving] = useState(false)
@@ -78,6 +85,11 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const [fastBoot, setFastBoot] = useState(false)
     const [clearCacheOnExit, setClearCacheOnExit] = useState(true) // default ON = zero footprint
     const [securityMeta, setSecurityMeta] = useState(vaultMeta || null)
+    const productSurface = normalizeProductSurfacePolicyForRenderer(surfacePolicy)
+    const showCloudSyncControls = shouldShowCloudSyncControls(productSurface)
+    const showPhoneEnrollmentControls = shouldShowPhoneEnrollmentControls(productSurface)
+    const showProviderControls = shouldShowProviderControls(productSurface)
+    const showTrustedAutoImportStatus = shouldShowTrustedAutoImportStatus(productSurface)
 
     // Read the freshest meta from disk on mount to perfectly sync security UI toggles
     useEffect(() => {
@@ -107,6 +119,8 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
             }
         }
 
+        if (!showCloudSyncControls && !showTrustedAutoImportStatus) return undefined
+
         if (window.wipesnap?.cloudSync?.getAutoImportStatus) {
             window.wipesnap.cloudSync.getAutoImportStatus()
                 .then(applyAutoImportStatus)
@@ -121,7 +135,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
             mounted = false
             if (typeof unsubscribe === 'function') unsubscribe()
         }
-    }, [])
+    }, [showCloudSyncControls, showTrustedAutoImportStatus])
 
     // Session edit/recapture state
     const [sessionMode, setSessionMode] = useState(null) // 'edit' | 'recapture'
@@ -787,6 +801,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const diagnosticsFailures = diagnosticsSummary?.failures?.slice(0, 3) || []
     const diagnosticsBrowser = diagnosticsSummary?.browser
     const diagnosticsCleanup = diagnosticsSummary?.cleanup
+    const diagnosticsLifecycle = diagnosticsSummary?.lifecycle
     const diagnosticsImports = diagnosticsSummary?.imports
     const healthReasons = healthSummary?.reasons?.slice(0, 5) || []
     const healthBrowserProfile = healthSummary?.browserProfile
@@ -846,6 +861,13 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         if (status === 'missing') return 'No data'
         if (status === 'empty') return 'Empty'
         return status || 'Unknown'
+    }
+
+    const getLifecycleStatusClass = (state) => {
+        if (state === 'synced' || state === 'cleanup-completed') return 'text-success'
+        if (state === 'cleanup-deferred' || state === 'unknown') return 'text-warning'
+        if (state === 'action-needed') return 'text-error'
+        return 'text-muted'
     }
 
     const getCloudSyncStatusClass = (status) => {
@@ -944,7 +966,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     }
 
     return (
-        <div className="card p-6 w-full max-w-sm animate-slide-up flex flex-col" style={{ maxHeight: 540 }}>
+        <div className="card p-6 w-full max-w-lg animate-slide-up flex flex-col" style={{ maxHeight: 660 }}>
             <div className="flex items-center justify-between mb-4 flex-shrink-0">
                 <h1 className="text-lg font-semibold text-white">Settings</h1>
                 {!isInSessionMode && (
@@ -954,6 +976,18 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
 
             {/* Scrollable content area */}
             <div className="flex-1 overflow-y-auto min-h-0">
+
+            {!isInSessionMode && (
+                <div className="mb-4 rounded-md border border-[#31405f] bg-[#111827] p-3">
+                    <p className="text-xs font-semibold text-[#d8e2ff] mb-1">Desktop trust boundary</p>
+                    <p className="text-[11px] text-[#aab5d6] leading-relaxed">
+                        The vault encrypts workspace config and desktop launch capabilities. BrowserProfile, AppData, imported app payloads, caches, and diagnostics are not fully covered by the vault.
+                    </p>
+                    <p className="text-[11px] text-[#d4a44a] leading-relaxed mt-1">
+                        Cleanup is best-effort and cannot guarantee zero residue or privacy on a compromised host.
+                    </p>
+                </div>
+            )}
 
             {/* Session Edit/Recapture Mode */}
             {isInSessionMode && (
@@ -1175,6 +1209,36 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                     </p>
                                 </div>
 
+                                {diagnosticsLifecycle && (
+                                    <div className="rounded bg-[#101018] border border-[#242435] p-2">
+                                        <div className="flex items-center justify-between gap-2">
+                                            <p className="text-xs text-white">Final lifecycle</p>
+                                            <span className={`text-[10px] font-semibold ${getLifecycleStatusClass(diagnosticsLifecycle.finalState)}`}>
+                                                {diagnosticsLifecycle.finalStateLabel || 'Unknown'}
+                                            </span>
+                                        </div>
+                                        <div className="grid grid-cols-3 gap-2 mt-2">
+                                            <div>
+                                                <p className="text-[10px] text-muted">Browser sync</p>
+                                                <p className="text-[10px] text-white">{diagnosticsLifecycle.browserSyncBack?.statusLabel || 'Unknown'}</p>
+                                            </div>
+                                            <div>
+                                                <p className="text-[10px] text-muted">App sync</p>
+                                                <p className="text-[10px] text-white">{diagnosticsLifecycle.appSessionSyncBack?.statusLabel || 'Unknown'}</p>
+                                            </div>
+                                            <div>
+                                                <p className="text-[10px] text-muted">Cleanup</p>
+                                                <p className="text-[10px] text-white">{diagnosticsLifecycle.cleanup?.statusLabel || 'Unknown'}</p>
+                                            </div>
+                                        </div>
+                                        {diagnosticsLifecycle.recoveryGuidance && (
+                                            <p className="text-[10px] text-[#d4a44a] mt-2 leading-relaxed">
+                                                {diagnosticsLifecycle.recoveryGuidance}
+                                            </p>
+                                        )}
+                                    </div>
+                                )}
+
                                 <div className="grid grid-cols-3 gap-2">
                                     <div className="rounded bg-[#101018] border border-[#242435] p-2">
                                         <p className="text-[10px] text-muted">Warnings</p>
@@ -1222,6 +1286,11 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                                 <p className="text-[10px] text-muted truncate">
                                                     {app.launchSourceType} - {app.stage} - readiness {app.readinessStatus}
                                                 </p>
+                                                {app.appSessionSyncBackStatus && app.appSessionSyncBackStatus !== 'not-run' && (
+                                                    <p className={`text-[10px] truncate ${app.appSessionSyncBackStatus === 'failed' ? 'text-error' : app.appSessionSyncBackStatus === 'completed' ? 'text-success' : 'text-warning'}`}>
+                                                        App sync-back: {app.appSessionSyncBackStatus}
+                                                    </p>
+                                                )}
                                                 {(app.error || app.warning) && (
                                                     <p className={`text-[10px] truncate ${app.error ? 'text-error' : 'text-warning'}`}>
                                                         {app.error || app.warning}
@@ -1279,17 +1348,36 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                 </div>
             )}
 
+            {/* Cloud/Phone Surface Freeze */}
+            {!isInSessionMode && !showCloudSyncControls && !showPhoneEnrollmentControls && !showProviderControls && !showTrustedAutoImportStatus && (
+                <div className="mb-4 rounded-md border border-[#2a2a3a] bg-[#14141c] p-3">
+                    <div className="flex items-center justify-between gap-3">
+                        <span className="section-label">Cloud and phone</span>
+                        <span className="text-[10px] font-semibold text-warning">Staging hidden</span>
+                    </div>
+                    <p className="text-[11px] text-muted mt-2">
+                        Cloud sync, phone enrollment, and provider controls are frozen staging surfaces. The desktop owns launch, sync-back, cleanup, and diagnostics.
+                    </p>
+                </div>
+            )}
+
             {/* Cloud Sync */}
-            {!isInSessionMode && (
+            {!isInSessionMode && (showCloudSyncControls || showTrustedAutoImportStatus) && (
                 <div className="mb-4">
                     <div className="flex items-center justify-between mb-2">
-                        <span className="section-label">Cloud Sync</span>
+                        <span className="section-label">{showCloudSyncControls ? 'Cloud Sync (staging)' : 'Trusted auto-import (advanced)'}</span>
                         <span className={`text-[10px] font-semibold ${getCloudSyncStatusClass(cloudSyncStatusView.status)}`}>
                             {cloudSyncStatusView.statusLabel}
                         </span>
                     </div>
 
                     <div className="rounded-md border border-[#2a2a3a] bg-[#14141c] p-3">
+                        <p className="text-[11px] text-[#d4a44a] mb-3">
+                            {showCloudSyncControls
+                                ? 'Staging only. Cloud carries app-encrypted snapshots and patches, not launch authority.'
+                                : 'Advanced status only. Trusted auto-import cannot launch apps or create capabilities.'}
+                        </p>
+                        {showCloudSyncControls && (
                         <div className="grid grid-cols-2 gap-2">
                             <button
                                 className="btn-secondary text-[11px] py-2 px-2"
@@ -1320,43 +1408,55 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                 {cloudSyncBusyAction === 'apply-trusted-patches' ? 'Applying...' : 'Apply Trusted'}
                             </button>
                         </div>
+                        )}
 
+                        {showCloudSyncControls && (showPhoneEnrollmentControls || showProviderControls) && (
                         <div className="mt-3 rounded bg-[#101018] border border-[#242435] p-2">
                             <div className="flex items-center justify-between gap-2 mb-2">
-                                <p className="text-[10px] font-semibold uppercase tracking-wide text-muted">Phone Enrollment</p>
-                                <span className="text-[10px] text-muted">{cloudEnrollmentRequests.length} pending</span>
+                                <p className="text-[10px] font-semibold uppercase tracking-wide text-muted">Phone Enrollment (staging)</p>
+                                {showPhoneEnrollmentControls && (
+                                    <span className="text-[10px] text-muted">{cloudEnrollmentRequests.length} pending</span>
+                                )}
                             </div>
-                            <input
-                                className="w-full bg-[#14141c] border border-[#242435] rounded px-2 py-1.5 text-[11px] text-white outline-none"
-                                value={cloudEnrollmentRequestId}
-                                placeholder="dev_..."
-                                maxLength={96}
-                                onChange={event => setCloudEnrollmentRequestId(event.target.value)}
-                            />
+                            {showPhoneEnrollmentControls && (
+                                <input
+                                    className="w-full bg-[#14141c] border border-[#242435] rounded px-2 py-1.5 text-[11px] text-white outline-none"
+                                    value={cloudEnrollmentRequestId}
+                                    placeholder="dev_..."
+                                    maxLength={96}
+                                    onChange={event => setCloudEnrollmentRequestId(event.target.value)}
+                                />
+                            )}
                             <div className="grid grid-cols-2 gap-2 mt-2">
-                                <button
-                                    className="btn-secondary text-[11px] py-2 px-2"
-                                    disabled={!!cloudSyncBusyAction}
-                                    onClick={bootstrapCloudDesktop}
-                                >
-                                    {cloudSyncBusyAction === 'bootstrap-cloudflare-desktop' ? 'Preparing...' : 'Prepare Cloud'}
-                                </button>
-                                <button
-                                    className="btn-secondary text-[11px] py-2 px-2"
-                                    disabled={!!cloudSyncBusyAction}
-                                    onClick={listCloudDeviceEnrollments}
-                                >
-                                    {cloudSyncBusyAction === 'list-pending-device-enrollments' ? 'Listing...' : 'List Phones'}
-                                </button>
-                                <button
-                                    className="btn-secondary text-[11px] py-2 px-2"
-                                    disabled={!!cloudSyncBusyAction || !cloudEnrollmentRequestId.trim()}
-                                    onClick={approveCloudDeviceEnrollment}
-                                >
-                                    {cloudSyncBusyAction === 'approve-phone-planner-enrollment' ? 'Approving...' : 'Approve Phone'}
-                                </button>
+                                {showProviderControls && (
+                                    <button
+                                        className="btn-secondary text-[11px] py-2 px-2"
+                                        disabled={!!cloudSyncBusyAction}
+                                        onClick={bootstrapCloudDesktop}
+                                    >
+                                        {cloudSyncBusyAction === 'bootstrap-cloudflare-desktop' ? 'Preparing...' : 'Prepare Cloud'}
+                                    </button>
+                                )}
+                                {showPhoneEnrollmentControls && (
+                                    <button
+                                        className="btn-secondary text-[11px] py-2 px-2"
+                                        disabled={!!cloudSyncBusyAction}
+                                        onClick={listCloudDeviceEnrollments}
+                                    >
+                                        {cloudSyncBusyAction === 'list-pending-device-enrollments' ? 'Listing...' : 'List Phones'}
+                                    </button>
+                                )}
+                                {showPhoneEnrollmentControls && (
+                                    <button
+                                        className="btn-secondary text-[11px] py-2 px-2"
+                                        disabled={!!cloudSyncBusyAction || !cloudEnrollmentRequestId.trim()}
+                                        onClick={approveCloudDeviceEnrollment}
+                                    >
+                                        {cloudSyncBusyAction === 'approve-phone-planner-enrollment' ? 'Approving...' : 'Approve Phone'}
+                                    </button>
+                                )}
                             </div>
-                            {cloudEnrollmentRequests.length > 0 && (
+                            {showPhoneEnrollmentControls && cloudEnrollmentRequests.length > 0 && (
                                 <div className="flex flex-col gap-1.5 mt-2">
                                     {cloudEnrollmentRequests.slice(0, 3).map(record => (
                                         <button
@@ -1372,6 +1472,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                 </div>
                             )}
                         </div>
+                        )}
 
                         <div className="mt-3 rounded bg-[#101018] border border-[#242435] p-2">
                             <div className="flex items-start justify-between gap-2">

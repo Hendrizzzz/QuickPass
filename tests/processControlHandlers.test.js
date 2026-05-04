@@ -35,6 +35,7 @@ function createDeps(overrides = {}) {
     const resetPaths = new Set(getFactoryResetVaultFilePaths(vaultDir))
     const calls = {
         diagnostics: [],
+        lifecyclePhases: [],
         closeBrowser: 0,
         closeDesktopApps: 0,
         launchSessionSetup: 0,
@@ -63,6 +64,12 @@ function createDeps(overrides = {}) {
         getActiveMasterPassword: () => 'active-password',
         beginDiagnosticsCycle: (mode) => {
             calls.diagnostics.push(mode)
+        },
+        diagPhaseStart: (name) => {
+            calls.lifecyclePhases.push({ event: 'start', name })
+        },
+        diagPhaseEnd: (name, status = 'ok', detail = '') => {
+            calls.lifecyclePhases.push({ event: 'end', name, status, detail })
         },
         closeBrowser: async () => {
             calls.closeBrowser += 1
@@ -141,6 +148,7 @@ function createDeps(overrides = {}) {
 
 function assertNoProcessSideEffects(calls) {
     assert.deepEqual(calls.diagnostics, [])
+    assert.deepEqual(calls.lifecyclePhases, [])
     assert.equal(calls.closeBrowser, 0)
     assert.equal(calls.closeDesktopApps, 0)
     assert.equal(calls.launchSessionSetup, 0)
@@ -213,6 +221,12 @@ test('unlocked quit-and-relaunch follows closeApps policy before app quit', asyn
     })
 
     assert.equal(result.success, true)
+    assert.deepEqual(calls.lifecyclePhases, [
+        { event: 'start', name: 'quit-requested' },
+        { event: 'end', name: 'quit-requested', status: 'ok', detail: '' },
+        { event: 'start', name: 'workspace-cleanup' },
+        { event: 'end', name: 'workspace-cleanup', status: 'ok', detail: '' }
+    ])
     assert.equal(calls.closeBrowser, 1)
     assert.equal(calls.closeDesktopApps, 1)
     assert.equal(calls.quitApp, 1)
@@ -246,6 +260,12 @@ test('close-window is allowed while locked and reaches before-quit lifecycle cle
 
     assert.equal(calls.windowClosed, true)
     assert.equal(calls.preventDefault, 1)
+    assert.deepEqual(calls.lifecyclePhases, [
+        { event: 'start', name: 'quit-requested' },
+        { event: 'end', name: 'quit-requested', status: 'ok', detail: '' },
+        { event: 'start', name: 'workspace-cleanup' },
+        { event: 'end', name: 'workspace-cleanup', status: 'ok', detail: '' }
+    ])
     assert.equal(calls.closeBrowser, 1)
     assert.equal(calls.closeDesktopApps, 1)
     assert.deepEqual(calls.setActiveMasterPassword, [null])

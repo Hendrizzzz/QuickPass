@@ -38,6 +38,20 @@ function beginEditDiagnosticsCycle(deps) {
     else deps.beginDiagnosticsCycle('edit')
 }
 
+function markLifecyclePhase(deps, name, status = 'ok', detail = '') {
+    if (!deps.diagPhaseStart || !deps.diagPhaseEnd) return
+    deps.diagPhaseStart(name)
+    deps.diagPhaseEnd(name, status, detail)
+}
+
+function beginLifecyclePhase(deps, name) {
+    if (deps.diagPhaseStart) deps.diagPhaseStart(name)
+}
+
+function endLifecyclePhase(deps, name, status = 'ok', detail = '') {
+    if (deps.diagPhaseEnd) deps.diagPhaseEnd(name, status, detail)
+}
+
 export function createFactoryResetTokenRecord({
     token,
     webContentsId,
@@ -146,8 +160,16 @@ export async function quitAndRelaunchHandlerCore({ input = {}, deps }) {
         hasActiveSession: deps.hasActiveSession()
     })
 
-    await deps.closeBrowser()
-    if (closeApps) await deps.closeDesktopApps()
+    markLifecyclePhase(deps, 'quit-requested')
+    beginLifecyclePhase(deps, 'workspace-cleanup')
+    try {
+        await deps.closeBrowser()
+        if (closeApps) await deps.closeDesktopApps()
+        endLifecyclePhase(deps, 'workspace-cleanup')
+    } catch (err) {
+        endLifecyclePhase(deps, 'workspace-cleanup', 'warning', 'Quit cleanup reported an error.')
+        throw err
+    }
     deps.quitApp()
 
     return { success: true }
@@ -168,14 +190,21 @@ export async function beforeQuitLifecycleCleanupCore({ event, state, deps }) {
     if (state.isQuitting) return
     event.preventDefault()
 
+    markLifecyclePhase(deps, 'quit-requested')
+    beginLifecyclePhase(deps, 'workspace-cleanup')
+    let cleanupStatus = 'ok'
+    let cleanupDetail = ''
     try {
         await deps.closeBrowser()
     } catch (err) {
+        cleanupStatus = 'warning'
+        cleanupDetail = 'Browser/profile sync-back reported an error.'
         if (deps.onCloseBrowserError) deps.onCloseBrowserError(err)
     } finally {
         deps.setActiveMasterPassword(null)
         await deps.closeDesktopApps()
         try { deps.wipeRuntimeAppProfiles({ staleOnly: true }) } catch (_) { }
+        endLifecyclePhase(deps, 'workspace-cleanup', cleanupStatus, cleanupDetail)
         try { deps.persistDiagnostics() } catch (_) { }
         try { deps.removeTempTraces() } catch (_) { }
         state.isQuitting = true

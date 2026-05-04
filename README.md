@@ -4,6 +4,8 @@ Portable workspace orchestration for Windows.
 
 Wipesnap provisions a portable workspace from USB/NVMe-style storage. It launches saved browser tabs and desktop applications, runs managed profiles from host temp storage for performance, syncs supported data back to the portable drive, and performs guarded best-effort cleanup on exit.
 
+Current product focus: desktop MVP hardening. The production path is vault setup/unlock, manual workspace launch, save current session, quit/sync-back/cleanup, workspace health, and sanitized diagnostics. Cloud sync, phone enrollment, provider selection, and phone planner cloud flows are staging/experimental surfaces and are not production-ready by default.
+
 ## Current Architecture
 
 - **Encrypted workspace config:** `vault.json` stores workspace configuration with AES-256-GCM and PBKDF2-SHA512 key derivation.
@@ -14,6 +16,18 @@ Wipesnap provisions a portable workspace from USB/NVMe-style storage. It launche
 - **App support tiers:** verified, best-effort, launch-only, needs-adapter, and unsupported tiers keep data-portability claims conservative.
 - **Host cleanup:** temp browser profiles, runtime profiles, imported AppData copies, and app caches are wiped with ownership/path checks.
 - **Diagnostics:** each run can write structured launch, readiness, sync, and cleanup diagnostics.
+- **Cloud/phone staging:** Firebase and Cloudflare transport code can carry app-encrypted sanitized snapshots and patches when explicitly configured for staging. Phone remains a safe preset editor, not a launch control plane; desktop remains launch authority.
+
+## Product Surface Classification
+
+| Surface | Status |
+| --- | --- |
+| Vault setup/unlock, manual launch, browser/profile lifecycle, save current session, quit/sync-back/cleanup, workspace health, sanitized diagnostics, guarded stale AppData cleanup | Production MVP |
+| Host app scan/import, launch-only host references, clear-cache behavior, PIN/Fast Boot, app support tiers | Advanced local |
+| Firebase hosted planner, Cloudflare Pages/Workers/D1 provider, desktop cloud sync upload/download/apply, phone enrollment/key grants | Disabled staging |
+| Trusted auto-import, trusted auto-launch, phone planner cloud flows, provider selection, owner/request/key-grant IDs, local draft/dev flows | Experimental/advanced |
+
+Staging or advanced surfaces are hidden from the default dashboard. Developers can reveal them only with an ignored local `wipesnap.local.json` beside the vault/app root; do not ship or commit that file.
 
 ## Important Storage Notes
 
@@ -35,11 +49,15 @@ Stored beside the vault and potentially sensitive:
 - `AppData/` imported AppData payloads.
 - `run-diagnostics.json` launch, readiness, sync, and cleanup diagnostics.
 
+Vault encryption does not fully cover `BrowserProfile/`, `Apps/`, `AppData/`, imported app payloads, browser sessions, host temp caches, or diagnostics. Wipesnap reduces ordinary residue, but it does not guarantee zero residue and does not provide privacy against a compromised host.
+
 ## Reset And Cleanup Scope
 
 Factory reset is unauthenticated by design. The reset token is anti-misfire sequencing only, not authorization. Factory reset deletes exactly `vault.json`, `vault.meta.json`, and `vault.state.json`; it does not delete `Apps/`, `AppData/`, `BrowserProfile/`, imported archives, browser profiles, host caches, or diagnostics.
 
 Normal shutdown cleanup closes the managed browser, closes only owned or safely identified desktop app processes, wipes Wipesnap Electron temp data, wipes local browser profile temp copies, wipes imported AppData temp copies, and wipes stale runtime-only app profiles. App binary cache cleanup is controlled by `clearCacheOnExit`; when disabled, extracted app binary caches may persist for faster relaunch. Cleanup is best-effort host-residue reduction, not a zero-residue guarantee.
+
+If sync-back or cleanup fails, is deferred, or is unknown, do not treat the workspace as fully synced or safe to unplug until diagnostics are reviewed and the remaining action is resolved.
 
 Legacy compatibility names still recognized in one pass:
 
@@ -63,6 +81,8 @@ Legacy compatibility names still recognized in one pass:
 Wipesnap helps reduce ordinary host residue on shared Windows PCs. It does not defend against a compromised host OS, administrator/EDR inspection, kernel malware, keyloggers, physical capture of an unlocked session, or memory forensics.
 
 Chromium login sessions may require re-authentication on different PCs because services and browsers can bind credentials to host/device state.
+
+Cloud/phone note: staging cloud code stores app-encrypted snapshots and patches, not launch capabilities. Phone/cloud cannot create, mutate, repair, migrate, or launch desktop capabilities. Do not present cloud sync or phone enrollment as production-ready without a later product gate.
 
 ## Getting Started
 

@@ -269,6 +269,229 @@ test('diagnostics summary allowlists status-like fields before returning them', 
     assert.equal(summary.warnings.some(item => JSON.stringify(item).includes(secret)), false)
 }))
 
+test('diagnostics lifecycle reports sync-back failure and cleanup blocked with safe guidance', () => withVaultDir((vaultDir) => {
+    const secretPath = 'C:\\Users\\Alice\\AppData\\Local\\Wipesnap'
+    writeDiagnostics(vaultDir, {
+        cycleType: 'launch',
+        cycleStartTime: 444,
+        phases: [
+            { name: 'launch-started', status: 'ok' },
+            { name: 'workspace-running', status: 'ok' },
+            { name: 'quit-requested', status: 'ok' },
+            { name: 'browser-copy-out', status: 'ok' },
+            { name: 'workspace-cleanup', status: 'warning', detail: `blocked ${secretPath}` }
+        ],
+        browserSync: {
+            copyInMs: 10,
+            copyOutMs: 20
+        },
+        appResults: [{
+            name: 'Portable App',
+            diagnosticRole: 'cleanup',
+            status: 'ok',
+            launchStage: 'ok',
+            runtimeProfileSynced: true,
+            appSessionSyncBackStatus: 'failed',
+            appSessionSyncBackError: `Copy failed at ${secretPath}`,
+            cleanupSkippedForSafety: true,
+            cleanupSafetyReason: `Live process still references ${secretPath}`
+        }]
+    })
+
+    const summary = loadDiagnosticsSummary({ vaultDir })
+    const serialized = JSON.stringify(summary)
+
+    assert.equal(summary.success, true)
+    assert.equal(summary.lifecycle.launchStarted, true)
+    assert.equal(summary.lifecycle.workspaceRunning, true)
+    assert.equal(summary.lifecycle.quitRequested, true)
+    assert.equal(summary.lifecycle.browserSyncBack.status, 'completed')
+    assert.equal(summary.lifecycle.appSessionSyncBack.status, 'failed')
+    assert.equal(summary.lifecycle.cleanup.status, 'blocked')
+    assert.equal(summary.lifecycle.finalState, 'action-needed')
+    assert.match(summary.lifecycle.recoveryGuidance, /review diagnostics before unplugging/i)
+    assert.equal(summary.failures.some(item => item.scope === 'sync-back'), true)
+    assert.equal(serialized.includes(secretPath), false)
+    assert.equal(serialized.includes('AppData'), false)
+}))
+
+test('diagnostics lifecycle reports cleanup deferred without implying safe unplug', () => withVaultDir((vaultDir) => {
+    writeDiagnostics(vaultDir, {
+        cycleType: 'launch',
+        cycleStartTime: 555,
+        phases: [
+            { name: 'launch-started', status: 'ok' },
+            { name: 'workspace-running', status: 'ok' },
+            { name: 'quit-requested', status: 'ok' },
+            { name: 'browser-copy-out', status: 'ok' },
+            { name: 'workspace-cleanup', status: 'warning' }
+        ],
+        browserSync: {
+            copyInMs: 5,
+            copyOutMs: 15
+        },
+        appResults: [{
+            name: 'Runtime Only App',
+            diagnosticRole: 'cleanup',
+            status: 'ok',
+            launchStage: 'ok',
+            runtimeProfileSynced: false,
+            runtimeProfileWipeSkippedForSafety: true,
+            runtimeProfileWipeSafetyReason: 'Known owned processes are still alive after shutdown.'
+        }]
+    })
+
+    const summary = loadDiagnosticsSummary({ vaultDir })
+
+    assert.equal(summary.lifecycle.browserSyncBack.status, 'completed')
+    assert.equal(summary.lifecycle.appSessionSyncBack.status, 'not-run')
+    assert.equal(summary.lifecycle.cleanup.status, 'deferred')
+    assert.equal(summary.lifecycle.finalState, 'cleanup-deferred')
+    assert.match(summary.lifecycle.recoveryGuidance, /before unplugging/i)
+}))
+
+test('diagnostics lifecycle keeps null and missing browser copy-out unknown after quit', () => {
+    for (const browserSync of [
+        { copyInMs: 5, copyOutMs: null },
+        { copyInMs: 5 }
+    ]) {
+        withVaultDir((vaultDir) => {
+            writeDiagnostics(vaultDir, {
+                cycleType: 'launch',
+                cycleStartTime: 600,
+                phases: [
+                    { name: 'launch-started', status: 'ok' },
+                    { name: 'workspace-running', status: 'ok' },
+                    { name: 'quit-requested', status: 'ok' },
+                    { name: 'workspace-cleanup', status: 'ok' }
+                ],
+                browserSync,
+                webResults: [{
+                    tabIndex: 1,
+                    success: true
+                }],
+                appResults: [{
+                    name: 'Closed App',
+                    diagnosticRole: 'cleanup',
+                    status: 'ok',
+                    launchStage: 'ok',
+                    closeMethod: 'graceful'
+                }]
+            })
+
+            const summary = loadDiagnosticsSummary({ vaultDir })
+
+            assert.equal(summary.browser.copyOutMs, null)
+            assert.equal(summary.lifecycle.browserSyncBack.status, 'unknown')
+            assert.equal(summary.lifecycle.cleanup.status, 'completed')
+            assert.equal(summary.lifecycle.finalState, 'action-needed')
+            assert.notEqual(summary.lifecycle.finalState, 'synced')
+            assert.equal(/Last diagnostics show sync-back and cleanup completed/i.test(summary.lifecycle.recoveryGuidance), false)
+        })
+    }
+})
+
+test('diagnostics lifecycle does not mark mixed completed and unknown sync channels as synced', () => withVaultDir((vaultDir) => {
+    writeDiagnostics(vaultDir, {
+        cycleType: 'launch',
+        cycleStartTime: 610,
+        phases: [
+            { name: 'launch-started', status: 'ok' },
+            { name: 'workspace-running', status: 'ok' },
+            { name: 'quit-requested', status: 'ok' },
+            { name: 'workspace-cleanup', status: 'ok' }
+        ],
+        browserSync: {
+            copyInMs: 7
+        },
+        webResults: [{
+            tabIndex: 1,
+            success: true
+        }],
+        appResults: [{
+            name: 'Synced App',
+            diagnosticRole: 'cleanup',
+            status: 'ok',
+            launchStage: 'ok',
+            closeMethod: 'graceful',
+            runtimeProfileSynced: true,
+            appSessionSyncBackStatus: 'completed'
+        }]
+    })
+
+    const summary = loadDiagnosticsSummary({ vaultDir })
+
+    assert.equal(summary.lifecycle.browserSyncBack.status, 'unknown')
+    assert.equal(summary.lifecycle.appSessionSyncBack.status, 'completed')
+    assert.equal(summary.lifecycle.cleanup.status, 'completed')
+    assert.equal(summary.lifecycle.finalState, 'action-needed')
+    assert.notEqual(summary.lifecycle.finalState, 'synced')
+    assert.match(summary.lifecycle.recoveryGuidance, /needs attention/i)
+}))
+
+test('just-launched diagnostics without quit or copy-out do not report synced or cleanup completed', () => withVaultDir((vaultDir) => {
+    writeDiagnostics(vaultDir, {
+        cycleType: 'launch',
+        cycleStartTime: 620,
+        phases: [
+            { name: 'launch-started', status: 'ok' },
+            { name: 'workspace-running', status: 'ok' }
+        ],
+        browserSync: {
+            copyInMs: 8,
+            copyOutMs: null
+        },
+        webResults: [{
+            tabIndex: 1,
+            success: true
+        }]
+    })
+
+    const summary = loadDiagnosticsSummary({ vaultDir })
+
+    assert.equal(summary.lifecycle.quitRequested, false)
+    assert.equal(summary.lifecycle.browserSyncBack.status, 'not-run')
+    assert.equal(summary.lifecycle.cleanup.status, 'not-run')
+    assert.equal(summary.lifecycle.finalState, 'unknown')
+    assert.notEqual(summary.lifecycle.finalState, 'synced')
+    assert.notEqual(summary.lifecycle.finalState, 'cleanup-completed')
+    assert.equal(/Last diagnostics show sync-back and cleanup completed|Cleanup completed/i.test(summary.lifecycle.recoveryGuidance), false)
+}))
+
+test('unknown sync-back guidance does not use completed guidance', () => withVaultDir((vaultDir) => {
+    writeDiagnostics(vaultDir, {
+        cycleType: 'launch',
+        cycleStartTime: 630,
+        phases: [
+            { name: 'launch-started', status: 'ok' },
+            { name: 'workspace-running', status: 'ok' },
+            { name: 'quit-requested', status: 'ok' },
+            { name: 'workspace-cleanup', status: 'ok' }
+        ],
+        browserSync: {
+            copyInMs: 9
+        },
+        webResults: [{
+            tabIndex: 1,
+            success: true
+        }],
+        appResults: [{
+            name: 'Cleanup App',
+            diagnosticRole: 'cleanup',
+            status: 'ok',
+            launchStage: 'ok',
+            closeMethod: 'graceful'
+        }]
+    })
+
+    const summary = loadDiagnosticsSummary({ vaultDir })
+
+    assert.equal(summary.lifecycle.browserSyncBack.status, 'unknown')
+    assert.equal(summary.lifecycle.finalState, 'action-needed')
+    assert.match(summary.lifecycle.recoveryGuidance, /needs attention/i)
+    assert.equal(/Last diagnostics show sync-back and cleanup completed|Cleanup completed/i.test(summary.lifecycle.recoveryGuidance), false)
+}))
+
 test('diagnostics handler rejects locked state before reading diagnostics', () => {
     let getVaultDirCalled = false
     const summary = loadDiagnosticsSummaryHandlerCore({

@@ -7,7 +7,7 @@ import util from 'util'
 const execAsync = util.promisify(exec)
 const execFileAsync = util.promisify(execFile)
 import crypto from 'crypto'
-import { launchWorkspace, launchSessionSetup, captureSession, captureCurrentSession, closeBrowser, closeDesktopApps, emergencyKillDesktopAppsSync, onBrowserAllClosed, hasActiveBrowserSession, wipeLocalTraces, wipeAllLocalProfiles, wipeAllLocalAppData, wipeLocalAppCache, wipeAllRuntimeAppProfiles, runDiagnostics, diagError, beginDiagnosticsCycle } from './engine.js'
+import { launchWorkspace, launchSessionSetup, captureSession, captureCurrentSession, closeBrowser, closeDesktopApps, emergencyKillDesktopAppsSync, onBrowserAllClosed, hasActiveBrowserSession, wipeLocalTraces, wipeAllLocalProfiles, wipeAllLocalAppData, wipeLocalAppCache, wipeAllRuntimeAppProfiles, runDiagnostics, diagError, beginDiagnosticsCycle, diagPhaseStart, diagPhaseEnd } from './engine.js'
 import {
     APPDATA_SKIP_DIRS,
     BINARY_ARCHIVE_EXCLUDE_DIRS,
@@ -127,6 +127,7 @@ import {
     loadWorkspaceHealthSummary,
     loadWorkspaceHealthSummaryHandlerCore
 } from './workspaceHealth.js'
+import { loadProductSurfacePolicy } from './productSurfacePolicy.js'
 import { registerCloudSyncInvocationIpcHandlers } from './cloudSyncInvocation.js'
 import { createCloudSyncRuntimeAdapter } from './cloudSyncRuntime.js'
 import { createTrustedAutoImportOrchestrator } from './cloudSyncAutoImport.js'
@@ -715,6 +716,8 @@ function createProcessControlHandlerDeps() {
         hasActiveSession,
         getActiveMasterPassword: getActiveMasterPasswordText,
         beginDiagnosticsCycle,
+        diagPhaseStart,
+        diagPhaseEnd,
         beginSetupDiagnosticsCycle: () => beginDiagnosticsCycle('setup'),
         beginEditDiagnosticsCycle: () => beginDiagnosticsCycle('edit'),
         closeBrowser,
@@ -898,6 +901,9 @@ function registerIpcHandlers() {
         return existsSync(getVaultPath())
     })
     trustedHandle('load-vault-meta', async () => loadVaultMetaForRenderer())
+    trustedHandle('load-product-surface-policy', async () => loadProductSurfacePolicy({
+        vaultDir: getVaultDir()
+    }))
     trustedHandle('load-diagnostics-summary', async (_, input) => {
         return loadDiagnosticsSummaryHandlerCore({
             input,
@@ -2952,9 +2958,11 @@ function installElectronSecurityHandlers() {
 // ─── Window Creation ───────────────────────────────────────────────────────────
 function createWindow() {
     const mainWindow = new BrowserWindow({
-        width: 480,
-        height: 640,
-        resizable: false,
+        width: 620,
+        height: 760,
+        minWidth: 480,
+        minHeight: 640,
+        resizable: true,
         frame: false,
         transparent: false,
         backgroundColor: '#1a1a24',

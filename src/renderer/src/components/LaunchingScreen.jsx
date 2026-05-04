@@ -447,6 +447,8 @@ export default function LaunchingScreen({ workspace, autoLaunch = false, onSetti
         if (result.success) {
             setSaveSuccess(true)
             setTimeout(() => setSaveSuccess(false), 3000)
+        } else {
+            setLiveStatus(result.error || 'Session save failed. Review diagnostics before unplugging.')
         }
     }
 
@@ -505,8 +507,62 @@ export default function LaunchingScreen({ workspace, autoLaunch = false, onSetti
                 : 'All set'
 
     const showAutoLaunchCountdown = autoLaunchStatus.statusCategory === 'countdown'
-    const showAutoLaunchBlocked = autoLaunchStatus.statusCategory === 'blocked' &&
-        autoLaunchStatus.blockerReasonCodes.length > 0
+    const showAutoLaunchBlocked = autoLaunchStatus.statusCategory === 'blocked'
+    const autoLaunchIsRunning = ['launching', 'running'].includes(autoLaunchStatus.statusCategory)
+    const showAutoLaunchWaiting = autoLaunchStatus.statusCategory === 'waiting-auto-import'
+    const showAutoLaunchSafetyControls = showAutoLaunchCountdown || showAutoLaunchBlocked || autoLaunchIsRunning || showAutoLaunchWaiting
+    const autoLaunchStatusTitle = showAutoLaunchBlocked
+        ? 'Auto-launch blocked'
+        : autoLaunchIsRunning
+            ? 'Trusted auto-launch running'
+            : showAutoLaunchWaiting
+                ? 'Trusted auto-launch enabled'
+                : 'Trusted auto-launch'
+
+    const renderAutoLaunchSafetyCard = () => (
+        <div className="mb-4 p-3 rounded-lg bg-[#121626] border border-[#27304d]">
+            <div className="flex items-start justify-between gap-3 mb-2">
+                <div className="min-w-0">
+                    <p className="text-xs font-medium text-white">{autoLaunchStatusTitle}</p>
+                    <p className="text-[10px] text-[#aab7e8] truncate">
+                        {autoLaunchStatus.presetLabel || 'Advanced personal automation'}
+                    </p>
+                </div>
+                {showAutoLaunchCountdown && (
+                    <div className="text-right flex-shrink-0">
+                        <p className="text-base font-semibold text-white">{autoLaunchStatus.countdownSeconds}</p>
+                        <p className="text-[9px] text-[#8793c2]">sec</p>
+                    </div>
+                )}
+            </div>
+            <p className="text-[10px] text-[#9ca3c8] mb-2">
+                {autoLaunchStatus.itemCounts.total} items: {autoLaunchStatus.itemCounts.browserTabs} tabs, {autoLaunchStatus.itemCounts.desktopApps + autoLaunchStatus.itemCounts.hostFolders} desktop
+            </p>
+            {showAutoLaunchBlocked && autoLaunchStatus.blockerReasonCodes.length > 0 && (
+                <p className="text-[10px] text-[#c08e86] break-words mb-2">
+                    {autoLaunchStatus.blockerReasonCodes.join(', ')}
+                </p>
+            )}
+            {autoLaunchStatus.recoveryHints[0] && (
+                <p className="text-[10px] text-[#9ca3c8] mb-3">{autoLaunchStatus.recoveryHints[0]}</p>
+            )}
+            <div className="flex gap-2">
+                {(showAutoLaunchCountdown || autoLaunchIsRunning) && (
+                    <button className="btn-secondary flex-1 text-[10px] py-1.5" onClick={handleCancelAutoLaunch}>
+                        Cancel
+                    </button>
+                )}
+                {!autoLaunchIsRunning && (
+                    <button className="btn-primary flex-1 text-[10px] py-1.5" onClick={handleAutoLaunchNow}>
+                        Launch now
+                    </button>
+                )}
+                <button className="flex-1 text-[10px] py-1.5 rounded-md border border-[#3a2a2a] text-[#d44] hover:bg-[#2a1a1a] transition-colors" onClick={handleDisableAutoLaunch}>
+                    Disable
+                </button>
+            </div>
+        </div>
+    )
 
     return (
         <>
@@ -522,12 +578,14 @@ export default function LaunchingScreen({ workspace, autoLaunch = false, onSetti
                 >
                     <div className="spinner" style={{ width: 28, height: 28, marginBottom: 16 }} />
                     <h2 style={{ fontSize: 16, fontWeight: 600, color: '#fff', marginBottom: 6 }}>Closing Workspace</h2>
-                    <p style={{ fontSize: 12, color: '#8888a0' }}>Syncing data & cleaning up...</p>
-                    <p style={{ fontSize: 10, color: '#555568', marginTop: 16 }}>Please don&apos;t unplug your USB drive</p>
+                    <p style={{ fontSize: 12, color: '#8888a0' }}>Quit requested. Sync-back and cleanup are running.</p>
+                    <p style={{ fontSize: 10, color: '#d4a44a', marginTop: 16, maxWidth: 280, textAlign: 'center' }}>
+                        Keep the drive connected until Wipesnap closes cleanly. If diagnostics later show failed or unknown sync-back, reopen Wipesnap before unplugging.
+                    </p>
                 </div>
             )}
 
-            <div className="card p-6 w-full max-w-sm animate-slide-up" style={{ maxHeight: 560 }}>
+            <div className="card p-6 w-full max-w-md animate-slide-up" style={{ maxHeight: 660 }}>
                 {phase === 'launching' && (
                     <div className="flex flex-col items-center animate-fade-in">
                         <div className="w-14 h-14 mx-auto mb-4 rounded-full flex items-center justify-center bg-[#1a1a2e]">
@@ -551,6 +609,8 @@ export default function LaunchingScreen({ workspace, autoLaunch = false, onSetti
                                 }}
                             />
                         </div>
+
+                        {showAutoLaunchSafetyControls && renderAutoLaunchSafetyCard()}
 
                         <div className="w-full space-y-3" style={{ maxHeight: 260, overflowY: 'auto' }}>
                             {loadedItems.length > 0 && (
@@ -702,48 +762,7 @@ export default function LaunchingScreen({ workspace, autoLaunch = false, onSetti
                             </div>
                         )}
 
-                        {showAutoLaunchCountdown && (
-                            <div className="mb-4 p-3 rounded-lg bg-[#121626] border border-[#27304d]">
-                                <div className="flex items-start justify-between gap-3 mb-2">
-                                    <div className="min-w-0">
-                                        <p className="text-xs font-medium text-white">Trusted auto-launch</p>
-                                        <p className="text-[10px] text-[#aab7e8] truncate">
-                                            {autoLaunchStatus.presetLabel || 'Selected preset'}
-                                        </p>
-                                    </div>
-                                    <div className="text-right flex-shrink-0">
-                                        <p className="text-base font-semibold text-white">{autoLaunchStatus.countdownSeconds}</p>
-                                        <p className="text-[9px] text-[#8793c2]">sec</p>
-                                    </div>
-                                </div>
-                                <p className="text-[10px] text-[#9ca3c8] mb-3">
-                                    {autoLaunchStatus.itemCounts.total} items: {autoLaunchStatus.itemCounts.browserTabs} tabs, {autoLaunchStatus.itemCounts.desktopApps + autoLaunchStatus.itemCounts.hostFolders} desktop
-                                </p>
-                                <div className="grid grid-cols-3 gap-2">
-                                    <button className="btn-secondary text-[10px] py-1.5" onClick={handleCancelAutoLaunch}>
-                                        Cancel
-                                    </button>
-                                    <button className="btn-primary text-[10px] py-1.5" onClick={handleAutoLaunchNow}>
-                                        Launch now
-                                    </button>
-                                    <button className="text-[10px] py-1.5 rounded-md border border-[#3a2a2a] text-[#d44] hover:bg-[#2a1a1a] transition-colors" onClick={handleDisableAutoLaunch}>
-                                        Disable
-                                    </button>
-                                </div>
-                            </div>
-                        )}
-
-                        {showAutoLaunchBlocked && (
-                            <div className="mb-4 p-3 rounded-lg bg-[#1b1718] border border-[#3a2a2a]">
-                                <p className="text-xs font-medium text-[#f0b36b] mb-1">Auto-launch blocked</p>
-                                <p className="text-[10px] text-[#c08e86] break-words">
-                                    {autoLaunchStatus.blockerReasonCodes.join(', ')}
-                                </p>
-                                {autoLaunchStatus.recoveryHints[0] && (
-                                    <p className="text-[10px] text-[#9ca3c8] mt-1">{autoLaunchStatus.recoveryHints[0]}</p>
-                                )}
-                            </div>
-                        )}
+                        {showAutoLaunchSafetyControls && renderAutoLaunchSafetyCard()}
 
                         <div className="space-y-2">
                             {totalItems > 0 && loadedItems.length === 0 && failedItems.length === 0 && skippedItems.length === 0 && (
@@ -812,7 +831,7 @@ export default function LaunchingScreen({ workspace, autoLaunch = false, onSetti
                         </div>
 
                         <p className="text-muted text-center mt-3" style={{ fontSize: 10 }}>
-                            Save your tabs & logins before unplugging
+                            Use Quit before unplugging. Review diagnostics if sync-back or cleanup cannot finish.
                         </p>
                     </div>
                 )}

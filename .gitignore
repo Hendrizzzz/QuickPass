@@ -11,6 +11,7 @@ run-diagnostics.json
 firestore-debug.log
 .DS_Store
 .env
+wipesnap.local.json
 _planning/
 .tmp/
 AppData/

@@ -16,6 +16,7 @@ const wipesnapApi = {
     // Vault Operations
     vaultExists: () => ipcRenderer.invoke('vault-exists'),
     loadVaultMeta: () => ipcRenderer.invoke('load-vault-meta'),
+    loadProductSurfacePolicy: () => ipcRenderer.invoke('load-product-surface-policy'),
     loadDiagnosticsSummary: () => ipcRenderer.invoke('load-diagnostics-summary'),
     loadWorkspaceHealth: () => ipcRenderer.invoke('load-workspace-health'),
     loadAccountSlots: () => ipcRenderer.invoke('load-account-slots'),

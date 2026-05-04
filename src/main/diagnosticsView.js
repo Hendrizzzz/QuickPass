@@ -26,6 +26,9 @@ const CLOSE_METHOD_VALUES = new Set(['none', 'not-owned', 'graceful', 'force', '
 const LAUNCH_VERIFIED_BY_VALUES = new Set(['unknown', 'shell-activation-sent', 'process-ready', 'visible-window', 'launcher-handoff', 'process-spawn'])
 const IMPORTED_DATA_SUPPORT_LEVEL_VALUES = new Set(['verified', 'best-effort', 'unsupported', 'unknown'])
 const ARCHIVE_POLICY_STATUS_VALUES = new Set(['current', 'legacy', 'unknown', 'ok', 'failed'])
+const SYNC_BACK_STATUS_VALUES = new Set(['not-run', 'running', 'completed', 'failed', 'deferred', 'blocked', 'unknown'])
+const CLEANUP_LIFECYCLE_STATUS_VALUES = new Set(['not-run', 'started', 'completed', 'deferred', 'blocked', 'unknown'])
+const FINAL_STATE_VALUES = new Set(['synced', 'cleanup-completed', 'cleanup-deferred', 'action-needed', 'unknown'])
 const BROWSER_REASON_VALUES = new Set(['', 'empty-url', 'local-file-url', 'browser-error-page', 'browser-internal-page', 'unsupported-browser-scheme', 'unsupported-browser-url'])
 const STATUS_CLASSIFICATION_VALUES = new Set([
     ...PHASE_STATUS_VALUES,
@@ -78,6 +81,18 @@ function createEmptySummary(state = 'missing', overrides = {}) {
             skippedForSafety: 0,
             runtimeProfilesWiped: 0,
             runtimeProfilesDeferred: 0
+        },
+        lifecycle: {
+            metadataOnly: true,
+            launchStarted: false,
+            workspaceRunning: false,
+            quitRequested: false,
+            browserSyncBack: { status: 'not-run', copyOutMs: null },
+            appSessionSyncBack: { status: 'not-run', completed: 0, failed: 0, deferred: 0 },
+            cleanup: { status: 'not-run', completed: false, deferred: 0, blocked: 0 },
+            finalState: 'unknown',
+            finalStateLabel: 'Unknown',
+            recoveryGuidance: 'No final lifecycle status has been recorded yet.'
         },
         imports: {
             present: false,
@@ -154,6 +169,7 @@ function normalizeBoolean(value) {
 }
 
 function normalizeNumber(value) {
+    if (value == null) return null
     const number = Number(value)
     return Number.isFinite(number) && number >= 0 ? number : null
 }
@@ -282,6 +298,7 @@ function getAppError(app) {
 function hasAppWarning(app) {
     return !!app?.cleanupSkippedForSafety ||
         !!app?.runtimeProfileWipeSkippedForSafety ||
+        ['failed', 'deferred', 'blocked'].includes(sanitizeStatus(app?.appSessionSyncBackStatus || 'not-run', 'not-run', SYNC_BACK_STATUS_VALUES)) ||
         isWarningStatus(app?.availabilityStatus) ||
         isWarningStatus(app?.supportTier) ||
         isWarningStatus(app?.archivePolicyStatus) ||
@@ -314,6 +331,8 @@ function summarizeApps(appResults = []) {
             runtimeProfileSynced: normalizeBoolean(app?.runtimeProfileSynced),
             runtimeProfileWiped: normalizeBoolean(app?.runtimeProfileWiped),
             runtimeProfileDeferred: runtimeProfileWipeSkippedForSafety,
+            appSessionSyncBackStatus: sanitizeStatus(app?.appSessionSyncBackStatus || 'not-run', 'not-run', SYNC_BACK_STATUS_VALUES),
+            appSessionSyncBackError: redactSensitiveText(app?.appSessionSyncBackError || '', 180),
             cleanupSkippedForSafety,
             cleanupSafetyReason: cleanupSkippedForSafety ? redactSensitiveText(app?.cleanupSafetyReason || 'Cleanup skipped for safety.', 180) : '',
             importedDataSupportLevel: sanitizeStatus(app?.importedDataSupportLevel || 'unknown', 'unknown', IMPORTED_DATA_SUPPORT_LEVEL_VALUES),
@@ -398,6 +417,168 @@ function summarizeImports(apps, runtimeChecks = {}) {
     }
 }
 
+function phaseNamed(phases, name) {
+    return phases.some(phase => phase.name === name)
+}
+
+function phaseFailed(phases, name) {
+    return phases.some(phase => phase.name === name && isFailureStatus(phase.status))
+}
+
+function errorsForContext(errors, pattern) {
+    return errors.some(error => pattern.test(String(error?.context || '')))
+}
+
+function syncBackStatusLabel(status) {
+    if (status === 'completed') return 'Completed'
+    if (status === 'failed') return 'Failed'
+    if (status === 'deferred') return 'Deferred'
+    if (status === 'blocked') return 'Blocked'
+    if (status === 'running') return 'Running'
+    if (status === 'not-run') return 'Not run'
+    return 'Unknown'
+}
+
+function finalStateLabel(state) {
+    if (state === 'synced') return 'Synced'
+    if (state === 'cleanup-completed') return 'Cleanup completed'
+    if (state === 'cleanup-deferred') return 'Cleanup deferred'
+    if (state === 'action-needed') return 'Action needed'
+    return 'Unknown'
+}
+
+function lifecycleGuidance(finalState) {
+    if (finalState === 'synced') {
+        return 'Last diagnostics show sync-back and cleanup completed.'
+    }
+    if (finalState === 'cleanup-completed') {
+        return 'Cleanup completed. Review sync-back rows if you expected browser or app data to save.'
+    }
+    if (finalState === 'cleanup-deferred') {
+        return 'Cleanup was deferred for safety. Close remaining launched apps, reopen Wipesnap, and review diagnostics before unplugging.'
+    }
+    if (finalState === 'action-needed') {
+        return 'Sync-back or cleanup needs attention. Keep the drive connected, reopen Wipesnap, and review diagnostics before unplugging.'
+    }
+    return 'Final sync-back and cleanup state is unknown. Do not treat the workspace as fully synced until diagnostics are reviewed.'
+}
+
+function summarizeBrowserSyncBack({ browser, phases, errors, quitRequested }) {
+    if (browser.copyOutMs != null) {
+        const failed = phaseFailed(phases, 'browser-copy-out') || errorsForContext(errors, /browser-copy-out/i)
+        return {
+            status: failed ? 'failed' : 'completed',
+            statusLabel: syncBackStatusLabel(failed ? 'failed' : 'completed'),
+            copyOutMs: browser.copyOutMs
+        }
+    }
+    if (quitRequested && browser.present) {
+        return {
+            status: 'unknown',
+            statusLabel: 'Unknown',
+            copyOutMs: null
+        }
+    }
+    return {
+        status: 'not-run',
+        statusLabel: 'Not run',
+        copyOutMs: null
+    }
+}
+
+function summarizeAppSessionSyncBack(apps) {
+    const syncApps = apps.filter(app => app.runtimeProfileSynced || app.appSessionSyncBackStatus !== 'not-run')
+    const failed = syncApps.filter(app => app.appSessionSyncBackStatus === 'failed').length
+    const deferred = syncApps.filter(app => ['deferred', 'blocked'].includes(app.appSessionSyncBackStatus)).length
+    const completed = syncApps.filter(app => app.appSessionSyncBackStatus === 'completed').length
+    const running = syncApps.filter(app => app.appSessionSyncBackStatus === 'running').length
+    const status = failed > 0
+        ? 'failed'
+        : deferred > 0
+            ? 'deferred'
+            : running > 0
+                ? 'running'
+                : completed > 0
+                    ? 'completed'
+                    : syncApps.length > 0
+                        ? 'unknown'
+                        : 'not-run'
+
+    return {
+        status,
+        statusLabel: syncBackStatusLabel(status),
+        completed,
+        failed,
+        deferred
+    }
+}
+
+function summarizeCleanupLifecycle(cleanup, phases) {
+    const blocked = Number(cleanup.skippedForSafety || 0)
+    const deferred = Number(cleanup.runtimeProfilesDeferred || 0)
+    const completed = !!cleanup.present && blocked === 0 && deferred === 0
+    const status = blocked > 0
+        ? 'blocked'
+        : deferred > 0
+            ? 'deferred'
+            : completed
+                ? 'completed'
+                : phaseNamed(phases, 'workspace-cleanup')
+                    ? 'unknown'
+                    : 'not-run'
+    return {
+        status: sanitizeStatus(status, 'unknown', CLEANUP_LIFECYCLE_STATUS_VALUES),
+        statusLabel: syncBackStatusLabel(status),
+        completed,
+        deferred,
+        blocked
+    }
+}
+
+function deriveFinalState({ browserSyncBack, appSessionSyncBack, cleanup }) {
+    const syncFailed = browserSyncBack.status === 'failed' || appSessionSyncBack.status === 'failed'
+    const syncNeedsAttention = [browserSyncBack.status, appSessionSyncBack.status].some(status =>
+        ['unknown', 'running', 'deferred', 'blocked'].includes(status)
+    )
+    if (syncFailed || syncNeedsAttention || cleanup.status === 'blocked') return 'action-needed'
+    if (cleanup.status === 'deferred') return 'cleanup-deferred'
+    if (cleanup.status === 'completed') {
+        if (browserSyncBack.status === 'completed' || appSessionSyncBack.status === 'completed') return 'synced'
+        return 'cleanup-completed'
+    }
+    return 'unknown'
+}
+
+function summarizeLifecycle({ selectedCycle, phases, apps, browser, cleanup, errors }) {
+    const quitRequested = phaseNamed(phases, 'quit-requested') ||
+        phaseNamed(phases, 'workspace-cleanup') ||
+        phaseNamed(phases, 'browser-copy-out') ||
+        cleanup.present
+    const browserSyncBack = summarizeBrowserSyncBack({ browser, phases, errors, quitRequested })
+    const appSessionSyncBack = summarizeAppSessionSyncBack(apps)
+    const cleanupLifecycle = summarizeCleanupLifecycle(cleanup, phases)
+    const finalState = sanitizeStatus(
+        deriveFinalState({ browserSyncBack, appSessionSyncBack, cleanup: cleanupLifecycle }),
+        'unknown',
+        FINAL_STATE_VALUES
+    )
+
+    return {
+        metadataOnly: true,
+        launchStarted: phaseNamed(phases, 'launch-started') || !!selectedCycle?.cycleStartTime,
+        workspaceRunning: phaseNamed(phases, 'workspace-running') ||
+            browser.succeeded > 0 ||
+            apps.some(app => app.status === 'ok'),
+        quitRequested,
+        browserSyncBack,
+        appSessionSyncBack,
+        cleanup: cleanupLifecycle,
+        finalState,
+        finalStateLabel: finalStateLabel(finalState),
+        recoveryGuidance: lifecycleGuidance(finalState)
+    }
+}
+
 function addLimited(target, item, limit) {
     if (target.length < limit) target.push(item)
 }
@@ -420,7 +601,11 @@ function collectWarnings({ phases, apps, browser, cleanup, imports }) {
             addLimited(warnings, {
                 scope: 'app',
                 name: app.name,
-                message: app.warning || app.cleanupSafetyReason || `App status: ${app.availabilityStatus || app.status}`
+                message: app.appSessionSyncBackStatus === 'deferred'
+                    ? 'App session sync-back was deferred for safety.'
+                    : app.appSessionSyncBackStatus === 'blocked'
+                        ? 'App session sync-back was blocked for safety.'
+                        : app.warning || app.cleanupSafetyReason || `App status: ${app.availabilityStatus || app.status}`
             }, MAX_WARNINGS)
         }
     }
@@ -453,7 +638,8 @@ function collectWarnings({ phases, apps, browser, cleanup, imports }) {
 }
 
 function hasSummarizedAppWarning(app) {
-    return isWarningStatus(app.availabilityStatus) ||
+    return ['failed', 'deferred', 'blocked'].includes(app.appSessionSyncBackStatus) ||
+        isWarningStatus(app.availabilityStatus) ||
         isWarningStatus(app.supportTier) ||
         isWarningStatus(app.archivePolicyStatus) ||
         isWarningStatus(app.readinessStatus)
@@ -478,6 +664,13 @@ function collectFailures({ phases, apps, browser, errors }) {
                 scope: 'app',
                 name: app.name,
                 message: app.error || `App failed during ${app.stage}.`
+            }, MAX_FAILURES)
+        }
+        if (app.appSessionSyncBackStatus === 'failed') {
+            addLimited(failures, {
+                scope: 'sync-back',
+                name: app.name,
+                message: app.appSessionSyncBackError || 'App session sync-back failed.'
             }, MAX_FAILURES)
         }
     }
@@ -532,6 +725,14 @@ function buildSummary(raw, sizeBytes) {
     const warnings = collectWarnings({ phases, apps, browser, cleanup, imports })
     const failures = collectFailures({ phases, apps, browser, errors: diagnosticErrors })
     const status = computeSummaryStatus({ browser, phases, apps, failures, warnings })
+    const lifecycle = summarizeLifecycle({
+        selectedCycle,
+        phases,
+        apps,
+        browser,
+        cleanup,
+        errors: diagnosticErrors
+    })
 
     return {
         success: true,
@@ -558,6 +759,7 @@ function buildSummary(raw, sizeBytes) {
         lastLaunch: lastLaunchCycle ? summarizeCycleMeta(lastLaunchCycle) : null,
         browser,
         cleanup,
+        lifecycle,
         imports,
         phases,
         apps,
