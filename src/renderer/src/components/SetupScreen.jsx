@@ -549,7 +549,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
                                 </p>
                                 <p className="text-xs text-secondary mt-1">
                                     {savingSession
-                                        ? 'Encrypting cookies and tabs...'
+                                        ? 'Saving tabs and browser profile...'
                                         : 'Log into your sites, then come back here'}
                                 </p>
                             </div>
@@ -589,7 +589,7 @@ export default function SetupScreen({ driveInfo, onComplete }) {
                             </div>
                             <p className="text-base text-white font-semibold">Setup Complete!</p>
                             <p className="text-xs text-secondary mt-1">
-                                {capturedCount} tab{capturedCount !== 1 ? 's' : ''} saved and encrypted
+                                {capturedCount} tab{capturedCount !== 1 ? 's' : ''} saved to the vault
                             </p>
                             {capturedSkippedCount > 0 && (
                                 <p className="text-xs text-[#d4a44a] mt-1">

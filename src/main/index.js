@@ -1088,7 +1088,7 @@ function registerIpcHandlers() {
     })
 
     // Phase 17.1: Toggle for clearing extracted app cache on exit
-    // ON  = Zero-footprint mode (safe for public/school PCs)
+    // ON  = best-effort cache cleanup for public/school PCs
     // OFF = Keep cache for instant launches (ideal for home PC)
     trustedHandle('update-clear-cache', async (_, enable) => {
         try {

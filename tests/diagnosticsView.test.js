@@ -564,8 +564,48 @@ test('failed browser copy-in is visible and sanitized without implying healthy l
 
     assert.equal(summary.status, 'failed')
     assert.equal(summary.browser.status, 'failed')
-    assert.equal(summary.lifecycle.finalState, 'unknown')
+    assert.equal(summary.lifecycle.finalState, 'action-needed')
+    assert.match(summary.lifecycle.recoveryGuidance, /copy-in failed/i)
+    assert.match(summary.lifecycle.recoveryGuidance, /protect the portable profile/i)
     assert.equal(summary.failures.some(item => item.scope === 'phase' && item.name === 'browser-copy-in'), true)
+    assert.equal(serialized.includes(secretPath), false)
+    assert.equal(serialized.includes('BrowserProfile'), false)
+    assert.equal(serialized.includes(secretToken), false)
+}))
+
+test('managed browser launch failure is action-needed and does not imply sync-back completed', () => withVaultDir((vaultDir) => {
+    const secretPath = 'C:\\Users\\Alice\\BrowserProfile\\Default'
+    const secretToken = '0123456789abcdef0123456789abcdef01234567'
+    writeDiagnostics(vaultDir, {
+        cycleType: 'launch',
+        cycleStartTime: 647,
+        phases: [
+            { name: 'launch-started', status: 'ok' },
+            { name: 'browser-copy-in', status: 'ok' },
+            { name: 'browser-launch', status: 'failed', detail: `Chrome failed at ${secretPath} token=${secretToken}` }
+        ],
+        browserSync: {
+            copyInMs: 17,
+            copyOutMs: null
+        },
+        errors: [{
+            context: 'browser-launch',
+            message: `Managed profile failed at ${secretPath} token=${secretToken}`
+        }]
+    })
+
+    const summary = loadDiagnosticsSummary({ vaultDir })
+    const serialized = JSON.stringify(summary)
+
+    assert.equal(summary.status, 'failed')
+    assert.equal(summary.lifecycle.browserSyncBack.status, 'not-run')
+    assert.equal(summary.lifecycle.cleanup.status, 'not-run')
+    assert.equal(summary.lifecycle.finalState, 'action-needed')
+    assert.match(summary.lifecycle.recoveryGuidance, /managed profile/i)
+    assert.match(summary.lifecycle.recoveryGuidance, /Sync-back was blocked/i)
+    assert.notEqual(summary.lifecycle.finalState, 'synced')
+    assert.equal(/Last diagnostics show sync-back and cleanup completed|Cleanup completed/i.test(summary.lifecycle.recoveryGuidance), false)
+    assert.equal(summary.failures.some(item => item.scope === 'phase' && item.name === 'browser-launch'), true)
     assert.equal(serialized.includes(secretPath), false)
     assert.equal(serialized.includes('BrowserProfile'), false)
     assert.equal(serialized.includes(secretToken), false)

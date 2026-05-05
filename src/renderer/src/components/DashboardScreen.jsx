@@ -968,7 +968,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, surfa
     return (
         <div className="card p-6 w-full max-w-lg animate-slide-up flex flex-col" style={{ maxHeight: 660 }}>
             <div className="flex items-center justify-between mb-4 flex-shrink-0">
-                <h1 className="text-lg font-semibold text-white">Settings</h1>
+                <h1 className="text-lg font-semibold text-white">Workspace</h1>
                 {!isInSessionMode && (
                     <button className="btn-secondary text-xs py-1 px-3" onClick={onCancel}>Close</button>
                 )}
