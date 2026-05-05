@@ -211,7 +211,7 @@ const RUNTIME_DATA_SUPPORT_LEVELS = Object.freeze({
 // - adapter identity / argument style
 // This lets Wipesnap keep best-effort launch-only adapters without falsely
 // advertising imported-data portability.
-function resolveRuntimeDataPlan(appConfig, launchProfile, dataProfile) {
+export function resolveRuntimeDataPlan(appConfig, launchProfile, dataProfile) {
     const normalizedLaunchProfile = String(launchProfile || '').toLowerCase()
     const dataMode = String(dataProfile?.mode || '').toLowerCase()
 
@@ -268,7 +268,7 @@ function resolveRuntimeDataPlan(appConfig, launchProfile, dataProfile) {
             importedDataSupported: false,
             argPrefix: '--user-data-dir=',
             runtimeSupportReason: 'Generic Electron runtime isolation is best-effort until Wipesnap has app-specific validation.',
-            runtimeSupportWarning: 'Using best-effort Electron runtime isolation. Verify this app stays off host AppData on this PC before relying on zero-footprint guarantees.',
+            runtimeSupportWarning: 'Using best-effort Electron runtime isolation. Verify this app does not write important data to host AppData on this PC before relying on cleanup.',
             unsupportedImportedDataReason: 'Wipesnap does not yet have a verified imported AppData adapter for generic Electron apps.'
         }
     }
@@ -578,6 +578,27 @@ function createSkippedBrowserResult(originalUrl, tabIndex, classification = clas
         error: message,
         errors: []
     }
+}
+
+function createBrowserLaunchFailureResults(urls, message) {
+    const safeMessage = message || 'Browser launch failed. Review diagnostics before launching browser tabs again.'
+    return urls.map((_, index) => {
+        const tabIndex = index + 1
+        return {
+            type: 'web',
+            tabIndex,
+            url: `Saved browser tab ${tabIndex}`,
+            normalizedUrl: null,
+            success: false,
+            skipped: false,
+            reason: '',
+            attempts: 0,
+            finalUrl: null,
+            title: null,
+            error: safeMessage,
+            errors: []
+        }
+    })
 }
 
 function getPageSnapshot(page) {
@@ -1824,7 +1845,7 @@ export function wipeAllLocalAppData() {
  * Wipes extracted app binaries from temp.
  * Conditionally called based on clearCacheOnExit toggle.
  * When OFF: apps persist for instant <10s launches on home PC.
- * When ON:  zero-footprint mode for public/school PCs.
+ * When ON:  best-effort cache cleanup mode for public/school PCs.
  * Legacy QuickPass temp names are also removed when cache clearing is enabled.
  */
 export function wipeLocalAppCache() {
@@ -2013,7 +2034,7 @@ function handleProfileMigration(profileDir) {
  * Portable Firefox, Tor Browser, etc.
  */
 const BROWSER_PROFILE_COPY_IN_BLOCKED_MESSAGE = 'Browser profile copy-in failed. Browser launch was blocked to protect the portable profile.'
-const BROWSER_LAUNCH_FAILED_MESSAGE = 'Browser launch failed. Chrome could not start from the managed profile.'
+const BROWSER_LAUNCH_FAILED_MESSAGE = 'Browser launch failed. Chrome could not start from the managed profile, so sync-back was blocked to protect the portable profile.'
 
 const defaultBrowserLifecycleOps = Object.freeze({
     existsSync: (pathValue) => existsSync(pathValue),
@@ -2116,29 +2137,13 @@ async function launchChrome(vaultDir, onStatus = () => { }, ops = defaultBrowser
     try {
         context = await ops.launchPersistentContext(localProfile, launchOptions)
     } catch (launchErr) {
-        diagError('browser-launch', `Primary launch failed: ${launchErr.message}`)
-        console.error('[Wipesnap] Chrome launch failed, retrying with clean profile:', launchErr.message)
-
-        // Nuclear fallback: nuke the corrupted local profile and start fresh
+        diagError('browser-launch', `Managed profile launch failed: ${launchErr.message}`)
+        console.error('[Wipesnap] Chrome launch failed from managed profile:', launchErr.message)
+        diagPhaseEnd('browser-launch', 'failed', BROWSER_LAUNCH_FAILED_MESSAGE)
         try { ops.rmSync(localProfile, { recursive: true, force: true }) } catch (_) { }
-        ops.mkdirSync(localProfile, { recursive: true })
-        ops.patchProfileLocale(localProfile)
-        // Write machine marker so next run doesn't re-trigger migration
-        const machineHash = crypto.createHash('sha256')
-            .update(`${os.hostname()}:${os.userInfo().username}`)
-            .digest('hex').slice(0, 16)
-            try { require('fs').writeFileSync(join(localProfile, MACHINE_MARKER_FILE), machineHash) } catch (_) { }
-
-        try {
-            context = await ops.launchPersistentContext(localProfile, launchOptions)
-            onStatus('[WARN] Browser launched with fresh profile - all sessions reset')
-        } catch (retryErr) {
-            diagError('browser-launch', `Retry with fresh profile failed: ${retryErr.message}`)
-            diagPhaseEnd('browser-launch', 'failed', BROWSER_LAUNCH_FAILED_MESSAGE)
-            try { ops.rmSync(localProfile, { recursive: true, force: true }) } catch (_) { }
-            activeVaultDir = null
-            throw new Error(BROWSER_LAUNCH_FAILED_MESSAGE)
-        }
+        activeVaultDir = null
+        onStatus('[ERROR] Browser launch failed. Sync-back was blocked to protect the portable profile.')
+        throw new Error(BROWSER_LAUNCH_FAILED_MESSAGE)
     }
     diagPhaseEnd('browser-launch')
 
@@ -3501,9 +3506,9 @@ async function launchDesktopAppLegacy(appConfig, onStatus, vaultDir) {
 /**
  * Launches the full workspace: browser tabs + desktop apps.
  *
- * Phase 16.1: Desktop apps launch CONCURRENTLY with the browser; they no longer
- * wait for robocopy + Chrome + tab loading to finish first. A 1.5s stagger between
- * apps prevents CPU/disk saturation when multiple Electron apps initialize.
+ * Desktop apps launch concurrently with browser setup. Launch completion waits
+ * for both tracks to settle so UI state cannot clear while app side effects are
+ * still in flight.
  */
 async function launchDesktopApp(appConfig, onStatus, vaultDir) {
     const diagRef = createAppDiagnostic(appConfig, appConfig.path)
@@ -4240,6 +4245,12 @@ export async function launchWorkspace(workspace, onStatus, vaultDir, options = {
     onStatus(`Launching ${total} items...`)
     diagPhaseEnd('launch-started')
 
+    const browserLifecycleOps = options.browserLifecycleOps
+        ? { ...defaultBrowserLifecycleOps, ...options.browserLifecycleOps }
+        : defaultBrowserLifecycleOps
+    const launchDesktopAppImpl = options.launchDesktopApp || launchDesktopApp
+    const ensureExtractorPreflightImpl = options.ensureExtractorPreflight || ensureExtractorPreflight
+
     // --- Track: Browser (async) ---
     // Runs robocopy -> Chrome -> tabs concurrently with desktop apps
     const browserTrack = async () => {
@@ -4247,7 +4258,7 @@ export async function launchWorkspace(workspace, onStatus, vaultDir, options = {
             return []
         }
 
-        const { context, browser } = await launchChrome(vaultDir, onStatus)
+        const { context, browser } = await launchChrome(vaultDir, onStatus, browserLifecycleOps)
         activeContext = context
         activeBrowser = browser
 
@@ -4288,44 +4299,75 @@ export async function launchWorkspace(workspace, onStatus, vaultDir, options = {
         return results
     }
 
-    // --- Track: Desktop Apps (async, staggered) ---
-    // Launches immediately (doesn't wait for browser), with 1.5s gaps so
-    // multiple Electron apps don't overwhelm CPU/RAM during init
-    // Phase 16.3: Removed artificial 1500ms stagger; robocopy already provides
-    // natural spacing between app launches. The stagger was adding 6+ seconds
-    // of pure waste to every workspace launch.
+    // --- Track: Desktop Apps (async) ---
+    // Launches immediately and settles independently from browser tab loading.
     const appsTrack = async () => {
         if (enabledApps.length > 0) {
-            ensureExtractorPreflight()
+            ensureExtractorPreflightImpl()
         }
 
         const appResults = await mapWithConcurrency(enabledApps, DESKTOP_APP_LAUNCH_CONCURRENCY, async (appConfig, i) => {
-            const result = await launchDesktopApp(appConfig, (msg) => onStatus(`[App ${i + 1}] ${msg}`), vaultDir)
+            const result = await launchDesktopAppImpl(appConfig, (msg) => onStatus(`[App ${i + 1}] ${msg}`), vaultDir)
             return { type: 'app', ...result }
         })
         return appResults
     }
 
-    // --- Run both tracks concurrently ---
-    const [webResults, appResults] = await Promise.all([
+    // --- Run both tracks concurrently, then settle structurally ---
+    const [browserTrackResult, appsTrackResult] = await Promise.allSettled([
         browserTrack(),
         appsTrack()
     ])
+
+    const browserTrackFailed = browserTrackResult.status === 'rejected'
+    const appTrackFailed = appsTrackResult.status === 'rejected'
+    const browserFailureMessage = 'Browser launch failed. Review diagnostics before launching browser tabs again.'
+    const webResults = browserTrackFailed
+        ? createBrowserLaunchFailureResults(savedUrls, browserFailureMessage)
+        : browserTrackResult.value
+    const appResults = appTrackFailed ? [] : appsTrackResult.value
+
+    if (browserTrackFailed) {
+        const hasBrowserFailurePhase = runDiagnostics.phases.some(phase =>
+            ['browser-copy-in', 'browser-launch'].includes(phase?.name) &&
+            ['failed', 'error', 'blocked'].includes(phase?.status)
+        )
+        if (!hasBrowserFailurePhase) {
+            diagPhaseStart('browser-launch')
+            diagPhaseEnd('browser-launch', 'failed', BROWSER_LAUNCH_FAILED_MESSAGE)
+            diagError('browser-launch', browserFailureMessage)
+        }
+        runDiagnostics.webResults = webResults
+        for (const result of webResults) {
+            onStatus(`[Tab ${result.tabIndex}] [WARN] ${result.url} - ${result.error}`)
+        }
+    }
+
+    if (appTrackFailed) {
+        diagError('app-launch-track', 'Desktop app launch track failed before results could be returned.')
+        throw new Error('Desktop app launch failed before all app results could be returned.')
+    }
+
+    if (browserTrackFailed && appResults.length === 0) {
+        throw new Error(BROWSER_LAUNCH_FAILED_MESSAGE)
+    }
 
     const failed = webResults.filter(item => item?.success === false && !item?.skipped).length +
         appResults.filter(item => item?.success === false && !item?.skipped).length
     const skipped = webResults.filter(item => item?.skipped).length +
         appResults.filter(item => item?.skipped).length
-    diagPhaseStart('workspace-running')
-    diagPhaseEnd(
-        'workspace-running',
-        failed > 0 ? 'warning' : 'ok',
-        failed > 0
-            ? `${failed} item${failed === 1 ? '' : 's'} failed during launch.`
-            : skipped > 0
-                ? `${skipped} item${skipped === 1 ? '' : 's'} skipped during launch.`
-                : 'Workspace launch completed.'
-    )
+    if (appResults.length > 0 || webResults.some(item => item?.success || item?.skipped)) {
+        diagPhaseStart('workspace-running')
+        diagPhaseEnd(
+            'workspace-running',
+            failed > 0 ? 'warning' : 'ok',
+            failed > 0
+                ? `${failed} item${failed === 1 ? '' : 's'} failed during launch.`
+                : skipped > 0
+                    ? `${skipped} item${skipped === 1 ? '' : 's'} skipped during launch.`
+                    : 'Workspace launch completed.'
+        )
+    }
 
     return { webResults, appResults }
 }

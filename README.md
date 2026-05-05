@@ -79,6 +79,27 @@ Tracked Phase 34 matrix summary:
 
 Some worktrees may also contain a fuller local planning matrix at `docs/phase-34-windows-compatibility-matrix.md`. The `docs/` directory is ignored by this repository policy, so that file is a local planning artifact unless it is intentionally force-added in a future docs policy change.
 
+## Desktop MVP Gate Readiness
+
+The desktop MVP release-candidate path is intentionally narrow:
+
+```text
+unlock -> launch workspace -> save current session -> quit/sync-back/cleanup -> review diagnostics
+```
+
+Before treating a build as Desktop MVP Gate-passing, record real-host smoke results for:
+
+- Windows 10 and Windows 11 as non-admin users with Chrome installed.
+- Chrome missing or locked browser profile failure.
+- USB and external NVMe launch, sync-back, cleanup, and drive-yank cases.
+- Slow or nearly full removable media.
+- OneDrive-redirected folders and inaccessible host app/folder references.
+- Managed hosts with denied registry, PowerShell/CIM, process, or file operations.
+- Long-running owned apps, launch-only host apps, and unmanaged shell/folder launches.
+- NTFS junction/symlink AppData cleanup safety.
+
+Automated tests cover sanitizer, fail-closed, and lifecycle classification behavior, but they are not a substitute for the real hardware and policy-host smoke above.
+
 Legacy compatibility names still recognized in one pass:
 
 - `.quickpass-app.json` imported-app manifests are read for old vaults; new manifests use `.wipesnap-app.json`.

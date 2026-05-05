@@ -349,7 +349,10 @@ export default function LaunchingScreen({ workspace, autoLaunch = false, onSetti
                 return
             }
 
-            if (result.results?.metadataOnly === true) {
+            const webResults = result.results?.webResults || []
+            const appResults = result.results?.appResults || []
+
+            if (result.results?.metadataOnly === true && webResults.length === 0 && appResults.length === 0) {
                 setLoadedItems([])
                 setFailedItems([])
                 setSkippedItems([])
@@ -363,8 +366,6 @@ export default function LaunchingScreen({ workspace, autoLaunch = false, onSetti
             const finalLoaded = []
             const finalFailed = []
             const finalSkipped = []
-            const webResults = result.results?.webResults || []
-            const appResults = result.results?.appResults || []
 
             const appendFinalResults = (items, fallbackType) => {
                 for (const [index, item] of items.entries()) {
@@ -798,7 +799,7 @@ export default function LaunchingScreen({ workspace, autoLaunch = false, onSetti
                                             <polyline points="17 21 17 13 7 13 7 21" />
                                             <polyline points="7 3 7 8 15 8" />
                                         </svg>
-                                        Save Session
+                                        Save Current Session
                                     </span>
                                 )}
                             </button>
@@ -824,14 +825,14 @@ export default function LaunchingScreen({ workspace, autoLaunch = false, onSetti
                                             <polyline points="16 17 21 12 16 7" />
                                             <line x1="21" y1="12" x2="9" y2="12" />
                                         </svg>
-                                        Quit
+                                        Quit & Clean
                                     </span>
                                 </button>
                             </div>
                         </div>
 
                         <p className="text-muted text-center mt-3" style={{ fontSize: 10 }}>
-                            Use Quit before unplugging. Review diagnostics if sync-back or cleanup cannot finish.
+                            Use Quit & Clean before unplugging. Review diagnostics if sync-back or cleanup cannot finish.
                         </p>
                     </div>
                 )}
@@ -849,8 +850,11 @@ export default function LaunchingScreen({ workspace, autoLaunch = false, onSetti
                         <p className="text-error text-xs text-center mb-4">{errorMsg}</p>
 
                         <div className="flex gap-2 w-full">
+                            <button className="btn-secondary flex-1 text-sm" onClick={onSettingsClick}>
+                                Diagnostics
+                            </button>
                             <button className="btn-secondary flex-1 text-sm" onClick={handleQuit}>
-                                Quit
+                                Quit & Clean
                             </button>
                         </div>
                     </div>

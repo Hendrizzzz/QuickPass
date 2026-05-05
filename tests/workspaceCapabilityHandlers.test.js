@@ -20,6 +20,63 @@ function clone(value) {
     return JSON.parse(JSON.stringify(value))
 }
 
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function assertNoRendererLaunchLeaks(value) {
+    assert.doesNotMatch(value, /https?:\/\//i)
+    assert.doesNotMatch(value, /accounts\.example\/callback/i)
+    assert.doesNotMatch(value, /localhost/i)
+    assert.doesNotMatch(value, /127\.0\.0\.1/i)
+    assert.doesNotMatch(value, /\[::1\]/i)
+    assert.doesNotMatch(value, /3000\/callback/i)
+    assert.doesNotMatch(value, /3000\/path/i)
+    assert.doesNotMatch(value, /5173\/path/i)
+    assert.doesNotMatch(value, /5173\/callback/i)
+    assert.doesNotMatch(value, /code=abc/i)
+    assert.doesNotMatch(value, /tokenish=value/i)
+    assert.doesNotMatch(value, /dev\.a1/i)
+    assert.doesNotMatch(value, /dev\.abc/i)
+    assert.doesNotMatch(value, /dev\.abc-1/i)
+    assert.doesNotMatch(value, /dev\.\.example/i)
+    assert.doesNotMatch(value, /example\.\.com/i)
+    assert.doesNotMatch(value, /\ba\.\.b\b/i)
+    assert.doesNotMatch(value, /abc-1/i)
+    assert.doesNotMatch(value, /team\.env2/i)
+    assert.doesNotMatch(value, /dev_a/i)
+    assert.doesNotMatch(value, /foo_bar/i)
+    assert.doesNotMatch(value, /\bbaz1\b/i)
+    assert.doesNotMatch(value, /a_b/i)
+    assert.doesNotMatch(value, /\u4f8b\u5b50\.\u6d4b\u8bd5/u)
+    assert.doesNotMatch(value, /\u03b4\u03bf\u03ba\u03b9\u03bc\u03ae\.example/u)
+    assert.doesNotMatch(value, /xn--fsqu00a/i)
+    assert.doesNotMatch(value, /xn--0zwm56d/i)
+    assert.doesNotMatch(value, /xn--jxalpdlp/i)
+    assert.doesNotMatch(value, /\ba1\b/i)
+    assert.doesNotMatch(value, /\benv2\b/i)
+    assert.doesNotMatch(value, /env2:5173/i)
+    assert.doesNotMatch(value, /a1:3000/i)
+    assert.doesNotMatch(value, /\[redacted-url\]-1/i)
+    assert.doesNotMatch(value, /a_b\.\[redacted-url\]/i)
+    assert.doesNotMatch(value, /-1:3000/i)
+    assert.doesNotMatch(value, /raw-launch-token/i)
+    assert.doesNotMatch(value, /hunter2/i)
+    assert.doesNotMatch(value, /C:\\/i)
+    assert.doesNotMatch(value, /Users\\Alice/i)
+    assert.doesNotMatch(value, /BrowserProfile/i)
+    assert.doesNotMatch(value, /\bcap_[a-f0-9]{12,96}\b/i)
+    assert.doesNotMatch(value, /--token/i)
+    assert.doesNotMatch(value, /--password/i)
+    assert.doesNotMatch(value, /normalizedUrl/i)
+    assert.doesNotMatch(value, /finalUrl/i)
+    assert.doesNotMatch(value, /launchArgs/i)
+    assert.doesNotMatch(value, /capabilityId/i)
+    assert.doesNotMatch(value, /realPid/i)
+    assert.doesNotMatch(value, /pid["\s:=]*4242/i)
+    assert.doesNotMatch(value, /pid["\s:=]*9999/i)
+}
+
 const ACCOUNT_SLOT = {
     id: `acct_${'c3'.repeat(24)}`,
     provider: 'google',
@@ -416,6 +473,495 @@ test('USB-local executable browse saves and launches through manifest-backed vau
         assert.equal(harness.calls.launchedWorkspace.desktopApps[0].path, join(harness.vaultDir, 'Apps', 'Imported_App', 'Imported.exe'))
         assert.equal(harness.calls.launchedWorkspace.desktopApps[0].launchSourceType, 'vault-archive')
         assert.deepEqual(harness.calls.sent.map(item => item.channel), ['launch-status', 'launch-complete'])
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('launch handler does not send launch-complete until launch work settles', async () => {
+    const harness = createHarness()
+    try {
+        harness.writeWorkspace({
+            webTabs: [{ url: 'https://example.com', enabled: true }],
+            desktopApps: []
+        })
+
+        let resolveLaunch
+        const launchGate = new Promise(resolve => {
+            resolveLaunch = resolve
+        })
+        const deps = harness.createLaunchDeps()
+        deps.launchWorkspace = async (workspace, status, launchVaultDir, options) => {
+            harness.calls.launchedWorkspace = clone(workspace)
+            harness.calls.launchVaultDir = launchVaultDir
+            harness.calls.launchOptions = options
+            status('launching slow app')
+            await launchGate
+            return {
+                webResults: [],
+                appResults: [{ type: 'app', success: true, name: 'Slow App' }]
+            }
+        }
+
+        const result = await launchWorkspaceHandlerCore({
+            event: { sender: { id: 1 } },
+            deps
+        })
+
+        assert.equal(result.success, true)
+        await delay(5)
+        assert.equal(harness.calls.launchPromise instanceof Promise, true)
+        assert.deepEqual(harness.calls.sent.map(item => item.channel), ['launch-status'])
+
+        resolveLaunch()
+        await harness.calls.launchPromise
+        assert.deepEqual(harness.calls.sent.map(item => item.channel), ['launch-status', 'launch-complete'])
+        assert.equal(harness.calls.sent[1].payload.success, true)
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('manual launch IPC redacts status and complete results while preserving partial metadata', async () => {
+    const harness = createHarness()
+    try {
+        const record = createCapabilityRecord({
+            type: 'host-exe',
+            provenance: 'browse-exe',
+            displayName: 'Portable Notes',
+            launch: {
+                path: 'C:\\Program Files\\Portable Notes\\Notes.exe'
+            },
+            policy: {
+                allowedArgs: 'none',
+                canCloseFromWipesnap: true,
+                ownership: 'owned-process'
+            }
+        })
+        harness.writeWorkspace({
+            webTabs: [{ url: 'https://accounts.example/callback?token=raw-launch-token#frag', enabled: true }],
+            desktopApps: [{
+                capabilityId: record.capabilityId,
+                displayName: 'Portable Notes',
+                enabled: true
+            }],
+            [WORKSPACE_CAPABILITY_VAULT_KEY]: {
+                version: 1,
+                records: {
+                    [record.capabilityId]: record
+                }
+            }
+        })
+
+        let finishAppLaunch
+        const appLaunchGate = new Promise(resolve => {
+            finishAppLaunch = resolve
+        })
+        const deps = harness.createLaunchDeps()
+        deps.launchWorkspace = async (workspace, status, launchVaultDir, options) => {
+            harness.calls.launchedWorkspace = clone(workspace)
+            harness.calls.launchVaultDir = launchVaultDir
+            harness.calls.launchOptions = options
+            status('[Tab 1] Loading https://accounts.example/callback?token=raw-launch-token#frag...')
+            status('[Tab 1] [WARN] https://accounts.example/callback?token=raw-launch-token#frag - Failed at C:\\Users\\Alice\\BrowserProfile token=raw-launch-token')
+            status('[App 1] Launching Portable Notes...')
+            status(`[App 1] [WARN] Portable Notes - Resolved path not found: C:\\Users\\Alice\\Portable.exe --token=raw-launch-token ${record.capabilityId} pid=4242`)
+            await appLaunchGate
+            status('[App 1] [OK] Portable Notes - launched pid=4242')
+            return {
+                webResults: [{
+                    type: 'web',
+                    tabIndex: 1,
+                    url: 'https://accounts.example/callback?token=raw-launch-token#frag',
+                    normalizedUrl: 'https://accounts.example/callback?token=raw-launch-token#frag',
+                    finalUrl: 'https://accounts.example/final?token=raw-launch-token#done',
+                    title: 'Token raw-launch-token',
+                    success: false,
+                    error: 'Failed at C:\\Users\\Alice\\BrowserProfile token=raw-launch-token',
+                    errors: [{ message: `blocked ${record.capabilityId}`, pid: 4242 }]
+                }],
+                appResults: [{
+                    type: 'app',
+                    name: 'Portable Notes',
+                    success: true,
+                    path: 'C:\\Users\\Alice\\Portable.exe',
+                    exePath: 'C:\\Users\\Alice\\Portable.exe',
+                    capabilityId: record.capabilityId,
+                    launchArgs: ['--token=raw-launch-token'],
+                    pid: 4242,
+                    realPid: 4242
+                }]
+            }
+        }
+
+        const result = await launchWorkspaceHandlerCore({
+            event: { sender: { id: 1 } },
+            deps
+        })
+
+        assert.equal(result.success, true)
+        await delay(5)
+        assert.equal(harness.calls.launchPromise instanceof Promise, true)
+        assert.equal(harness.calls.sent.some(item => item.channel === 'launch-complete'), false)
+
+        finishAppLaunch()
+        await harness.calls.launchPromise
+
+        const serializedSent = JSON.stringify(harness.calls.sent)
+        assertNoRendererLaunchLeaks(serializedSent)
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[Tab 1] Loading Saved browser tab 1...'))
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[Tab 1] [WARN] Saved browser tab 1 - Browser tab failed to load.'))
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[App 1] Launching Portable Notes...'))
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[App 1] [WARN] Portable Notes - Desktop item failed to launch.'))
+
+        const complete = harness.calls.sent.find(item => item.channel === 'launch-complete')
+        assert.equal(complete.payload.success, true)
+        assert.equal(complete.payload.results.metadataOnly, true)
+        assert.deepEqual(complete.payload.results.webResults, [{
+            type: 'web',
+            itemKey: 'tab-1',
+            tabIndex: 1,
+            url: 'Saved browser tab 1',
+            success: false,
+            skipped: false,
+            error: 'Browser tab failed to load.',
+            reason: 'Browser tab failed to load.'
+        }])
+        assert.deepEqual(complete.payload.results.appResults, [{
+            type: 'app',
+            itemKey: 'app-1',
+            appIndex: 1,
+            name: 'Portable Notes',
+            success: true,
+            skipped: false
+        }])
+        assert.deepEqual(complete.payload.results.summary.browserTabs, {
+            total: 1,
+            succeeded: 0,
+            failed: 1,
+            skipped: 0
+        })
+        assert.deepEqual(complete.payload.results.summary.desktopApps, {
+            total: 1,
+            succeeded: 1,
+            failed: 0,
+            skipped: 0
+        })
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('manual launch IPC redacts no-scheme local URLs across status and result metadata', async () => {
+    const harness = createHarness()
+    try {
+        const record = createCapabilityRecord({
+            type: 'host-exe',
+            provenance: 'browse-exe',
+            displayName: 'Local Dev Tool',
+            launch: {
+                path: 'C:\\Program Files\\Local Dev Tool\\Tool.exe'
+            },
+            policy: {
+                allowedArgs: 'none',
+                canCloseFromWipesnap: true,
+                ownership: 'owned-process'
+            }
+        })
+        harness.writeWorkspace({
+            webTabs: [{ url: 'https://example.com', enabled: true }],
+            desktopApps: [{
+                capabilityId: record.capabilityId,
+                displayName: 'Local Dev Tool',
+                enabled: true
+            }],
+            [WORKSPACE_CAPABILITY_VAULT_KEY]: {
+                version: 1,
+                records: {
+                    [record.capabilityId]: record
+                }
+            }
+        })
+
+        const deps = harness.createLaunchDeps()
+        deps.launchWorkspace = async (workspace, status, launchVaultDir, options) => {
+            harness.calls.launchedWorkspace = clone(workspace)
+            harness.calls.launchVaultDir = launchVaultDir
+            harness.calls.launchOptions = options
+            status('[Tab 1] [WARN] localhost:3000/callback?code=abc#frag failed (Timeout); retrying...')
+            status('[Tab 1] [WARN] localhost/callback?code=abc#frag - Local retry')
+            status('[Tab 1] [WARN] 127.0.0.1:5173/path?tokenish=value#frag - Timeout')
+            status('[Tab 1] [WARN] [::1]:3000/path?code=abc - Timeout')
+            status('[App 1] Launching [::1]:3000/path?code=abc...')
+            status('[App 1] [WARN] localhost:3000/callback?code=abc#frag - failed near 127.0.0.1:5173/path?tokenish=value#frag')
+            return {
+                webResults: [{
+                    type: 'web',
+                    tabIndex: 1,
+                    url: 'localhost:3000/callback?code=abc#frag',
+                    normalizedUrl: '127.0.0.1:5173/path?tokenish=value#frag',
+                    finalUrl: '[::1]:3000/path?code=abc',
+                    success: false,
+                    error: '[::1]:3000/path?code=abc'
+                }],
+                appResults: [{
+                    type: 'app',
+                    name: '127.0.0.1:5173/path?tokenish=value#frag',
+                    success: false,
+                    error: 'localhost:3000/callback?code=abc#frag'
+                }]
+            }
+        }
+
+        const result = await launchWorkspaceHandlerCore({
+            event: { sender: { id: 1 } },
+            deps
+        })
+
+        assert.equal(result.success, true)
+        await harness.calls.launchPromise
+
+        const serializedSent = JSON.stringify(harness.calls.sent)
+        assertNoRendererLaunchLeaks(serializedSent)
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[Tab 1] [WARN] Saved browser tab 1 - Browser tab failed to load.'))
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[Tab 1] [WARN] Saved browser tab 1 - Local retry'))
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[Tab 1] [WARN] Saved browser tab 1 - Timeout'))
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[App 1] Launching Desktop item 1...'))
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[App 1] [WARN] Desktop item 1 - Desktop item failed to launch.'))
+
+        const complete = harness.calls.sent.find(item => item.channel === 'launch-complete')
+        assert.equal(complete.payload.success, true)
+        assert.deepEqual(complete.payload.results.webResults, [{
+            type: 'web',
+            itemKey: 'tab-1',
+            tabIndex: 1,
+            url: 'Saved browser tab 1',
+            success: false,
+            skipped: false,
+            error: 'Browser tab failed to load.',
+            reason: 'Browser tab failed to load.'
+        }])
+        assert.deepEqual(complete.payload.results.appResults, [{
+            type: 'app',
+            itemKey: 'app-1',
+            appIndex: 1,
+            name: 'Desktop item 1',
+            success: false,
+            skipped: false,
+            error: 'Desktop item failed to launch.',
+            reason: 'Desktop item failed to launch.'
+        }])
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('manual launch IPC redacts accepted dotted no-scheme host URLs', async () => {
+    const harness = createHarness()
+    try {
+        const record = createCapabilityRecord({
+            type: 'host-exe',
+            provenance: 'browse-exe',
+            displayName: 'Host Port Tool',
+            launch: {
+                path: 'C:\\Program Files\\Host Port Tool\\Tool.exe'
+            },
+            policy: {
+                allowedArgs: 'none',
+                canCloseFromWipesnap: true,
+                ownership: 'owned-process'
+            }
+        })
+        harness.writeWorkspace({
+            webTabs: [{ url: 'https://example.com', enabled: true }],
+            desktopApps: [{
+                capabilityId: record.capabilityId,
+                displayName: 'Host Port Tool',
+                enabled: true
+            }],
+            [WORKSPACE_CAPABILITY_VAULT_KEY]: {
+                version: 1,
+                records: {
+                    [record.capabilityId]: record
+                }
+            }
+        })
+
+        const deps = harness.createLaunchDeps()
+        const idnChineseUrl = '\u4f8b\u5b50.\u6d4b\u8bd5/path?code=abc#frag'
+        const idnGreekUrl = '\u03b4\u03bf\u03ba\u03b9\u03bc\u03ae.example/path?code=abc#frag'
+        deps.launchWorkspace = async (workspace, status, launchVaultDir, options) => {
+            harness.calls.launchedWorkspace = clone(workspace)
+            harness.calls.launchVaultDir = launchVaultDir
+            harness.calls.launchOptions = options
+            status('[Tab 1] Loading dev.a1...')
+            status('[Tab 1] Loading dev.abc-1...')
+            status('[Tab 1] Loading dev_a.example...')
+            status('[Tab 1] Loading dev..example...')
+            status('[Tab 1] Loading foo_bar.baz1...')
+            status('[Tab 1] [WARN] dev.a1:3000/callback?code=abc#frag failed (Timeout); retrying...')
+            status('[Tab 1] [WARN] dev.abc-1 failed (Timeout); retrying...')
+            status('[Tab 1] [WARN] dev_a.example:3000/path?code=abc#frag failed (Timeout); retrying...')
+            status('[Tab 1] [WARN] dev..example:3000/path?code=abc#frag failed (Timeout); retrying...')
+            status('[Tab 1] [WARN] a..b:5173/callback?tokenish=value failed (Timeout); retrying...')
+            status('[Tab 1] [WARN] saved browser tab - failed:dev..example:3000/path?code=abc#frag')
+            status('[Tab 1] [WARN] saved browser tab - failed/dev..example:3000/path?code=abc#frag')
+            status(`[Tab 1] [WARN] saved browser tab - failed/${idnChineseUrl}`)
+            status(`[Tab 1] [WARN] saved browser tab - failed/${idnGreekUrl}`)
+            status('[Tab 1] [WARN] a_b.localhost/callback?tokenish=value failed (Timeout); retrying...')
+            status('[App 1] Launching dev.abc-1:3000/path?code=abc#frag...')
+            status('[App 1] Launching foo_bar.baz1...')
+            status('[App 1] Launching example..com...')
+            status('[App 1] [WARN] dev_a.example - a_b.localhost/callback?tokenish=value failed')
+            status('[App 1] [WARN] a..b - dev..example:3000/path?code=abc#frag failed')
+            status('[App 1] [WARN] label:a..b:5173/callback?tokenish=value - failed:dev..example:3000/path?code=abc#frag')
+            status('[App 1] [WARN] label/foo_bar.baz1 - failed/dev..example:3000/path?code=abc#frag')
+            status(`[App 1] [WARN] label/${idnChineseUrl} - failed/${idnGreekUrl}`)
+            return {
+                webResults: [{
+                    type: 'web',
+                    tabIndex: 1,
+                    url: 'dev..example',
+                    normalizedUrl: 'https://dev.abc-1:3000/path?code=abc#frag',
+                    finalUrl: 'foo_bar.baz1',
+                    success: true,
+                    error: null
+                }],
+                appResults: [{
+                    type: 'app',
+                    name: 'example..com',
+                    success: false,
+                    error: 'a..b:5173/callback?tokenish=value'
+                }]
+            }
+        }
+
+        const result = await launchWorkspaceHandlerCore({
+            event: { sender: { id: 1 } },
+            deps
+        })
+
+        assert.equal(result.success, true)
+        await harness.calls.launchPromise
+
+        const serializedSent = JSON.stringify(harness.calls.sent)
+        assertNoRendererLaunchLeaks(serializedSent)
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[Tab 1] Loading Saved browser tab 1...'))
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[Tab 1] [WARN] Saved browser tab 1 - Browser tab failed to load.'))
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[App 1] Launching Desktop item 1...'))
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[App 1] [WARN] Desktop item 1 - Desktop item failed to launch.'))
+
+        const complete = harness.calls.sent.find(item => item.channel === 'launch-complete')
+        assert.equal(complete.payload.success, true)
+        assert.deepEqual(complete.payload.results.webResults, [{
+            type: 'web',
+            itemKey: 'tab-1',
+            tabIndex: 1,
+            url: 'Saved browser tab 1',
+            success: true,
+            skipped: false
+        }])
+        assert.deepEqual(complete.payload.results.appResults, [{
+            type: 'app',
+            itemKey: 'app-1',
+            appIndex: 1,
+            name: 'Desktop item 1',
+            success: false,
+            skipped: false,
+            error: 'Desktop item failed to launch.',
+            reason: 'Desktop item failed to launch.'
+        }])
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('manual launch IPC preserves ordinary dotted sentence punctuation', async () => {
+    const harness = createHarness()
+    try {
+        harness.writeWorkspace({
+            webTabs: [{ url: 'https://example.com', enabled: true }],
+            desktopApps: []
+        })
+
+        const deps = harness.createLaunchDeps()
+        deps.launchWorkspace = async (_workspace, status) => {
+            status('Workspace unavailable.')
+            status('[Tab 1] [WARN] Saved browser tab - unavailable.')
+            status('[App 1] [INFO] Desktop item - ready.')
+            return { webResults: [], appResults: [] }
+        }
+
+        const result = await launchWorkspaceHandlerCore({
+            event: { sender: { id: 1 } },
+            deps
+        })
+
+        assert.equal(result.success, true)
+        await harness.calls.launchPromise
+
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === 'Workspace unavailable.'))
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[Tab 1] [WARN] Saved browser tab 1 - unavailable.'))
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[App 1] [INFO] Desktop item - ready.'))
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('manual launch-complete failure errors are sanitized before reaching renderer', async () => {
+    const harness = createHarness()
+    try {
+        harness.writeWorkspace({
+            webTabs: [{ url: 'https://example.com', enabled: true }],
+            desktopApps: []
+        })
+
+        const deps = harness.createLaunchDeps()
+        const idnChineseUrl = '\u4f8b\u5b50.\u6d4b\u8bd5/path?code=abc#frag'
+        const idnGreekUrl = '\u03b4\u03bf\u03ba\u03b9\u03bc\u03ae.example/path?code=abc#frag'
+        deps.launchWorkspace = async () => {
+            throw new Error(`spawn C:\\Users\\Alice\\Portable.exe --password=hunter2 token=raw-launch-token localhost:3000/callback?code=abc#frag 127.0.0.1:5173/path?tokenish=value#frag [::1]:3000/path?code=abc dev.a1 dev.abc-1 team.env2 dev_a.example foo_bar.baz1 a_b.localhost/callback?tokenish=value dev..example:3000/path?code=abc#frag failed:dev..example:3000/path?code=abc#frag failed/dev..example:3000/path?code=abc#frag failed/${idnChineseUrl} failed/${idnGreekUrl} label:a..b:5173/callback?tokenish=value a..b:5173/callback?tokenish=value example..com cap_aaaaaaaaaaaaaaaaaaaaaaaa pid=9999`)
+        }
+
+        const result = await launchWorkspaceHandlerCore({
+            event: { sender: { id: 1 } },
+            deps
+        })
+
+        assert.equal(result.success, true)
+        await harness.calls.launchPromise
+
+        const complete = harness.calls.sent.find(item => item.channel === 'launch-complete')
+        assert.equal(complete.payload.success, false)
+        assert.equal(complete.payload.error, 'Workspace launch failed. Review diagnostics before retrying.')
+        assertNoRendererLaunchLeaks(JSON.stringify(complete.payload))
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('manual launch start failures returned by invoke are sanitized', async () => {
+    const harness = createHarness()
+    try {
+        harness.writeWorkspace({ webTabs: [], desktopApps: [] })
+        const deps = harness.createLaunchDeps()
+        const idnChineseUrl = '\u4f8b\u5b50.\u6d4b\u8bd5/path?code=abc#frag'
+        const idnGreekUrl = '\u03b4\u03bf\u03ba\u03b9\u03bc\u03ae.example/path?code=abc#frag'
+        deps.loadActiveVaultWorkspace = () => {
+            throw new Error(`Vault load failed at C:\\Users\\Alice\\vault.json token=raw-launch-token dev.abc-1:3000/path?code=abc#frag dev_a.example:3000/path?code=abc#frag dev..example:3000/path?code=abc#frag failed:dev..example:3000/path?code=abc#frag failed/dev..example:3000/path?code=abc#frag failed/${idnChineseUrl} failed/${idnGreekUrl} label:a..b:5173/callback?tokenish=value a..b example..com cap_aaaaaaaaaaaaaaaaaaaaaaaa`)
+        }
+
+        const result = await launchWorkspaceHandlerCore({
+            event: { sender: { id: 1 } },
+            deps
+        })
+
+        assert.equal(result.success, false)
+        assert.equal(result.error, 'Workspace launch could not start.')
+        assertNoRendererLaunchLeaks(JSON.stringify(result))
+        assert.equal(harness.calls.closeBrowser, 0)
+        assert.equal(harness.calls.closeDesktopApps, 0)
+        assert.equal(harness.calls.launchPromise, null)
     } finally {
         harness.cleanup()
     }

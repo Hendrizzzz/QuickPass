@@ -449,7 +449,20 @@ function finalStateLabel(state) {
     return 'Unknown'
 }
 
-function lifecycleGuidance(finalState) {
+function lifecycleGuidance(finalState, {
+    browserCopyInFailed = false,
+    browserLaunchFailed = false,
+    browserCopyOutFailed = false
+} = {}) {
+    if (browserCopyInFailed) {
+        return 'Browser profile copy-in failed, so browser launch was blocked to protect the portable profile. Keep the drive connected, review diagnostics, and resolve the profile access issue before launching again.'
+    }
+    if (browserLaunchFailed) {
+        return 'Browser launch failed from the managed profile. Sync-back was blocked to protect the portable profile; review diagnostics before launching again.'
+    }
+    if (browserCopyOutFailed) {
+        return 'Browser profile sync-back needs attention. Keep the drive connected, close remaining browser windows, reopen Wipesnap, and review diagnostics before unplugging.'
+    }
     if (finalState === 'synced') {
         return 'Last diagnostics show sync-back and cleanup completed.'
     }
@@ -554,12 +567,13 @@ function summarizeCleanupLifecycle(cleanup, phases) {
     }
 }
 
-function deriveFinalState({ browserSyncBack, appSessionSyncBack, cleanup }) {
+function deriveFinalState({ browserSyncBack, appSessionSyncBack, cleanup, launchActionNeeded = false }) {
     const syncFailed = browserSyncBack.status === 'failed' || appSessionSyncBack.status === 'failed'
     const syncNeedsAttention = [browserSyncBack.status, appSessionSyncBack.status].some(status =>
         ['unknown', 'running', 'deferred', 'blocked'].includes(status)
     )
     if (cleanup.status === 'failed') return 'cleanup-failed'
+    if (launchActionNeeded) return 'action-needed'
     if (syncFailed || syncNeedsAttention || ['blocked', 'started'].includes(cleanup.status)) return 'action-needed'
     if (cleanup.status === 'deferred') return 'cleanup-deferred'
     if (cleanup.status === 'completed') {
@@ -574,11 +588,19 @@ function summarizeLifecycle({ selectedCycle, phases, apps, browser, cleanup, err
         phaseNamed(phases, 'workspace-cleanup') ||
         phaseNamed(phases, 'browser-copy-out') ||
         cleanup.present
+    const browserCopyInFailed = phaseFailed(phases, 'browser-copy-in') || errorsForContext(errors, /browser-copy-in/i)
+    const browserLaunchFailed = phaseFailed(phases, 'browser-launch') || errorsForContext(errors, /browser-launch/i)
+    const browserCopyOutFailed = phaseFailed(phases, 'browser-copy-out') || errorsForContext(errors, /browser-copy-out/i)
     const browserSyncBack = summarizeBrowserSyncBack({ browser, phases, errors, quitRequested })
     const appSessionSyncBack = summarizeAppSessionSyncBack(apps)
     const cleanupLifecycle = summarizeCleanupLifecycle(cleanup, phases)
     const finalState = sanitizeStatus(
-        deriveFinalState({ browserSyncBack, appSessionSyncBack, cleanup: cleanupLifecycle }),
+        deriveFinalState({
+            browserSyncBack,
+            appSessionSyncBack,
+            cleanup: cleanupLifecycle,
+            launchActionNeeded: browserCopyInFailed || browserLaunchFailed
+        }),
         'unknown',
         FINAL_STATE_VALUES
     )
@@ -595,7 +617,11 @@ function summarizeLifecycle({ selectedCycle, phases, apps, browser, cleanup, err
         cleanup: cleanupLifecycle,
         finalState,
         finalStateLabel: finalStateLabel(finalState),
-        recoveryGuidance: lifecycleGuidance(finalState)
+        recoveryGuidance: lifecycleGuidance(finalState, {
+            browserCopyInFailed,
+            browserLaunchFailed,
+            browserCopyOutFailed
+        })
     }
 }
 
