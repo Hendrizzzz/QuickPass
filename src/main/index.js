@@ -96,6 +96,11 @@ import {
     saveWorkspaceHandlerCore
 } from './workspaceCapabilityHandlers.js'
 import {
+    sanitizeRendererLaunchError,
+    sanitizeRendererLaunchStatusMessage,
+    summarizeTrustedAutoLaunchResults
+} from './launchRendererStatus.js'
+import {
     metaHasLaunchCapabilityMaterial,
     sanitizeVaultMetaForRenderer,
     stripLaunchCapabilityMaterialFromMeta
@@ -458,55 +463,6 @@ function trackLaunchPromise(promise) {
     }).catch(() => {})
 }
 
-function sanitizeAutoLaunchText(value, fallback = '') {
-    const text = String(value || '')
-        .replace(/https?:\/\/[^\s"'<>]+/gi, '[redacted-url]')
-        .replace(/[?#][A-Za-z0-9_=&%.-]+/g, '')
-        .replace(/[A-Za-z]:\\[^\r\n"']+/g, '[redacted-path]')
-        .replace(/\\\\[^\s"']+/g, '[redacted-path]')
-        .replace(/\bcap_[A-Za-z0-9_-]{4,128}\b/g, '[redacted-id]')
-        .replace(/\bpatchrev_[A-Za-z0-9_-]{4,128}\b/g, '[redacted-id]')
-        .replace(/\s+/g, ' ')
-        .trim()
-    return text || fallback
-}
-
-function sanitizeAutoLaunchStatusMessage(message) {
-    const text = sanitizeAutoLaunchText(message, 'Launching workspace item')
-    if (/^\[Tab\s+\d+\]/i.test(text)) {
-        return text
-            .replace(/\[OK\]\s+.*?(?:\s+-\s+ready)?$/i, '[OK] Browser tab - ready')
-            .replace(/\[WARN\]\s+.*$/i, '[WARN] Browser tab - launch status unavailable')
-    }
-    if (/^\[App\s+\d+\]/i.test(text)) {
-        return text
-            .replace(/\[OK\]\s+.*?(?:\s+-\s+launched)?$/i, '[OK] Desktop item - launched')
-            .replace(/\[WARN\]\s+.*$/i, '[WARN] Desktop item - launch status unavailable')
-    }
-    return text
-}
-
-function summarizeAutoLaunchResults(results) {
-    const webResults = Array.isArray(results?.webResults) ? results.webResults : []
-    const appResults = Array.isArray(results?.appResults) ? results.appResults : []
-    const summarize = (items) => ({
-        total: items.length,
-        succeeded: items.filter(item => item?.success === true).length,
-        failed: items.filter(item => item && item.success === false && item.skipped !== true).length,
-        skipped: items.filter(item => item?.skipped === true).length
-    })
-    return {
-        metadataOnly: true,
-        webResults: [],
-        appResults: [],
-        summary: {
-            browserTabs: summarize(webResults),
-            desktopApps: summarize(appResults),
-            metadataOnly: true
-        }
-    }
-}
-
 function emitTrustedAutoLaunchStatus(status) {
     const safeStatus = trustedAutoLaunchStatusContainsForbiddenMaterial(status)
         ? {
@@ -546,14 +502,14 @@ async function launchTrustedAutoLaunchWorkspace(launchWorkspaceConfig, context =
         await closeBrowser()
         await closeDesktopApps()
         return launchWorkspace(launchWorkspaceConfig, (statusMsg) => {
-            const safeStatus = sanitizeAutoLaunchStatusMessage(statusMsg)
+            const safeStatus = sanitizeRendererLaunchStatusMessage(statusMsg)
             for (const win of BrowserWindow.getAllWindows()) {
                 try { win.webContents.send('launch-status', safeStatus) } catch (_) { }
             }
         }, vaultDir, { skipDiagnosticsCycle: true })
     }
     const launchPromise = doLaunch().then((results) => {
-        const sanitizedResults = summarizeAutoLaunchResults(results)
+        const sanitizedResults = summarizeTrustedAutoLaunchResults(results)
         for (const win of BrowserWindow.getAllWindows()) {
             try {
                 win.webContents.send('launch-complete', {
@@ -571,7 +527,7 @@ async function launchTrustedAutoLaunchWorkspace(launchWorkspaceConfig, context =
             try {
                 win.webContents.send('launch-complete', {
                     success: false,
-                    error: sanitizeAutoLaunchText(err.message, 'Trusted auto-launch failed.'),
+                    error: sanitizeRendererLaunchError(err, 'Trusted auto-launch failed.'),
                     autoLaunch: true,
                     metadataOnly: true
                 })

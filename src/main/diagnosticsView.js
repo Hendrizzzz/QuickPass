@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, statSync } from 'fs'
 import { join } from 'path'
+import { sanitizeManualLaunchText } from './workspaceCapabilityHandlers.js'
 
 export const DIAGNOSTICS_FILE_NAME = 'run-diagnostics.json'
 export const MAX_DIAGNOSTICS_BYTES = 1024 * 1024
@@ -130,18 +131,7 @@ function limitString(value, maxLength = MAX_MESSAGE_LENGTH) {
 }
 
 function redactSensitiveText(value, maxLength = MAX_MESSAGE_LENGTH) {
-    let text = limitString(value, maxLength * 2)
-    if (!text) return ''
-
-    text = text
-        .replace(/file:\/\/\/[^\s"')]+/gi, '[redacted-path]')
-        .replace(/\\\\[^\s"')]+/g, '[redacted-path]')
-        .replace(/[a-zA-Z]:\\[^\r\n"']+/g, '[redacted-path]')
-        .replace(/\b(https?:\/\/[^\s?#]+)[^\s]*/gi, '$1[redacted-url-detail]')
-        .replace(/\b(password|pin|token|secret|cookie|credential|auth|key|fastboot)([\w.-]{0,24})\s*[:=]\s*[^,;\s]+/gi, '$1$2=[redacted]')
-        .replace(/\b[A-Fa-f0-9]{32,}\b/g, '[redacted-token]')
-        .replace(/\b[A-Za-z0-9+/]{40,}={0,2}\b/g, '[redacted-token]')
-
+    const text = sanitizeManualLaunchText(value, '')
     return limitString(text, maxLength)
 }
 
@@ -511,6 +501,7 @@ function summarizeAppSessionSyncBack(apps) {
     const deferred = syncApps.filter(app => app.appSessionSyncBackStatus === 'deferred').length
     const completed = syncApps.filter(app => app.appSessionSyncBackStatus === 'completed').length
     const running = syncApps.filter(app => app.appSessionSyncBackStatus === 'running').length
+    const unknown = syncApps.filter(app => app.appSessionSyncBackStatus === 'unknown').length
     const status = failed > 0
         ? 'failed'
         : blocked > 0
@@ -519,11 +510,13 @@ function summarizeAppSessionSyncBack(apps) {
                 ? 'deferred'
                 : running > 0
                     ? 'running'
-                    : completed > 0
-                        ? 'completed'
-                        : syncApps.length > 0
-                            ? 'unknown'
-                            : 'not-run'
+                    : unknown > 0 || completed < syncApps.length
+                        ? 'unknown'
+                        : completed > 0
+                            ? 'completed'
+                            : syncApps.length > 0
+                                ? 'unknown'
+                                : 'not-run'
 
     return {
         status,
@@ -531,7 +524,8 @@ function summarizeAppSessionSyncBack(apps) {
         completed,
         failed,
         deferred,
-        blocked
+        blocked,
+        unknown
     }
 }
 
@@ -747,9 +741,11 @@ function summarizeErrors(errors = []) {
     }))
 }
 
-function computeSummaryStatus({ browser, phases, apps, failures, warnings }) {
+function computeSummaryStatus({ browser, phases, apps, failures, warnings, lifecycle }) {
     if (failures.length > 0 || browser.status === 'failed') return 'failed'
+    if (lifecycle?.finalState === 'cleanup-failed') return 'failed'
     if (warnings.length > 0 || phases.some(phase => isWarningStatus(phase.status)) || apps.some(app => hasSummarizedAppWarning(app))) return 'warning'
+    if (lifecycle && ['action-needed', 'unknown', 'cleanup-deferred'].includes(lifecycle.finalState)) return 'warning'
     if (phases.length || apps.length || browser.present) return 'ok'
     return 'empty'
 }
@@ -770,7 +766,6 @@ function buildSummary(raw, sizeBytes) {
     const diagnosticErrors = summarizeErrors(selectedCycle.errors || [])
     const warnings = collectWarnings({ phases, apps, browser, cleanup, imports })
     const failures = collectFailures({ phases, apps, browser, errors: diagnosticErrors })
-    const status = computeSummaryStatus({ browser, phases, apps, failures, warnings })
     const lifecycle = summarizeLifecycle({
         selectedCycle,
         phases,
@@ -779,6 +774,7 @@ function buildSummary(raw, sizeBytes) {
         cleanup,
         errors: diagnosticErrors
     })
+    const status = computeSummaryStatus({ browser, phases, apps, failures, warnings, lifecycle })
 
     return {
         success: true,
@@ -788,7 +784,11 @@ function buildSummary(raw, sizeBytes) {
         message: status === 'ok'
             ? 'Last diagnostics look healthy.'
             : status === 'warning'
-                ? 'Last diagnostics include warnings.'
+                ? lifecycle.finalState === 'action-needed'
+                    ? 'Last diagnostics need attention before unplugging.'
+                    : lifecycle.finalState === 'unknown'
+                        ? 'Last diagnostics have an unknown final state.'
+                        : 'Last diagnostics include warnings.'
                 : status === 'failed'
                     ? 'Last diagnostics include failures.'
                     : 'Diagnostics did not contain a recorded run.',

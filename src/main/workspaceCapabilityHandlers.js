@@ -512,7 +512,7 @@ function limitManualLaunchText(value, limit = MANUAL_LAUNCH_TEXT_LIMIT) {
     return `${text.slice(0, Math.max(0, limit - 3)).trim()}...`
 }
 
-function sanitizeManualLaunchText(value, fallback = 'Launch status unavailable.') {
+export function sanitizeManualLaunchText(value, fallback = 'Launch status unavailable.') {
     if (typeof value !== 'string') return fallback
     let text = value
         .replace(/[\u0000-\u001f\u007f]+/g, ' ')
@@ -529,15 +529,41 @@ function sanitizeManualLaunchText(value, fallback = 'Launch status unavailable.'
         .replace(/\b(?:[A-Za-z0-9_-]+\.)+[A-Za-z]{2,}(?::\d{1,5})?(?:[/?#][^\s"'<>]*)?/g, '[redacted-url]')
     text = redactValidatedManualBrowserUrls(text)
     text = text
-        .replace(/\bHK(?:CU|LM|CR|U|CC)\\[^\s"'<>]+/gi, '[redacted-registry]')
-        .replace(/\b[A-Za-z]:\\[^\r\n"'<>|]+/g, '[redacted-path]')
-        .replace(/\\\\[^\s"'<>|]+/g, '[redacted-path]')
+        .replace(/\b(?:HKEY_(?:CURRENT_USER|LOCAL_MACHINE|CLASSES_ROOT|USERS|CURRENT_CONFIG)|HK(?:CU|LM|CR|U|CC))(?::)?[\\/][^\s"'<>]+/gi, '[redacted-registry]')
+        .replace(/\b[A-Za-z]:[\\/][^\r\n"'<>|]+/g, '[redacted-path]')
+        .replace(/(?:\\\\|\/\/)[^\s"'<>|]+/g, '[redacted-path]')
+        .replace(/\$\{env:(?:LOCALAPPDATA|APPDATA|USERPROFILE)\}[\\/][^\r\n"'<>|]+/gi, '[redacted-path]')
+        .replace(/\$env:(?:LOCALAPPDATA|APPDATA|USERPROFILE)[\\/][^\r\n"'<>|]+/gi, '[redacted-path]')
+        .replace(/%?(?:LOCALAPPDATA|APPDATA|USERPROFILE)%?[\\/][^\r\n"'<>|]+/gi, '[redacted-path]')
+        .replace(/\b(?:Users[\\/][^\\/:"'<>|\s]+[\\/])?(?:BrowserProfile|AppData|Apps)(?:[\\/][^\r\n"'<>|]+)*/gi, '[redacted-path]')
+        .replace(/\bvault(?:\.meta|\.state)?\.json\b/gi, '[redacted-path]')
         .replace(/\bcap_[a-f0-9]{12,96}\b/gi, '[redacted-id]')
         .replace(/\b(?:pid|process(?:\s+id)?)\s*[:=#]?\s*\d{2,10}\b/gi, '[redacted-process]')
-        .replace(/\b(?:password|passwd|pass|pin|token|secret|cookie|credential|auth|key|session|synckey|privatekey)([\w.-]{0,24})\s*[:=]\s*[^,;\s)]+/gi, (match) => {
+        .replace(/\b((?:proxy[-_])?authorization)\s*[:=]\s*Bearer\s+[^\s"'<>]+/gi, (_match, name) => `${name}=[redacted]`)
+        .replace(/\b((?:proxy[-_])?authorization)\s+Bearer\s+[^\s"'<>]+/gi, (_match, name) => `${name} [redacted]`)
+        .replace(/\b(?=[A-Za-z][A-Za-z0-9_.-]*\s*[:=])[A-Za-z0-9_.-]*(?:password|passwd|pass|pin|token|secret|cookie|credential|auth|key|session|sync[-_]?key|private[-_]?key|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|auth[-_]?token|session[-_]?token|secret[-_]?key|client[-_]?secret|authorization|bearer)[A-Za-z0-9_.-]*\s*[:=]\s*\S+/gi, (match) => {
             const name = match.split(/[:=]/)[0]?.trim() || 'value'
             return `${name}=[redacted]`
         })
+        .replace(/\b(?=[A-Za-z][A-Za-z0-9_.-]*\s+)[A-Za-z0-9_.-]*(?:password|passwd|pass|pin|token|secret|cookie|credential|auth|key|session|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|auth[-_]?token|session[-_]?token|secret[-_]?key|client[-_]?secret|authorization|bearer)[A-Za-z0-9_.-]*\s+(?:"[^"]+"|'[^']+')/gi, (match) => {
+            const name = match.split(/\s+/)[0]?.trim() || 'value'
+            return `${name} [redacted]`
+        })
+        .replace(/\b(?=[A-Za-z][A-Za-z0-9_.-]*\s+)[A-Za-z0-9_.-]*(?:password|passwd|pass|pin|token|secret|cookie|credential|auth|key|session|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|auth[-_]?token|session[-_]?token|secret[-_]?key|client[-_]?secret|authorization|bearer)[A-Za-z0-9_.-]*\s+\S+/gi, (match) => {
+            const name = match.split(/\s+/)[0]?.trim() || 'value'
+            return `${name} [redacted]`
+        })
+        .replace(/\bpin\s+\d{4,8}\b/gi, 'pin [redacted]')
+        .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [redacted]')
+        .replace(/\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{16,}\b/g, '[redacted-token]')
+        .replace(/\bglpat-[A-Za-z0-9_-]{16,}\b/g, '[redacted-token]')
+        .replace(/\bsk_(?:live|test)_[A-Za-z0-9]{16,}\b/g, '[redacted-token]')
+        .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/g, '[redacted-token]')
+        .replace(/\bxox[A-Za-z0-9]*-[A-Za-z0-9-]{10,}\b/g, '[redacted-token]')
+        .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, '[redacted-token]')
+        .replace(/\bAIza[0-9A-Za-z_-]{20,}\b/g, '[redacted-token]')
+        .replace(/\bya29\.[0-9A-Za-z_-]{20,}\b/g, '[redacted-token]')
+        .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, '[redacted-token]')
         .replace(/(?:^|\s)--?[A-Za-z0-9][A-Za-z0-9_.:-]*(?:=(?:"[^"]*"|'[^']*'|[^\s]+))?/g, ' [redacted-arg]')
         .replace(/\b[A-Fa-f0-9]{32,}\b/g, '[redacted-token]')
         .replace(/\b[A-Za-z0-9+/]{40,}={0,2}\b/g, '[redacted-token]')
@@ -549,7 +575,7 @@ function sanitizeManualLaunchText(value, fallback = 'Launch status unavailable.'
 }
 
 function hasManualLaunchRedaction(value) {
-    return /\[redacted-(?:url|path|registry|id|process|arg|token|command)\]|\b(?:password|passwd|pass|pin|token|secret|cookie|credential|auth|key|session|synckey|privatekey)[\w.-]*=\[redacted\]/i.test(String(value || ''))
+    return /\[redacted(?:-(?:url|path|registry|id|process|arg|token|command))?\]/i.test(String(value || ''))
 }
 
 function sanitizeManualLaunchReason(value, fallback) {
@@ -571,7 +597,7 @@ function splitStatusLabelAndReason(body) {
     }
 }
 
-function sanitizeManualLaunchStatusMessage(message) {
+export function sanitizeManualLaunchStatusMessage(message) {
     const rawMessage = typeof message === 'string' ? message : ''
     const tabMatch = rawMessage.match(/^\[Tab\s+(\d+)\]\s*(.*)$/i)
     if (tabMatch) {
@@ -715,7 +741,7 @@ function sanitizeManualLaunchResults(results) {
     }
 }
 
-function sanitizeManualLaunchError(err, fallback = 'Workspace launch failed. Review diagnostics before retrying.') {
+export function sanitizeManualLaunchError(err, fallback = 'Workspace launch failed. Review diagnostics before retrying.') {
     const raw = typeof err === 'string' ? err : err?.message
     if (/received a launch argument outside its allowlist/i.test(String(raw || ''))) {
         return 'Saved app received a launch argument outside its allowlist.'

@@ -62,9 +62,38 @@ function assertNoRendererLaunchLeaks(value) {
     assert.doesNotMatch(value, /-1:3000/i)
     assert.doesNotMatch(value, /raw-launch-token/i)
     assert.doesNotMatch(value, /hunter2/i)
+    assert.doesNotMatch(value, /abcde/i)
+    assert.doesNotMatch(value, /@abc/i)
+    assert.doesNotMatch(value, /#abc/i)
+    assert.doesNotMatch(value, /\$abc/i)
+    assert.doesNotMatch(value, /!abc/i)
+    assert.doesNotMatch(value, /\*abc/i)
+    assert.doesNotMatch(value, /githubAccessToken/i)
+    assert.doesNotMatch(value, /mySecretKey/i)
+    assert.doesNotMatch(value, /key=hunter2/i)
+    assert.doesNotMatch(value, /auth hunter2/i)
+    assert.doesNotMatch(value, /session raw/i)
+    assert.doesNotMatch(value, /Bearer raw/i)
+    assert.doesNotMatch(value, /pin 1234/i)
+    assert.doesNotMatch(value, /ghp_/i)
+    assert.doesNotMatch(value, /github_pat_/i)
+    assert.doesNotMatch(value, /xoxb-/i)
+    assert.doesNotMatch(value, /xoxc-/i)
+    assert.doesNotMatch(value, /AKIA[A-Z0-9]+/i)
+    assert.doesNotMatch(value, /eyJ[A-Za-z0-9_-]+\./)
     assert.doesNotMatch(value, /C:\\/i)
+    assert.doesNotMatch(value, /C:\//i)
     assert.doesNotMatch(value, /Users\\Alice/i)
+    assert.doesNotMatch(value, /Users\/Alice/i)
+    assert.doesNotMatch(value, /AppData[\\/]/i)
+    assert.doesNotMatch(value, /LOCALAPPDATA/i)
+    assert.doesNotMatch(value, /USERPROFILE/i)
+    assert.doesNotMatch(value, /vault\.json/i)
     assert.doesNotMatch(value, /BrowserProfile/i)
+    assert.doesNotMatch(value, /HKEY_CURRENT_USER/i)
+    assert.doesNotMatch(value, /HKLM/i)
+    assert.doesNotMatch(value, /SecretToken/i)
+    assert.doesNotMatch(value, /SERVER\/Share/i)
     assert.doesNotMatch(value, /\bcap_[a-f0-9]{12,96}\b/i)
     assert.doesNotMatch(value, /--token/i)
     assert.doesNotMatch(value, /--password/i)
@@ -908,6 +937,351 @@ test('manual launch IPC preserves ordinary dotted sentence punctuation', async (
     }
 })
 
+test('manual launch IPC redacts Windows registry path and camel-case secret forms', async () => {
+    const harness = createHarness()
+    try {
+        const record = createCapabilityRecord({
+            type: 'host-exe',
+            provenance: 'browse-exe',
+            displayName: 'Desktop Tool',
+            launch: {
+                path: 'C:\\Program Files\\Desktop Tool\\Tool.exe'
+            },
+            policy: {
+                allowedArgs: 'none',
+                canCloseFromWipesnap: true,
+                ownership: 'owned-process'
+            }
+        })
+        harness.writeWorkspace({
+            webTabs: [{ url: 'https://example.com', enabled: true }],
+            desktopApps: [{
+                capabilityId: record.capabilityId,
+                displayName: 'Desktop Tool',
+                enabled: true
+            }],
+            [WORKSPACE_CAPABILITY_VAULT_KEY]: {
+                version: 1,
+                records: {
+                    [record.capabilityId]: record
+                }
+            }
+        })
+
+        const deps = harness.createLaunchDeps()
+        deps.launchWorkspace = async (_workspace, status) => {
+            status('[Tab 1] [WARN] Saved browser tab - HKEY_CURRENT_USER\\Software\\Alice\\SecretToken apiKey=hunter2 githubAccessToken=raw-launch-token')
+            status('[Tab 1] [WARN] Saved browser tab - BrowserProfile/Default/Cookies AppData/Local/Google/Chrome/User Data vault.json')
+            status('[Tab 1] [WARN] Saved browser tab - %LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default\\Cookies')
+            status('[Tab 1] [WARN] Saved browser tab - ${env:LOCALAPPDATA}\\Google\\Chrome\\User Data\\Default\\Cookies')
+            status('[App 1] [WARN] C:/Users/Alice/BrowserProfile/Default - HKLM:\\Software\\Alice\\SecretToken accessToken=raw-launch-token mySecretKey=hunter2')
+            status('[App 1] [WARN] Users/Alice/BrowserProfile/Default - Apps/PortableTool/cache')
+            status('[App 1] [WARN] LOCALAPPDATA\\Google\\Chrome\\User Data\\Default - $env:USERPROFILE\\AppData\\Local\\Temp')
+            status('[App 1] Launching //SERVER/Share/Secret Bearer raw-launch-token...')
+            return {
+                webResults: [{
+                    type: 'web',
+                    tabIndex: 1,
+                    url: 'https://example.com',
+                    success: false,
+                    error: '%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default\\Cookies BrowserProfile/Default/Cookies HKEY_CURRENT_USER\\Software\\Alice\\SecretToken apiKey=hunter2 githubAccessToken=raw-launch-token'
+                }],
+                appResults: [{
+                    type: 'app',
+                    name: 'Users/Alice/BrowserProfile/Default',
+                    success: false,
+                    error: 'AppData/Local/Google/Chrome/User Data //SERVER/Share/Secret refreshToken=raw-launch-token mySecretKey=hunter2 Bearer raw-launch-token'
+                }]
+            }
+        }
+
+        const result = await launchWorkspaceHandlerCore({
+            event: { sender: { id: 1 } },
+            deps
+        })
+
+        assert.equal(result.success, true)
+        await harness.calls.launchPromise
+
+        const serializedSent = JSON.stringify(harness.calls.sent)
+        assertNoRendererLaunchLeaks(serializedSent)
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[Tab 1] [WARN] Saved browser tab 1 - Browser tab failed to load.'))
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[App 1] [WARN] Desktop item 1 - Desktop item failed to launch.'))
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[App 1] Launching Desktop item 1...'))
+
+        const complete = harness.calls.sent.find(item => item.channel === 'launch-complete')
+        assert.equal(complete.payload.success, true)
+        assert.deepEqual(complete.payload.results.webResults, [{
+            type: 'web',
+            itemKey: 'tab-1',
+            tabIndex: 1,
+            url: 'Saved browser tab 1',
+            success: false,
+            skipped: false,
+            error: 'Browser tab failed to load.',
+            reason: 'Browser tab failed to load.'
+        }])
+        assert.deepEqual(complete.payload.results.appResults, [{
+            type: 'app',
+            itemKey: 'app-1',
+            appIndex: 1,
+            name: 'Desktop item 1',
+            success: false,
+            skipped: false,
+            error: 'Desktop item failed to launch.',
+            reason: 'Desktop item failed to launch.'
+        }])
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('manual launch IPC redacts standalone and whitespace secret labels', async () => {
+    const harness = createHarness()
+    try {
+        const record = createCapabilityRecord({
+            type: 'host-exe',
+            provenance: 'browse-exe',
+            displayName: 'Desktop Tool',
+            launch: {
+                path: 'C:\\Program Files\\Desktop Tool\\Tool.exe'
+            },
+            policy: {
+                allowedArgs: 'none',
+                canCloseFromWipesnap: true,
+                ownership: 'owned-process'
+            }
+        })
+        harness.writeWorkspace({
+            webTabs: [{ url: 'https://example.com', enabled: true }],
+            desktopApps: [{
+                capabilityId: record.capabilityId,
+                displayName: 'Desktop Tool',
+                enabled: true
+            }],
+            [WORKSPACE_CAPABILITY_VAULT_KEY]: {
+                version: 1,
+                records: {
+                    [record.capabilityId]: record
+                }
+            }
+        })
+
+        const deps = harness.createLaunchDeps()
+        const longQuotedSecret = `raw-launch-token-${'a'.repeat(300)}`
+        deps.launchWorkspace = async (_workspace, status) => {
+            status('[Tab 1] [WARN] Saved browser tab - token=raw-launch-token')
+            status('[Tab 1] [WARN] Saved browser tab - password=hunter2')
+            status('[Tab 1] [WARN] Saved browser tab - apiKey hunter2')
+            status('[Tab 1] [WARN] Saved browser tab - apiKey "hunter2"')
+            status("[Tab 1] [WARN] Saved browser tab - token 'raw-launch-token'")
+            status(`[Tab 1] [WARN] Saved browser tab - token "${longQuotedSecret}"`)
+            status('[Tab 1] [WARN] Saved browser tab - token raw-launch-token')
+            status('[Tab 1] [WARN] Saved browser tab - token abcde')
+            status('[Tab 1] [WARN] Saved browser tab - password @abc')
+            status('[Tab 1] [WARN] Saved browser tab - password ,hunter2')
+            status('[Tab 1] [WARN] Saved browser tab - password=,hunter2')
+            status('[Tab 1] [WARN] Saved browser tab - token #abc')
+            status('[Tab 1] [WARN] Saved browser tab - token=)raw-launch-token')
+            status('[Tab 1] [WARN] Saved browser tab - apiKey ;hunter2')
+            status('[App 1] [WARN] Desktop Tool - secret=hunter2 cookie=raw-launch-token')
+            status('[App 1] [WARN] Desktop Tool - pin 123456')
+            status('[App 1] [WARN] Desktop Tool - pin 1234')
+            status('[App 1] [WARN] Desktop Tool - key=hunter2')
+            status('[App 1] [WARN] Desktop Tool - key 12345')
+            status('[App 1] [WARN] Desktop Tool - key $abc')
+            status('[App 1] [WARN] Desktop Tool - auth hunter2')
+            status('[App 1] [WARN] Desktop Tool - auth abcde')
+            status('[App 1] [WARN] Desktop Tool - session raw-launch-token')
+            status('[App 1] [WARN] Desktop Tool - session abcde')
+            status('[App 1] [WARN] Desktop Tool - session !abc secret *abc')
+            status('[App 1] [WARN] Desktop Tool - session "raw-launch-token"')
+            status('[App 1] [WARN] Desktop Tool - apiKey hunter2 githubAccessToken raw-launch-token')
+            return {
+                webResults: [{
+                    type: 'web',
+                    tabIndex: 1,
+                    url: 'https://example.com',
+                    success: false,
+                    error: `token "${longQuotedSecret}"`
+                }],
+                appResults: [{
+                    type: 'app',
+                    name: 'Desktop Tool',
+                    success: false,
+                    error: "session 'raw-launch-token'"
+                }]
+            }
+        }
+
+        const result = await launchWorkspaceHandlerCore({
+            event: { sender: { id: 1 } },
+            deps
+        })
+
+        assert.equal(result.success, true)
+        await harness.calls.launchPromise
+
+        const serializedSent = JSON.stringify(harness.calls.sent)
+        assertNoRendererLaunchLeaks(serializedSent)
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[Tab 1] [WARN] Saved browser tab 1 - Browser tab failed to load.'))
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[App 1] [WARN] Desktop Tool - Desktop item failed to launch.'))
+
+        const complete = harness.calls.sent.find(item => item.channel === 'launch-complete')
+        assert.equal(complete.payload.success, true)
+        assert.deepEqual(complete.payload.results.webResults[0], {
+            type: 'web',
+            itemKey: 'tab-1',
+            tabIndex: 1,
+            url: 'Saved browser tab 1',
+            success: false,
+            skipped: false,
+            error: 'Browser tab failed to load.',
+            reason: 'Browser tab failed to load.'
+        })
+        assert.deepEqual(complete.payload.results.appResults[0], {
+            type: 'app',
+            itemKey: 'app-1',
+            appIndex: 1,
+            name: 'Desktop Tool',
+            success: false,
+            skipped: false,
+            error: 'Desktop item failed to launch.',
+            reason: 'Desktop item failed to launch.'
+        })
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('manual launch IPC redacts standalone provider-prefixed token values', async () => {
+    const harness = createHarness()
+    try {
+        const record = createCapabilityRecord({
+            type: 'host-exe',
+            provenance: 'browse-exe',
+            displayName: 'Provider Tool',
+            launch: {
+                path: 'C:\\Program Files\\Provider Tool\\Tool.exe'
+            },
+            policy: {
+                allowedArgs: 'none',
+                canCloseFromWipesnap: true,
+                ownership: 'owned-process'
+            }
+        })
+        harness.writeWorkspace({
+            webTabs: [{ url: 'https://example.com', enabled: true }],
+            desktopApps: [{
+                capabilityId: record.capabilityId,
+                displayName: 'Provider Tool',
+                enabled: true
+            }],
+            [WORKSPACE_CAPABILITY_VAULT_KEY]: {
+                version: 1,
+                records: {
+                    [record.capabilityId]: record
+                }
+            }
+        })
+
+        const deps = harness.createLaunchDeps()
+        deps.launchWorkspace = async (_workspace, status) => {
+            status('[Tab 1] [WARN] Saved browser tab - ghp_1234567890ABCDEFGHIJ')
+            status('[Tab 1] [WARN] Saved browser tab - github_pat_1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+            status('[App 1] [WARN] Provider Tool - xoxb-123456789012-abcdefghijkl AKIAABCDEFGHIJKLMNOP')
+            status('[App 1] [WARN] Provider Tool - xoxc-123456789012-abcdefghijkl')
+            return {
+                webResults: [{
+                    type: 'web',
+                    tabIndex: 1,
+                    url: 'https://example.com',
+                    success: false,
+                    error: 'eyJaaaaaaaaaaa.bbbbbbbbbbbbb.ccccccccccccc'
+                }],
+                appResults: [{
+                    type: 'app',
+                    name: 'Provider Tool',
+                    success: false,
+                    error: 'xoxb-123456789012-abcdefghijkl'
+                }]
+            }
+        }
+
+        const result = await launchWorkspaceHandlerCore({
+            event: { sender: { id: 1 } },
+            deps
+        })
+
+        assert.equal(result.success, true)
+        await harness.calls.launchPromise
+
+        const serializedSent = JSON.stringify(harness.calls.sent)
+        assertNoRendererLaunchLeaks(serializedSent)
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[Tab 1] [WARN] Saved browser tab 1 - Browser tab failed to load.'))
+        assert.ok(harness.calls.sent.some(item => item.channel === 'launch-status' && item.payload === '[App 1] [WARN] Provider Tool - Desktop item failed to launch.'))
+
+        const complete = harness.calls.sent.find(item => item.channel === 'launch-complete')
+        assert.equal(complete.payload.success, true)
+        assert.equal(complete.payload.results.webResults[0].error, 'Browser tab failed to load.')
+        assert.equal(complete.payload.results.appResults[0].error, 'Desktop item failed to launch.')
+    } finally {
+        harness.cleanup()
+    }
+})
+
+test('manual launch failure surfaces redact standalone provider-prefixed token values', async () => {
+    {
+        const harness = createHarness()
+        try {
+            harness.writeWorkspace({
+                webTabs: [{ url: 'https://example.com', enabled: true }],
+                desktopApps: []
+            })
+            const deps = harness.createLaunchDeps()
+            deps.launchWorkspace = async () => {
+                throw new Error('launch failed with ghp_1234567890ABCDEFGHIJ xoxc-123456789012-abcdefghijkl')
+            }
+
+            const result = await launchWorkspaceHandlerCore({
+                event: { sender: { id: 1 } },
+                deps
+            })
+
+            assert.equal(result.success, true)
+            await harness.calls.launchPromise
+            const complete = harness.calls.sent.find(item => item.channel === 'launch-complete')
+            assert.equal(complete.payload.success, false)
+            assert.equal(complete.payload.error, 'Workspace launch failed. Review diagnostics before retrying.')
+            assertNoRendererLaunchLeaks(JSON.stringify(complete.payload))
+        } finally {
+            harness.cleanup()
+        }
+    }
+
+    {
+        const harness = createHarness()
+        try {
+            harness.writeWorkspace({ webTabs: [], desktopApps: [] })
+            const deps = harness.createLaunchDeps()
+            deps.loadActiveVaultWorkspace = () => {
+                throw new Error('vault load failed with xoxc-123456789012-abcdefghijkl')
+            }
+
+            const result = await launchWorkspaceHandlerCore({
+                event: { sender: { id: 1 } },
+                deps
+            })
+
+            assert.equal(result.success, false)
+            assert.equal(result.error, 'Workspace launch could not start.')
+            assertNoRendererLaunchLeaks(JSON.stringify(result))
+        } finally {
+            harness.cleanup()
+        }
+    }
+})
+
 test('manual launch-complete failure errors are sanitized before reaching renderer', async () => {
     const harness = createHarness()
     try {
@@ -920,7 +1294,7 @@ test('manual launch-complete failure errors are sanitized before reaching render
         const idnChineseUrl = '\u4f8b\u5b50.\u6d4b\u8bd5/path?code=abc#frag'
         const idnGreekUrl = '\u03b4\u03bf\u03ba\u03b9\u03bc\u03ae.example/path?code=abc#frag'
         deps.launchWorkspace = async () => {
-            throw new Error(`spawn C:\\Users\\Alice\\Portable.exe --password=hunter2 token=raw-launch-token localhost:3000/callback?code=abc#frag 127.0.0.1:5173/path?tokenish=value#frag [::1]:3000/path?code=abc dev.a1 dev.abc-1 team.env2 dev_a.example foo_bar.baz1 a_b.localhost/callback?tokenish=value dev..example:3000/path?code=abc#frag failed:dev..example:3000/path?code=abc#frag failed/dev..example:3000/path?code=abc#frag failed/${idnChineseUrl} failed/${idnGreekUrl} label:a..b:5173/callback?tokenish=value a..b:5173/callback?tokenish=value example..com cap_aaaaaaaaaaaaaaaaaaaaaaaa pid=9999`)
+            throw new Error(`spawn C:\\Users\\Alice\\Portable.exe C:/Users/Alice/BrowserProfile/Default //SERVER/Share/Secret HKEY_CURRENT_USER\\Software\\Alice\\SecretToken HKLM:\\Software\\Alice\\SecretToken --password=hunter2 apiKey=hunter2 githubAccessToken=raw-launch-token mySecretKey=hunter2 Bearer raw-launch-token accessToken=raw-launch-token token=raw-launch-token localhost:3000/callback?code=abc#frag 127.0.0.1:5173/path?tokenish=value#frag [::1]:3000/path?code=abc dev.a1 dev.abc-1 team.env2 dev_a.example foo_bar.baz1 a_b.localhost/callback?tokenish=value dev..example:3000/path?code=abc#frag failed:dev..example:3000/path?code=abc#frag failed/dev..example:3000/path?code=abc#frag failed/${idnChineseUrl} failed/${idnGreekUrl} label:a..b:5173/callback?tokenish=value a..b:5173/callback?tokenish=value example..com cap_aaaaaaaaaaaaaaaaaaaaaaaa pid=9999`)
         }
 
         const result = await launchWorkspaceHandlerCore({
@@ -948,7 +1322,7 @@ test('manual launch start failures returned by invoke are sanitized', async () =
         const idnChineseUrl = '\u4f8b\u5b50.\u6d4b\u8bd5/path?code=abc#frag'
         const idnGreekUrl = '\u03b4\u03bf\u03ba\u03b9\u03bc\u03ae.example/path?code=abc#frag'
         deps.loadActiveVaultWorkspace = () => {
-            throw new Error(`Vault load failed at C:\\Users\\Alice\\vault.json token=raw-launch-token dev.abc-1:3000/path?code=abc#frag dev_a.example:3000/path?code=abc#frag dev..example:3000/path?code=abc#frag failed:dev..example:3000/path?code=abc#frag failed/dev..example:3000/path?code=abc#frag failed/${idnChineseUrl} failed/${idnGreekUrl} label:a..b:5173/callback?tokenish=value a..b example..com cap_aaaaaaaaaaaaaaaaaaaaaaaa`)
+            throw new Error(`Vault load failed at C:\\Users\\Alice\\vault.json C:/Users/Alice/BrowserProfile/Default //SERVER/Share/Secret HKEY_CURRENT_USER\\Software\\Alice\\SecretToken HKLM:\\Software\\Alice\\SecretToken apiKey=hunter2 githubAccessToken=raw-launch-token mySecretKey=hunter2 Bearer raw-launch-token accessToken=raw-launch-token token=raw-launch-token dev.abc-1:3000/path?code=abc#frag dev_a.example:3000/path?code=abc#frag dev..example:3000/path?code=abc#frag failed:dev..example:3000/path?code=abc#frag failed/dev..example:3000/path?code=abc#frag failed/${idnChineseUrl} failed/${idnGreekUrl} label:a..b:5173/callback?tokenish=value a..b example..com cap_aaaaaaaaaaaaaaaaaaaaaaaa`)
         }
 
         const result = await launchWorkspaceHandlerCore({

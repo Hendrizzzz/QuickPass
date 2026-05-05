@@ -23,6 +23,33 @@ function writeDiagnostics(vaultDir, payload) {
     writeFileSync(join(vaultDir, DIAGNOSTICS_FILE_NAME), JSON.stringify(payload, null, 2), 'utf-8')
 }
 
+function assertNoDiagnosticsSensitiveMaterial(value) {
+    for (const forbidden of [
+        'C:/Users/Alice',
+        'C:\\Users\\Alice',
+        'BrowserProfile',
+        'AppData',
+        'HKEY_CURRENT_USER',
+        'HKLM',
+        'raw-launch-token',
+        'proxy-launch-token',
+        'hunter2',
+        'ghp_',
+        'github_pat_',
+        'xoxb-',
+        'AKIAABCDEFGHIJKLMNOP',
+        'eyJaaaaaaaaaaa.',
+        'dev..example',
+        'code=abc',
+        'pid=9999',
+        '--password',
+        '--token',
+        'cap_aaaaaaaaaaaaaaaa'
+    ]) {
+        assert.equal(String(value).includes(forbidden), false, `diagnostics leaked ${forbidden}`)
+    }
+}
+
 test('missing diagnostics returns an empty safe state', () => withVaultDir((vaultDir) => {
     const summary = loadDiagnosticsSummary({ vaultDir })
 
@@ -490,6 +517,168 @@ test('unknown sync-back guidance does not use completed guidance', () => withVau
     assert.equal(summary.lifecycle.finalState, 'action-needed')
     assert.match(summary.lifecycle.recoveryGuidance, /needs attention/i)
     assert.equal(/Last diagnostics show sync-back and cleanup completed|Cleanup completed/i.test(summary.lifecycle.recoveryGuidance), false)
+}))
+
+test('diagnostics lifecycle does not mark mixed completed and unknown app sync-back as synced or healthy', () => withVaultDir((vaultDir) => {
+    writeDiagnostics(vaultDir, {
+        cycleType: 'launch',
+        cycleStartTime: 635,
+        phases: [
+            { name: 'launch-started', status: 'ok' },
+            { name: 'workspace-running', status: 'ok' },
+            { name: 'quit-requested', status: 'ok' },
+            { name: 'browser-copy-out', status: 'ok' },
+            { name: 'workspace-cleanup', status: 'ok' }
+        ],
+        browserSync: {
+            copyInMs: 9,
+            copyOutMs: 18
+        },
+        webResults: [{
+            tabIndex: 1,
+            success: true
+        }],
+        appResults: [{
+            name: 'Synced App',
+            diagnosticRole: 'cleanup',
+            status: 'ok',
+            launchStage: 'ok',
+            runtimeProfileSynced: true,
+            runtimeProfileWiped: true,
+            appSessionSyncBackStatus: 'completed'
+        }, {
+            name: 'Unknown App',
+            diagnosticRole: 'cleanup',
+            status: 'ok',
+            launchStage: 'ok',
+            runtimeProfileSynced: true,
+            runtimeProfileWiped: true,
+            appSessionSyncBackStatus: 'unknown'
+        }]
+    })
+
+    const summary = loadDiagnosticsSummary({ vaultDir })
+
+    assert.equal(summary.lifecycle.browserSyncBack.status, 'completed')
+    assert.equal(summary.lifecycle.appSessionSyncBack.status, 'unknown')
+    assert.equal(summary.lifecycle.appSessionSyncBack.completed, 1)
+    assert.equal(summary.lifecycle.appSessionSyncBack.unknown, 1)
+    assert.equal(summary.lifecycle.cleanup.status, 'completed')
+    assert.equal(summary.lifecycle.finalState, 'action-needed')
+    assert.notEqual(summary.lifecycle.finalState, 'synced')
+    assert.notEqual(summary.status, 'ok')
+    assert.doesNotMatch(summary.message, /healthy/i)
+}))
+
+test('action-needed lifecycle downgrades top-level healthy status', () => withVaultDir((vaultDir) => {
+    writeDiagnostics(vaultDir, {
+        cycleType: 'launch',
+        cycleStartTime: 636,
+        phases: [
+            { name: 'launch-started', status: 'ok' },
+            { name: 'workspace-running', status: 'ok' },
+            { name: 'quit-requested', status: 'ok' },
+            { name: 'browser-copy-out', status: 'ok' },
+            { name: 'workspace-cleanup', status: 'ok' }
+        ],
+        browserSync: {
+            copyInMs: 8,
+            copyOutMs: null
+        },
+        webResults: [{
+            tabIndex: 1,
+            success: true
+        }],
+        appResults: [{
+            name: 'Cleanup App',
+            diagnosticRole: 'cleanup',
+            status: 'ok',
+            launchStage: 'ok',
+            runtimeProfileWiped: true
+        }]
+    })
+
+    const summary = loadDiagnosticsSummary({ vaultDir })
+
+    assert.equal(summary.lifecycle.browserSyncBack.status, 'unknown')
+    assert.equal(summary.lifecycle.cleanup.status, 'completed')
+    assert.equal(summary.lifecycle.finalState, 'action-needed')
+    assert.equal(summary.status, 'warning')
+    assert.doesNotMatch(summary.message, /healthy/i)
+    assert.match(summary.message, /attention/i)
+}))
+
+test('diagnostics renderer output redacts hardened launch-status sensitive corpus', () => withVaultDir((vaultDir) => {
+    const forbidden = 'C:/Users/Alice/BrowserProfile/Default HKEY_CURRENT_USER\\Software\\Alice HKLM:\\Software\\Alice Authorization: Bearer raw-launch-token Proxy-Authorization: Bearer proxy-launch-token Bearer raw-launch-token ghp_1234567890ABCDEFGHIJ github_pat_1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ xoxb-123456789012-abcdefghijkl AKIAABCDEFGHIJKLMNOP eyJaaaaaaaaaaa.bbbbbbbbbbbbb.ccccccccccccc failed/dev..example:3000/path?code=abc#frag --password=hunter2 --token=hunter2 pid=9999 cap_aaaaaaaaaaaaaaaa'
+    writeDiagnostics(vaultDir, {
+        cycleType: 'launch',
+        cycleStartTime: 637,
+        phases: [
+            { name: 'launch-started', status: 'ok', detail: forbidden },
+            { name: 'workspace-cleanup', status: 'failed', detail: forbidden }
+        ],
+        appResults: [{
+            name: `Desktop ${forbidden}`,
+            diagnosticRole: 'cleanup',
+            status: 'failed',
+            launchStage: 'spawning',
+            error: forbidden,
+            readiness: {
+                status: 'failed',
+                failureReason: forbidden
+            },
+            appSessionSyncBackStatus: 'failed',
+            appSessionSyncBackError: forbidden,
+            cleanupSkippedForSafety: true,
+            cleanupSafetyReason: forbidden
+        }],
+        runtimeChecks: {
+            extractor: {
+                checked: true,
+                tarAvailable: true,
+                zstdSupported: false,
+                detail: forbidden
+            }
+        },
+        webResults: [{
+            tabIndex: 1,
+            success: false,
+            reason: forbidden,
+            error: forbidden
+        }],
+        errors: [{
+            context: forbidden,
+            message: forbidden
+        }]
+    })
+
+    const summary = loadDiagnosticsSummary({ vaultDir })
+    const serialized = JSON.stringify(summary)
+
+    assert.equal(summary.success, true)
+    assert.equal(summary.status, 'failed')
+    assertNoDiagnosticsSensitiveMaterial(serialized)
+}))
+
+test('diagnostics redaction preserves ordinary safe status copy', () => withVaultDir((vaultDir) => {
+    writeDiagnostics(vaultDir, {
+        cycleType: 'launch',
+        cycleStartTime: 638,
+        phases: [
+            { name: 'launch-started', status: 'ok', detail: 'Workspace unavailable.' },
+            { name: 'browser-check', status: 'ok', detail: 'Browser ready.' },
+            { name: 'workspace-cleanup', status: 'warning', detail: 'Cleanup deferred for safety.' },
+            { name: 'desktop-status', status: 'ok', detail: 'Desktop item status updated.' }
+        ]
+    })
+
+    const summary = loadDiagnosticsSummary({ vaultDir })
+    const serialized = JSON.stringify(summary)
+
+    assert.match(serialized, /Workspace unavailable\./)
+    assert.match(serialized, /Browser ready\./)
+    assert.match(serialized, /Cleanup deferred for safety\./)
+    assert.match(serialized, /Desktop item status updated\./)
 }))
 
 test('failed browser copy-out is visible, actionable, and sanitized', () => withVaultDir((vaultDir) => {
